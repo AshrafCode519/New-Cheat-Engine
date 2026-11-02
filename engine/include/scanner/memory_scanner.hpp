@@ -1,0 +1,51 @@
+#pragma once
+
+#include "../hal/process.hpp"
+#include "scan_types.hpp"
+#include "scan_results.hpp"
+#include <memory>
+#include <functional>
+
+namespace nce::scanner {
+
+using ScanProgressCallback = std::function<void(size_t scanned_bytes, size_t total_bytes, size_t matches_count)>;
+
+class MemoryScanner {
+public:
+    explicit MemoryScanner(std::shared_ptr<hal::IProcess> process);
+
+    [[nodiscard]] ScanResults first_scan(
+        DataType type,
+        ScanCondition condition,
+        const ScanValue& val1,
+        const ScanValue& val2 = {},
+        size_t alignment = 4,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
+    [[nodiscard]] ScanResults first_scan_aob(
+        const std::string& aob_pattern,
+        size_t alignment = 1,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
+    [[nodiscard]] ScanResults next_scan(
+        const ScanResults& previous_results,
+        ScanCondition condition,
+        const ScanValue& val1 = {},
+        const ScanValue& val2 = {},
+        ScanProgressCallback progress = nullptr
+    );
+
+    void set_thread_count(size_t threads) { m_thread_count = threads; }
+    [[nodiscard]] size_t get_thread_count() const noexcept { return m_thread_count; }
+
+private:
+    std::shared_ptr<hal::IProcess> m_process;
+    size_t m_thread_count;
+};
+
+} // namespace nce::scanner
+
