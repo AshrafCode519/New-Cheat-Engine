@@ -2,17 +2,25 @@
 
 #include "hal/process.hpp"
 #include "scanner/scan_results.hpp"
+#include <algorithm>
 #include <cstring>
+#include <tuple>
 #include <vector>
 
 namespace nce::test {
 
-// In-memory IProcess: one committed, writable region of `size` bytes starting at kBase.
+// In-memory IProcess: `size` bytes of committed, writable memory starting at kBase.
+// make_unreadable() punches holes: reads touching a hole fail. A listed hole is also left out of
+// query_regions; an unlisted one simulates memory freed after the regions were queried.
 class FakeProcess : public hal::IProcess {
 public:
     static constexpr uintptr_t kBase = 0x10000;
 
     explicit FakeProcess(size_t size) : m_memory(size, 0) {}
+
+    void make_unreadable(size_t offset, size_t size, bool listed = true) {
+        m_holes.push_back({offset, offset + size, listed});
+    }
 
     bool attach(uint32_t) override { m_attached = true; return true; }
     void detach() override { m_attached = false; }
@@ -32,14 +40,30 @@ public:
     }
 
     [[nodiscard]] std::vector<hal::MemoryRegion> query_regions(uint32_t = hal::FilterFlags::DefaultScanFilter) const override {
-        hal::MemoryRegion region;
-        region.base_address = kBase;
-        region.size = m_memory.size();
-        region.is_committed = true;
-        region.is_readable = true;
-        region.is_writable = true;
-        region.type = hal::MemoryType::Private;
-        return {region};
+        std::vector<hal::MemoryRegion> regions;
+        size_t start = 0;
+        while (start < m_memory.size()) {
+            // Skip holes, then extend the region up to the next hole
+            size_t end = m_memory.size();
+            bool in_hole = false;
+            for (const auto& [h_begin, h_end, listed] : m_holes) {
+                if (!listed) continue;
+                if (start >= h_begin && start < h_end) { start = h_end; in_hole = true; break; }
+                if (h_begin > start) end = std::min(end, h_begin);
+            }
+            if (in_hole) continue;
+
+            hal::MemoryRegion region;
+            region.base_address = kBase + start;
+            region.size = end - start;
+            region.is_committed = true;
+            region.is_readable = true;
+            region.is_writable = true;
+            region.type = hal::MemoryType::Private;
+            regions.push_back(region);
+            start = end;
+        }
+        return regions;
     }
 
     [[nodiscard]] std::vector<hal::ModuleInfo> get_modules() const override { return {}; }
@@ -54,18 +78,31 @@ public:
 
 private:
     [[nodiscard]] bool contains(uintptr_t address, size_t size) const {
-        return address >= kBase && address - kBase + size <= m_memory.size();
+        if (address < kBase || address - kBase + size > m_memory.size()) return false;
+        const size_t begin = address - kBase;
+        for (const auto& [h_begin, h_end, listed] : m_holes) {
+            if (begin < h_end && begin + size > h_begin) return false;
+        }
+        return true;
     }
 
     mutable std::vector<uint8_t> m_memory;
+    std::vector<std::tuple<size_t, size_t, bool>> m_holes;
     bool m_attached{true};
 };
 
 inline bool contains_address(const scanner::ScanResults& results, uintptr_t address) {
-    for (const auto& m : results.get_matches()) {
-        if (m.address == address) return true;
+    for (size_t i = 0; i < results.count(); ++i) {
+        if (results.address(i) == address) return true;
     }
     return false;
+}
+
+inline bool sorted_by_address(const scanner::ScanResults& results) {
+    for (size_t i = 1; i < results.count(); ++i) {
+        if (results.address(i - 1) >= results.address(i)) return false;
+    }
+    return true;
 }
 
 } // namespace nce::test

@@ -57,7 +57,8 @@ public:
         ScanProgressCallback progress = nullptr
     );
 
-    // Next scan after first_scan_unknown: compares live memory with the snapshot
+    // Next scan after first_scan_unknown: compares live memory with the snapshot's candidates and
+    // returns the matches as results (previous value = the snapshot's value)
     [[nodiscard]] ScanResults next_scan(
         const MemorySnapshot& snapshot,
         ScanCondition condition,
@@ -65,6 +66,20 @@ public:
         const ScanValue& val2 = {},
         ScanProgressCallback progress = nullptr
     );
+
+    // Same comparison, but keeps the snapshot form: the result holds live bytes, only the candidates
+    // that matched stay set, and blocks with no candidates left are dropped. Cheaper than results
+    // while millions of candidates remain (1 bit per slot instead of a full result entry).
+    [[nodiscard]] MemorySnapshot filter_snapshot(
+        const MemorySnapshot& snapshot,
+        ScanCondition condition,
+        const ScanValue& val1 = {},
+        const ScanValue& val2 = {},
+        ScanProgressCallback progress = nullptr
+    );
+
+    // The snapshot's remaining candidates as results (current and previous = the snapshot's value)
+    [[nodiscard]] static ScanResults snapshot_to_results(const MemorySnapshot& snapshot);
 
     void set_thread_count(size_t threads) { m_thread_count = threads; }
     [[nodiscard]] size_t get_thread_count() const noexcept { return m_thread_count; }

@@ -49,8 +49,14 @@ struct ScanState {
 static std::vector<ScanState> g_history;
 constexpr size_t MAX_UNDO_STEPS = 5;
 
-// Moves the current state into the undo history and leaves it empty
+// Moves the current state into the undo history and leaves it empty.
+// Snapshots can be as large as the scanned memory, so the history keeps only the newest one:
+// pushing a snapshot state drops every older entry.
 void push_history() {
+    const bool pushing_snapshot = static_cast<bool>(g_snapshot);
+    if (pushing_snapshot) {
+        g_history.clear();
+    }
     g_history.push_back({std::move(g_results), std::move(g_snapshot), g_current_type});
     if (g_history.size() > MAX_UNDO_STEPS) {
         g_history.erase(g_history.begin());
@@ -79,11 +85,39 @@ std::string format_size(size_t bytes) {
 std::string describe_scan_state() {
     std::ostringstream ss;
     if (g_snapshot) {
-        ss << "unknown-value snapshot (" << format_size(g_snapshot->total_bytes()) << ")";
+        ss << g_snapshot->candidate_count() << " candidates, snapshot " << format_size(g_snapshot->memory_bytes());
     } else {
         ss << g_results.count() << " matches";
     }
     return ss.str();
+}
+
+long long elapsed_ms(std::chrono::steady_clock::time_point start) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+// Makes the current scan state `source` filtered by one next-scan step. A snapshot stays a snapshot
+// until its candidates would take less memory as a results list.
+void filter_into_current(const ScanState& source, scanner::ScanCondition cond,
+                         const scanner::ScanValue& val1, const scanner::ScanValue& val2) {
+    g_current_type = source.type;
+    if (!source.snapshot) {
+        g_results = g_scanner->next_scan(source.results, cond, val1, val2);
+        g_snapshot.reset();
+        return;
+    }
+
+    auto filtered = std::make_shared<scanner::MemorySnapshot>(
+        g_scanner->filter_snapshot(*source.snapshot, cond, val1, val2));
+    const size_t result_bytes = filtered->candidate_count() *
+                                (sizeof(uintptr_t) + 2 * scanner::get_data_type_size(filtered->type));
+    if (result_bytes <= filtered->memory_bytes()) {
+        g_results = scanner::MemoryScanner::snapshot_to_results(*filtered);
+        g_snapshot.reset();
+    } else {
+        g_results.clear();
+        g_snapshot = std::move(filtered);
+    }
 }
 
 // Freeze list support
@@ -137,7 +171,10 @@ void print_help() {
               << "                                    'scan aob 48 8B ? ? 89'\n"
               << "  next <cond> [val] [val2]        - Next scan (cond: exact, changed, unchanged, inc, dec,\n"
               << "                                    gt, lt, between, incby, decby). Example: 'next between 10 20'\n"
-              << "  undo                            - Go back to the results before the last scan (up to 5 steps)\n"
+              << "  track <type>                    - Guided search for a value you can change but don't know:\n"
+              << "                                    filters out noise while you wait, then asks how it changed\n"
+              << "  undo                            - Go back to the results before the last scan (up to 5 steps;\n"
+              << "                                    only the newest unknown-value snapshot is kept)\n"
               << "  floatmode [rounded|truncated|exact] - How 'exact' float values match (default: rounded)\n"
               << "  save <file> / load <file>       - Save or load the current results\n"
               << "  group <type1> <val1> ...        - Grouped scan: find multiple values in same struct\n"
@@ -306,6 +343,7 @@ void cmd_first_scan(const std::string& type_str, const std::string& rest) {
     std::istringstream rest_stream(rest);
     std::string val_str;
     rest_stream >> val_str;
+    const auto start = std::chrono::steady_clock::now();
 
     if (*type == scanner::DataType::AOB) {
         if (!utils::parse_aob_pattern(rest)) {
@@ -332,7 +370,7 @@ void cmd_first_scan(const std::string& type_str, const std::string& rest) {
         g_current_type = *type;
         g_snapshot = std::make_shared<scanner::MemorySnapshot>(
             g_scanner->first_scan_unknown(*type, scanner::get_data_type_size(*type)));
-        std::cout << "[+] Snapshot captured: " << format_size(g_snapshot->total_bytes()) << ". "
+        std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ". "
                   << "Change the value in the target, then use 'next changed/unchanged/inc/dec/...'.\n";
         return;
     } else {
@@ -350,7 +388,7 @@ void cmd_first_scan(const std::string& type_str, const std::string& rest) {
         }
     }
 
-    std::cout << "[+] First Scan complete. Found " << g_results.count() << " match(es).\n";
+    std::cout << "[+] First Scan complete in " << elapsed_ms(start) << " ms. Found " << g_results.count() << " match(es).\n";
 }
 
 void cmd_next_scan(const std::string& cond_str, const std::string& val_str, const std::string& val2_str) {
@@ -419,14 +457,10 @@ void cmd_next_scan(const std::string& cond_str, const std::string& val_str, cons
     }
 
     std::cout << "[*] Filtering " << describe_scan_state() << " ...\n";
+    const auto start = std::chrono::steady_clock::now();
     push_history();
-    const ScanState& previous = g_history.back();
-    if (previous.snapshot) {
-        g_results = g_scanner->next_scan(*previous.snapshot, cond, val, val2);
-    } else {
-        g_results = g_scanner->next_scan(previous.results, cond, val, val2);
-    }
-    std::cout << "[+] Next Scan complete. " << g_results.count() << " match(es) remaining.\n";
+    filter_into_current(g_history.back(), cond, val, val2);
+    std::cout << "[+] Next Scan complete in " << elapsed_ms(start) << " ms: " << describe_scan_state() << " remaining.\n";
 }
 
 void cmd_undo() {
@@ -486,6 +520,129 @@ void cmd_load(const std::string& path) {
         std::cout << "[!] These results were saved from PID " << saved->pid
                   << "; addresses may not be valid in PID " << g_process->get_pid() << ".\n";
     }
+}
+
+void cmd_list(size_t max_count);
+
+std::string trim(const std::string& s) {
+    const size_t first = s.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos) return "";
+    const size_t last = s.find_last_not_of(" \t\r\n");
+    return s.substr(first, last - first + 1);
+}
+
+// Guided unknown-value search. Each round has a quiet phase (the user leaves the value alone while
+// 'unchanged' runs in the background to remove addresses that change on their own) and a change
+// step (the user changes the value in the target and says how it changed).
+void cmd_track(const std::string& type_str) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
+        return;
+    }
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
+
+    constexpr size_t FOUND_THRESHOLD = 10;
+
+    std::cout << "[*] Tracking an unknown " << type_str << " value. Capturing snapshot ...\n";
+    auto start = std::chrono::steady_clock::now();
+    push_history();
+    g_current_type = *type;
+    g_snapshot = std::make_shared<scanner::MemorySnapshot>(
+        g_scanner->first_scan_unknown(*type, scanner::get_data_type_size(*type)));
+    std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ".\n";
+
+    for (int round = 1;; ++round) {
+        std::cout << "\n[track] Round " << round << " - " << describe_scan_state() << ".\n"
+                  << "        Leave the value alone: addresses that change on their own are being removed.\n"
+                  << "        Press Enter when you are ready to change it (or type 'done').\n";
+
+        // Quiet phase. The main thread only waits for input here, so the noise thread owns the scan state.
+        push_history();
+        std::atomic<bool> stop{false};
+        std::exception_ptr noise_error;
+        std::thread noise([&] {
+            try {
+                bool first_pass = true;
+                size_t last_count = SIZE_MAX;
+                do {
+                    if (first_pass) {
+                        filter_into_current(g_history.back(), scanner::ScanCondition::Unchanged, {}, {});
+                        first_pass = false;
+                    } else {
+                        const ScanState current{std::move(g_results), std::move(g_snapshot), g_current_type};
+                        filter_into_current(current, scanner::ScanCondition::Unchanged, {}, {});
+                    }
+
+                    const size_t count = g_snapshot ? g_snapshot->candidate_count() : g_results.count();
+                    if (count != last_count) {
+                        std::cout << "        [noise filter] " << describe_scan_state() << "\n";
+                        last_count = count;
+                    }
+                    for (int i = 0; i < 5 && !stop; ++i) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    }
+                } while (!stop);
+            } catch (...) {
+                noise_error = std::current_exception();
+            }
+        });
+
+        std::string line;
+        const bool got_line = static_cast<bool>(std::getline(std::cin, line));
+        stop = true;
+        noise.join();
+        if (noise_error) std::rethrow_exception(noise_error);
+        if (!got_line || trim(line) == "done") break;
+
+        // Change step
+        std::cout << "[track] Change the value now, then type how it changed:\n"
+                  << "        + (increased), - (decreased), c (changed), a number (its new value), or 'done'\n> "
+                  << std::flush;
+        if (!std::getline(std::cin, line)) break;
+        line = trim(line);
+        if (line == "done") break;
+
+        scanner::ScanCondition cond = scanner::ScanCondition::Changed;
+        scanner::ScanValue val;
+        scanner::ScanValue val2;
+        if (line == "+") {
+            cond = scanner::ScanCondition::Increased;
+        } else if (line == "-") {
+            cond = scanner::ScanCondition::Decreased;
+        } else if (line != "c") {
+            auto parsed = parse_value(*type, line);
+            if (!parsed) {
+                std::cout << "[track] Skipping this round.\n";
+                continue;
+            }
+            cond = scanner::ScanCondition::ExactValue;
+            val = *parsed;
+            if (auto range = float_exact_range(*type, line)) {
+                cond = scanner::ScanCondition::Between;
+                val = range->first;
+                val2 = range->second;
+            }
+        }
+
+        start = std::chrono::steady_clock::now();
+        push_history();
+        filter_into_current(g_history.back(), cond, val, val2);
+        std::cout << "[+] Filtered in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ".\n";
+
+        const size_t remaining = g_snapshot ? g_snapshot->candidate_count() : g_results.count();
+        if (remaining == 0) {
+            std::cout << "[-] No candidates left. Use 'undo' to go back one step.\n";
+            break;
+        }
+        if (!g_snapshot && remaining <= FOUND_THRESHOLD) {
+            std::cout << "[+] Narrowed down to " << remaining << " address(es):\n";
+            cmd_list(FOUND_THRESHOLD);
+            break;
+        }
+    }
+
+    std::cout << "[track] Stopped with " << describe_scan_state() << ". Continue with 'next', 'list' or 'undo'.\n";
 }
 
 void cmd_grouped_scan(const std::vector<std::string>& tokens) {
@@ -766,6 +923,13 @@ bool handle_command(const std::string& line) {
         }
     } else if (cmd == "undo") {
         cmd_undo();
+    } else if (cmd == "track") {
+        std::string type;
+        if (iss >> type) {
+            cmd_track(type);
+        } else {
+            std::cout << "Usage: track <type>   (e.g. 'track i32', 'track f32')\n";
+        }
     } else if (cmd == "floatmode") {
         std::string mode;
         iss >> mode;
