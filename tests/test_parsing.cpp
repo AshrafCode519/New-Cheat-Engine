@@ -12,11 +12,53 @@ TEST_CASE("parse_data_type accepts known type names only") {
     CHECK(utils::parse_data_type("f32") == DataType::Float);
     CHECK(utils::parse_data_type("double") == DataType::Double);
     CHECK(utils::parse_data_type("aob") == DataType::AOB);
+    CHECK(utils::parse_data_type("str") == DataType::String);
+    CHECK(utils::parse_data_type("wstr") == DataType::String16);
 
     // Used to fall back to Int32 silently
-    CHECK_FALSE(utils::parse_data_type("str").has_value());
+    CHECK_FALSE(utils::parse_data_type("text").has_value());
     CHECK_FALSE(utils::parse_data_type("I32").has_value());
     CHECK_FALSE(utils::parse_data_type("").has_value());
+}
+
+TEST_CASE("format_data_type is the inverse of parse_data_type") {
+    for (auto type : {DataType::Int8, DataType::Int16, DataType::Int32, DataType::Int64,
+                      DataType::UInt8, DataType::UInt16, DataType::UInt32, DataType::UInt64,
+                      DataType::Float, DataType::Double, DataType::String, DataType::String16, DataType::AOB}) {
+        CHECK(utils::parse_data_type(utils::format_data_type(type)) == type);
+    }
+}
+
+TEST_CASE("float_match_range follows the decimals the user typed") {
+    using scanner::FloatMatchMode;
+
+    auto rounded = utils::float_match_range("25.5", FloatMatchMode::Rounded);
+    REQUIRE(rounded.has_value());
+    CHECK(rounded->first == doctest::Approx(25.45));
+    CHECK(rounded->second == doctest::Approx(25.55));
+    CHECK(rounded->second < 25.55); // open upper edge
+
+    auto whole = utils::float_match_range("250", FloatMatchMode::Rounded);
+    REQUIRE(whole.has_value());
+    CHECK(whole->first == doctest::Approx(249.5));
+    CHECK(whole->second == doctest::Approx(250.5));
+
+    auto truncated = utils::float_match_range("25.5", FloatMatchMode::Truncated);
+    REQUIRE(truncated.has_value());
+    CHECK(truncated->first == 25.5);
+    CHECK(truncated->second == doctest::Approx(25.6));
+    CHECK(truncated->second < 25.6);
+
+    // Truncation goes toward zero: -25.57 truncates to -25.5
+    auto negative = utils::float_match_range("-25.5", FloatMatchMode::Truncated);
+    REQUIRE(negative.has_value());
+    CHECK(negative->first == doctest::Approx(-25.6));
+    CHECK(negative->first > -25.6);
+    CHECK(negative->second == -25.5);
+
+    CHECK_FALSE(utils::float_match_range("25.5", FloatMatchMode::Exact).has_value());
+    CHECK_FALSE(utils::float_match_range("1e3", FloatMatchMode::Rounded).has_value());
+    CHECK_FALSE(utils::float_match_range("abc", FloatMatchMode::Rounded).has_value());
 }
 
 TEST_CASE("parse_scan_value stores the variant alternative that matches the type") {

@@ -1,5 +1,6 @@
 #include "../../include/scanner/memory_scanner.hpp"
 #include "../../include/utils/hex_utils.hpp"
+#include "../../include/utils/text_encoding.hpp"
 #include <thread>
 #include <mutex>
 #include <vector>
@@ -13,6 +14,8 @@ namespace nce::scanner {
 
 namespace {
 
+constexpr size_t CHUNK_SIZE = 1024 * 1024; // 1 MB chunk
+
 template <typename T>
 bool match_condition(T current, ScanCondition cond, T target1, T target2 = 0) {
     switch (cond) {
@@ -24,6 +27,8 @@ bool match_condition(T current, ScanCondition cond, T target1, T target2 = 0) {
     }
 }
 
+// Floats: ExactValue keeps a small epsilon; Between is an exact inclusive range, which is what
+// the rounded/truncated float modes rely on.
 template <>
 bool match_condition<float>(float current, ScanCondition cond, float target1, float target2) {
     constexpr float epsilon = 0.0001f;
@@ -31,7 +36,7 @@ bool match_condition<float>(float current, ScanCondition cond, float target1, fl
         case ScanCondition::ExactValue:  return std::fabs(current - target1) <= epsilon;
         case ScanCondition::GreaterThan: return current > target1;
         case ScanCondition::LessThan:    return current < target1;
-        case ScanCondition::Between:     return current >= (target1 - epsilon) && current <= (target2 + epsilon);
+        case ScanCondition::Between:     return current >= target1 && current <= target2;
         default:                         return false;
     }
 }
@@ -43,7 +48,7 @@ bool match_condition<double>(double current, ScanCondition cond, double target1,
         case ScanCondition::ExactValue:  return std::fabs(current - target1) <= epsilon;
         case ScanCondition::GreaterThan: return current > target1;
         case ScanCondition::LessThan:    return current < target1;
-        case ScanCondition::Between:     return current >= (target1 - epsilon) && current <= (target2 + epsilon);
+        case ScanCondition::Between:     return current >= target1 && current <= target2;
         default:                         return false;
     }
 }
@@ -90,6 +95,22 @@ bool condition_uses_value(ScanCondition cond) {
     }
 }
 
+// Raw bytes held by a String / String16 / AOB value
+std::pair<const uint8_t*, size_t> raw_bytes(const ScanValue& v) {
+    if (const auto* s = std::get_if<std::string>(&v.value)) {
+        return {reinterpret_cast<const uint8_t*>(s->data()), s->size()};
+    }
+    if (const auto* b = std::get_if<std::vector<uint8_t>>(&v.value)) {
+        return {b->data(), b->size()};
+    }
+    return {nullptr, 0};
+}
+
+ScanValue bytes_value(DataType type, std::vector<uint8_t> bytes) {
+    if (type == DataType::String) return ScanValue::of(type, std::string(bytes.begin(), bytes.end()));
+    return ScanValue::of(type, std::move(bytes));
+}
+
 template <typename T>
 void scan_chunk_typed(
     const uint8_t* buffer,
@@ -110,9 +131,7 @@ void scan_chunk_typed(
         std::memcpy(&value, buffer + offset, sizeof(T));
 
         if (match_condition(value, cond, target1, target2)) {
-            ScanValue sv;
-            sv.type = type;
-            sv.value = value;
+            const auto sv = ScanValue::of(type, value);
             local_matches.push_back({chunk_base + offset, sv, sv});
         }
     }
@@ -124,6 +143,7 @@ void scan_chunk_aob(
     uintptr_t chunk_base,
     const AOBPattern& pattern,
     size_t alignment,
+    DataType result_type,
     std::vector<ScanMatch>& local_matches
 ) {
     const size_t pattern_size = pattern.bytes.size();
@@ -140,87 +160,38 @@ void scan_chunk_aob(
         }
 
         if (match) {
-            std::vector<uint8_t> matched_bytes(buffer + offset, buffer + offset + pattern_size);
-            ScanValue sv;
-            sv.type = DataType::AOB;
-            sv.value = matched_bytes;
+            const auto sv = bytes_value(result_type, std::vector<uint8_t>(buffer + offset, buffer + offset + pattern_size));
             local_matches.push_back({chunk_base + offset, sv, sv});
         }
     }
 }
 
-// Splits the matching regions across worker threads and hands every 1 MB chunk to scan_chunk.
-// An exception in a worker (e.g. bad_alloc on huge result sets) is rethrown on the calling thread
-// instead of terminating the process.
-template <typename ChunkScanner>
-ScanResults scan_regions(
-    const hal::IProcess& process,
-    uint32_t region_filter,
-    size_t thread_count,
-    const ScanProgressCallback& progress,
-    ChunkScanner&& scan_chunk
-) {
-    ScanResults results;
-
-    auto regions = process.query_regions(region_filter);
-    if (regions.empty()) return results;
-
-    size_t total_bytes = 0;
-    for (const auto& r : regions) total_bytes += r.size;
-
-    std::atomic<size_t> scanned_bytes{0};
-    std::atomic<size_t> region_index{0};
+// Runs body(state, i) for every i in [0, count) on up to thread_count threads; each thread gets
+// its own state from make_state(). The first exception (e.g. bad_alloc on huge result sets) stops
+// the remaining work and is rethrown on the calling thread instead of terminating the process.
+template <typename MakeState, typename Body>
+void parallel_for(size_t count, size_t thread_count, MakeState&& make_state, Body&& body) {
+    std::atomic<size_t> next_index{0};
     std::atomic<bool> failed{false};
-    std::mutex results_mutex;
-    std::exception_ptr worker_error;
-
-    constexpr size_t CHUNK_SIZE = 1024 * 1024; // 1 MB chunk
+    std::mutex error_mutex;
+    std::exception_ptr error;
 
     auto worker = [&]() {
         try {
-            std::vector<uint8_t> chunk_buffer(CHUNK_SIZE);
-            std::vector<ScanMatch> local_matches;
-            local_matches.reserve(4096);
-
+            auto state = make_state();
             while (!failed) {
-                size_t idx = region_index.fetch_add(1);
-                if (idx >= regions.size()) break;
-
-                const auto& reg = regions[idx];
-                uintptr_t current_addr = reg.base_address;
-                size_t remaining = reg.size;
-
-                while (remaining > 0) {
-                    size_t to_read = std::min(remaining, CHUNK_SIZE);
-                    if (process.read_raw(current_addr, chunk_buffer.data(), to_read)) {
-                        scan_chunk(chunk_buffer.data(), to_read, current_addr, local_matches);
-                    }
-
-                    current_addr += to_read;
-                    remaining -= to_read;
-                    scanned_bytes.fetch_add(to_read);
-
-                    if (progress) {
-                        progress(scanned_bytes.load(), total_bytes, local_matches.size());
-                    }
-                }
-
-                if (!local_matches.empty()) {
-                    std::lock_guard<std::mutex> lock(results_mutex);
-                    for (const auto& m : local_matches) {
-                        results.add_match(m.address, m.current_value, m.previous_value);
-                    }
-                    local_matches.clear();
-                }
+                const size_t i = next_index.fetch_add(1);
+                if (i >= count) break;
+                body(state, i);
             }
         } catch (...) {
-            std::lock_guard<std::mutex> lock(results_mutex);
-            if (!worker_error) worker_error = std::current_exception();
+            std::lock_guard<std::mutex> lock(error_mutex);
+            if (!error) error = std::current_exception();
             failed = true;
         }
     };
 
-    const size_t worker_count = std::max<size_t>(1, thread_count);
+    const size_t worker_count = std::clamp<size_t>(thread_count, 1, std::max<size_t>(1, count));
     std::vector<std::thread> threads;
     threads.reserve(worker_count);
     for (size_t i = 0; i < worker_count; ++i) {
@@ -231,7 +202,63 @@ ScanResults scan_regions(
         if (t.joinable()) t.join();
     }
 
-    if (worker_error) std::rethrow_exception(worker_error);
+    if (error) std::rethrow_exception(error);
+}
+
+// Splits the matching regions across worker threads and hands every 1 MB chunk to scan_chunk
+template <typename ChunkScanner>
+ScanResults scan_regions(
+    const hal::IProcess& process,
+    uint32_t region_filter,
+    size_t thread_count,
+    const ScanProgressCallback& progress,
+    ChunkScanner&& scan_chunk
+) {
+    ScanResults results;
+
+    const auto regions = process.query_regions(region_filter);
+    if (regions.empty()) return results;
+
+    size_t total_bytes = 0;
+    for (const auto& r : regions) total_bytes += r.size;
+
+    std::atomic<size_t> scanned_bytes{0};
+    std::mutex results_mutex;
+
+    struct WorkerState {
+        std::vector<uint8_t> chunk_buffer = std::vector<uint8_t>(CHUNK_SIZE);
+        std::vector<ScanMatch> local_matches;
+    };
+
+    parallel_for(regions.size(), thread_count, [] { return WorkerState{}; }, [&](WorkerState& state, size_t idx) {
+        const auto& reg = regions[idx];
+        uintptr_t current_addr = reg.base_address;
+        size_t remaining = reg.size;
+
+        while (remaining > 0) {
+            size_t to_read = std::min(remaining, CHUNK_SIZE);
+            if (process.read_raw(current_addr, state.chunk_buffer.data(), to_read)) {
+                scan_chunk(state.chunk_buffer.data(), to_read, current_addr, state.local_matches);
+            }
+
+            current_addr += to_read;
+            remaining -= to_read;
+            scanned_bytes.fetch_add(to_read);
+
+            if (progress) {
+                progress(scanned_bytes.load(), total_bytes, state.local_matches.size());
+            }
+        }
+
+        if (!state.local_matches.empty()) {
+            std::lock_guard<std::mutex> lock(results_mutex);
+            for (const auto& m : state.local_matches) {
+                results.add_match(m.address, m.current_value, m.previous_value);
+            }
+            state.local_matches.clear();
+        }
+    });
+
     return results;
 }
 
@@ -285,8 +312,83 @@ ScanResults MemoryScanner::first_scan_aob(
 
     return scan_regions(*m_process, region_filter, m_thread_count, progress,
         [&](const uint8_t* buffer, size_t size, uintptr_t base, std::vector<ScanMatch>& out) {
-            scan_chunk_aob(buffer, size, base, pattern, step, out);
+            scan_chunk_aob(buffer, size, base, pattern, step, DataType::AOB, out);
         });
+}
+
+ScanResults MemoryScanner::first_scan_string(
+    const std::string& utf8_text,
+    bool utf16,
+    size_t alignment,
+    uint32_t region_filter,
+    ScanProgressCallback progress
+) {
+    if (!m_process || !m_process->is_attached() || utf8_text.empty()) return {};
+
+    AOBPattern pattern;
+    if (utf16) {
+        auto encoded = utils::utf8_to_utf16le(utf8_text);
+        if (!encoded) return {};
+        pattern.bytes = std::move(*encoded);
+    } else {
+        pattern.bytes.assign(utf8_text.begin(), utf8_text.end());
+    }
+    pattern.mask.assign(pattern.bytes.size(), true);
+
+    const DataType type = utf16 ? DataType::String16 : DataType::String;
+    const size_t step = std::max<size_t>(1, alignment);
+
+    return scan_regions(*m_process, region_filter, m_thread_count, progress,
+        [&](const uint8_t* buffer, size_t size, uintptr_t base, std::vector<ScanMatch>& out) {
+            scan_chunk_aob(buffer, size, base, pattern, step, type, out);
+        });
+}
+
+MemorySnapshot MemoryScanner::first_scan_unknown(
+    DataType type,
+    size_t alignment,
+    uint32_t region_filter,
+    ScanProgressCallback progress
+) {
+    MemorySnapshot snapshot;
+    snapshot.type = type;
+    snapshot.alignment = std::max<size_t>(1, alignment);
+
+    const bool is_numeric = dispatch_numeric(type, []<typename T>() {});
+    if (!m_process || !m_process->is_attached() || !is_numeric) return snapshot;
+
+    // Allocate every block up front on this thread, so running out of memory throws here
+    for (const auto& reg : m_process->query_regions(region_filter)) {
+        for (size_t offset = 0; offset < reg.size; offset += CHUNK_SIZE) {
+            MemorySnapshot::Block block;
+            block.base_address = reg.base_address + offset;
+            block.bytes.resize(std::min(CHUNK_SIZE, reg.size - offset));
+            snapshot.blocks.push_back(std::move(block));
+        }
+    }
+
+    const size_t total_bytes = snapshot.total_bytes();
+    std::atomic<size_t> copied_bytes{0};
+    std::vector<char> read_ok(snapshot.blocks.size(), 0);
+
+    parallel_for(snapshot.blocks.size(), m_thread_count, [] { return 0; }, [&](int&, size_t i) {
+        auto& block = snapshot.blocks[i];
+        read_ok[i] = m_process->read_raw(block.base_address, block.bytes.data(), block.bytes.size()) ? 1 : 0;
+        copied_bytes.fetch_add(block.bytes.size());
+        if (progress) {
+            progress(copied_bytes.load(), total_bytes, 0);
+        }
+    });
+
+    // Drop blocks that could not be read (e.g. freed since query_regions)
+    std::vector<MemorySnapshot::Block> readable;
+    readable.reserve(snapshot.blocks.size());
+    for (size_t i = 0; i < snapshot.blocks.size(); ++i) {
+        if (read_ok[i]) readable.push_back(std::move(snapshot.blocks[i]));
+    }
+    snapshot.blocks = std::move(readable);
+
+    return snapshot;
 }
 
 ScanResults MemoryScanner::next_scan(
@@ -328,15 +430,15 @@ ScanResults MemoryScanner::next_scan(
             }
         });
 
-        // AOB results only support Changed / Unchanged against the bytes captured by the previous scan
-        if (!is_numeric && type == DataType::AOB &&
-            (condition == ScanCondition::Changed || condition == ScanCondition::Unchanged)) {
-            const auto& prev_bytes = std::get<std::vector<uint8_t>>(match.current_value.value);
-            std::vector<uint8_t> live_bytes(prev_bytes.size());
-            if (!live_bytes.empty() && m_process->read_raw(match.address, live_bytes.data(), live_bytes.size())) {
-                const bool unchanged = (live_bytes == prev_bytes);
+        // String / String16 / AOB results only support Changed / Unchanged against the bytes
+        // captured by the previous scan
+        if (!is_numeric && (condition == ScanCondition::Changed || condition == ScanCondition::Unchanged)) {
+            const auto [prev_data, prev_size] = raw_bytes(match.current_value);
+            std::vector<uint8_t> live_bytes(prev_size);
+            if (prev_size > 0 && m_process->read_raw(match.address, live_bytes.data(), prev_size)) {
+                const bool unchanged = std::memcmp(live_bytes.data(), prev_data, prev_size) == 0;
                 if (unchanged == (condition == ScanCondition::Unchanged)) {
-                    current_val.value = std::move(live_bytes);
+                    current_val = bytes_value(type, std::move(live_bytes));
                     matched = true;
                 }
             }
@@ -351,6 +453,73 @@ ScanResults MemoryScanner::next_scan(
             progress(processed, total, results.count());
         }
     }
+
+    return results;
+}
+
+ScanResults MemoryScanner::next_scan(
+    const MemorySnapshot& snapshot,
+    ScanCondition condition,
+    const ScanValue& val1,
+    const ScanValue& val2,
+    ScanProgressCallback progress
+) {
+    ScanResults results;
+    if (!m_process || !m_process->is_attached() || snapshot.blocks.empty()) return results;
+
+    const bool uses_val1 = condition_uses_value(condition);
+    const bool uses_val2 = (condition == ScanCondition::Between);
+    const size_t step = std::max<size_t>(1, snapshot.alignment);
+    const DataType type = snapshot.type;
+
+    dispatch_numeric(type, [&]<typename T>() {
+        const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
+        const T target2 = uses_val2 ? std::get<T>(val2.value) : T{};
+
+        const size_t total_bytes = snapshot.total_bytes();
+        std::atomic<size_t> compared_bytes{0};
+        std::atomic<size_t> found{0};
+        std::mutex results_mutex;
+
+        struct WorkerState {
+            std::vector<uint8_t> live;
+            std::vector<ScanMatch> local_matches;
+        };
+
+        parallel_for(snapshot.blocks.size(), m_thread_count, [] { return WorkerState{}; }, [&](WorkerState& state, size_t i) {
+            const auto& block = snapshot.blocks[i];
+            const size_t size = block.bytes.size();
+            state.live.resize(size);
+
+            if (size >= sizeof(T) && m_process->read_raw(block.base_address, state.live.data(), size)) {
+                for (size_t offset = 0; offset + sizeof(T) <= size; offset += step) {
+                    T current, previous;
+                    std::memcpy(&current, state.live.data() + offset, sizeof(T));
+                    std::memcpy(&previous, block.bytes.data() + offset, sizeof(T));
+
+                    if (match_next_condition(current, previous, condition, target1, target2)) {
+                        state.local_matches.push_back({
+                            block.base_address + offset, ScanValue::of(type, current), ScanValue::of(type, previous)
+                        });
+                    }
+                }
+            }
+
+            found.fetch_add(state.local_matches.size());
+            if (!state.local_matches.empty()) {
+                std::lock_guard<std::mutex> lock(results_mutex);
+                for (const auto& m : state.local_matches) {
+                    results.add_match(m.address, m.current_value, m.previous_value);
+                }
+                state.local_matches.clear();
+            }
+
+            compared_bytes.fetch_add(size);
+            if (progress) {
+                progress(compared_bytes.load(), total_bytes, found.load());
+            }
+        });
+    });
 
     return results;
 }

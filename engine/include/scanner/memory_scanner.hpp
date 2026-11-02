@@ -31,8 +31,35 @@ public:
         ScanProgressCallback progress = nullptr
     );
 
+    // Case-sensitive text search. utf16 = true looks for UTF-16LE (wide) strings, otherwise for the UTF-8 bytes.
+    [[nodiscard]] ScanResults first_scan_string(
+        const std::string& utf8_text,
+        bool utf16,
+        size_t alignment = 1,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
+    // "Unknown initial value": copies the scanned memory so the next scan can compare against it.
+    // Numeric types only; the snapshot is as large as the scanned memory.
+    [[nodiscard]] MemorySnapshot first_scan_unknown(
+        DataType type,
+        size_t alignment = 4,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
     [[nodiscard]] ScanResults next_scan(
         const ScanResults& previous_results,
+        ScanCondition condition,
+        const ScanValue& val1 = {},
+        const ScanValue& val2 = {},
+        ScanProgressCallback progress = nullptr
+    );
+
+    // Next scan after first_scan_unknown: compares live memory with the snapshot
+    [[nodiscard]] ScanResults next_scan(
+        const MemorySnapshot& snapshot,
         ScanCondition condition,
         const ScanValue& val1 = {},
         const ScanValue& val2 = {},

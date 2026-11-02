@@ -4,6 +4,7 @@
 #include <cctype>
 #include <charconv>
 #include <system_error>
+#include <cmath>
 
 namespace nce::utils {
 
@@ -97,8 +98,30 @@ std::optional<scanner::DataType> parse_data_type(const std::string& type_str) {
     if (type_str == "u64") return DataType::UInt64;
     if (type_str == "f32" || type_str == "float") return DataType::Float;
     if (type_str == "f64" || type_str == "double") return DataType::Double;
+    if (type_str == "str" || type_str == "string") return DataType::String;
+    if (type_str == "wstr" || type_str == "utf16") return DataType::String16;
     if (type_str == "aob") return DataType::AOB;
     return std::nullopt;
+}
+
+std::string format_data_type(scanner::DataType type) {
+    using scanner::DataType;
+    switch (type) {
+        case DataType::Int8:     return "i8";
+        case DataType::Int16:    return "i16";
+        case DataType::Int32:    return "i32";
+        case DataType::Int64:    return "i64";
+        case DataType::UInt8:    return "u8";
+        case DataType::UInt16:   return "u16";
+        case DataType::UInt32:   return "u32";
+        case DataType::UInt64:   return "u64";
+        case DataType::Float:    return "f32";
+        case DataType::Double:   return "f64";
+        case DataType::String:   return "str";
+        case DataType::String16: return "wstr";
+        case DataType::AOB:      return "aob";
+    }
+    return "?";
 }
 
 std::optional<scanner::ScanValue> parse_scan_value(scanner::DataType type, const std::string& value_str) {
@@ -119,6 +142,30 @@ std::optional<scanner::ScanValue> parse_scan_value(scanner::DataType type, const
     });
 
     return result;
+}
+
+std::optional<std::pair<double, double>> float_match_range(const std::string& value_str, scanner::FloatMatchMode mode) {
+    if (mode == scanner::FloatMatchMode::Exact || value_str.empty()) return std::nullopt;
+    if (value_str.find_first_not_of("+-0123456789.") != std::string::npos) return std::nullopt; // e-notation, inf, nan
+
+    const char* first = value_str.data();
+    const char* last = first + value_str.size();
+    double value = 0.0;
+    auto [ptr, ec] = std::from_chars(first, last, value);
+    if (ec != std::errc() || ptr != last) return std::nullopt;
+
+    const size_t dot = value_str.find('.');
+    const int decimals = (dot == std::string::npos) ? 0 : static_cast<int>(value_str.size() - dot - 1);
+    const double unit = std::pow(10.0, -decimals);
+    const bool negative = (value_str[0] == '-');
+
+    if (mode == scanner::FloatMatchMode::Rounded) {
+        return std::make_pair(value - unit / 2, std::nextafter(value + unit / 2, value)); // [v - u/2, v + u/2)
+    }
+    if (!negative) {
+        return std::make_pair(value, std::nextafter(value + unit, value));                // [v, v + u)
+    }
+    return std::make_pair(std::nextafter(value - unit, value), value);                    // (v - u, v]
 }
 
 } // namespace nce::utils

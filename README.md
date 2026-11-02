@@ -25,7 +25,9 @@
      * استخراج وتصنيف وحدات البرنامج (Modules) لحساب قواعد المؤشرات (Base Offsets).
    * **محرك الفحص المتوازي (MemoryScanner):**
      * فحص متوازي متعدد الخيوط (Multithreaded Chunk Scanning).
-     * دعم مختلف أنواع البيانات (`Int8`..`Int64`, `UInt8`..`UInt64`, `Float`, `Double`, `AOB`).
+     * دعم مختلف أنواع البيانات (`Int8`..`Int64`, `UInt8`..`UInt64`, `Float`, `Double`, `AOB`)، والنصوص UTF-8 (`str`) و UTF-16 (`wstr`).
+     * البحث عن قيمة غير معروفة (Unknown Initial Value): لقطة (Snapshot) للذاكرة ثم مقارنة الذاكرة الحية بيها.
+     * مطابقة الأعداد العشرية زي Cheat Engine: `rounded` (الافتراضي) و `truncated` و `exact`، حسب عدد الأرقام العشرية المكتوبة.
      * بحث متقدم عن أنماط البايتات مع الرموز البديلة (`AOB Scan with '?' wildcards`).
      * فحص ترشيحي متسلسل (Next Scan): `Exact`, `Changed`, `Unchanged`, `Increased`, `Decreased`, `GreaterThan`, `LessThan`, `Between`, `IncreasedBy`, `DecreasedBy` (نتائج AOB تدعم `Changed` و `Unchanged` فقط).
    * **الفحص المجمع (Grouped Scanner):**
@@ -41,7 +43,8 @@
 3. **`memscan_cli` (أداة سطر الأوامر التفاعلية):**
    * عرض العمليات الحية والبحث بالاسم (`ps`).
    * الاتصال بالعملية (`attach <pid>`).
-   * فحص الذاكرة وتصفية النتائج (`scan`, `next`, `list`).
+   * فحص الذاكرة وتصفية النتائج (`scan`, `next`, `list`)، والبحث عن قيمة غير معروفة (`scan i32 ?`).
+   * الرجوع لنتائج الفحص السابق (`undo`)، وحفظ وتحميل النتائج (`save`, `load`)، وطريقة مطابقة الأعداد العشرية (`floatmode`).
    * الفحص المجمع (`group i32 100 i32 50 f32 25.5`).
    * فحص سلاسل المؤشرات (`ptrscan <addr> [depth] [offset]`).
    * قراءة وكتابة وتعديل قيم الذاكرة الحية (`read`, `write`).

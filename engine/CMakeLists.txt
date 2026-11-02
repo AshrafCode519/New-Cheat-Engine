@@ -8,6 +8,7 @@ add_library(engine STATIC
     src/scanner/pointer_scanner.cpp
     src/scanner/grouped_scanner.cpp
     src/utils/hex_utils.cpp
+    src/utils/text_encoding.cpp
 )
 
 target_include_directories(engine PUBLIC 

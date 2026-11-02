@@ -8,6 +8,7 @@
 #include <cmath>
 #include <sstream>
 #include <iomanip>
+#include "../utils/text_encoding.hpp"
 
 namespace nce::scanner {
 
@@ -22,8 +23,18 @@ enum class DataType {
     UInt64,
     Float,
     Double,
-    String,
+    String,   // UTF-8 / ASCII bytes, stored as std::string
+    String16, // UTF-16LE bytes (wide strings), stored as std::vector<uint8_t>
     AOB
+};
+
+// How an exact float/double value typed by the user is matched (Cheat Engine style).
+// Rounded: "25.5" matches anything that rounds to 25.5 at one decimal; Truncated: anything that
+// truncates to it; Exact: within a fixed epsilon.
+enum class FloatMatchMode {
+    Rounded,
+    Truncated,
+    Exact
 };
 
 enum class ScanCondition {
@@ -49,6 +60,14 @@ struct ScanValue {
         std::vector<uint8_t>
     > value{static_cast<int32_t>(0)};
 
+    template <typename T>
+    [[nodiscard]] static ScanValue of(DataType type, T v) {
+        ScanValue sv;
+        sv.type = type;
+        sv.value = std::move(v);
+        return sv;
+    }
+
     [[nodiscard]] size_t size() const noexcept {
         switch (type) {
             case DataType::Int8:   case DataType::UInt8:  return 1;
@@ -58,6 +77,7 @@ struct ScanValue {
             case DataType::Float:                         return sizeof(float);
             case DataType::Double:                        return sizeof(double);
             case DataType::String:                        return std::get<std::string>(value).size();
+            case DataType::String16:
             case DataType::AOB:                           return std::get<std::vector<uint8_t>>(value).size();
         }
         return 4;
@@ -77,6 +97,11 @@ struct ScanValue {
             case DataType::Float:  ss << std::get<float>(value); break;
             case DataType::Double: ss << std::get<double>(value); break;
             case DataType::String: ss << "\"" << std::get<std::string>(value) << "\""; break;
+            case DataType::String16: {
+                const auto& bytes = std::get<std::vector<uint8_t>>(value);
+                ss << "\"" << utils::utf16le_to_utf8(bytes.data(), bytes.size()) << "\"";
+                break;
+            }
             case DataType::AOB: {
                 const auto& bytes = std::get<std::vector<uint8_t>>(value);
                 for (size_t i = 0; i < bytes.size(); ++i) {

@@ -11,12 +11,24 @@
 #include <chrono>
 #include <optional>
 #include <exception>
+#include <utility>
+
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 #include "hal/process.hpp"
 #include "scanner/memory_scanner.hpp"
 #include "scanner/pointer_scanner.hpp"
 #include "scanner/grouped_scanner.hpp"
 #include "utils/hex_utils.hpp"
+#include "utils/text_encoding.hpp"
 
 using namespace nce;
 
@@ -24,6 +36,55 @@ static std::shared_ptr<hal::IProcess> g_process;
 static std::unique_ptr<scanner::MemoryScanner> g_scanner;
 static scanner::ScanResults g_results;
 static scanner::DataType g_current_type = scanner::DataType::Int32;
+static std::shared_ptr<scanner::MemorySnapshot> g_snapshot; // set by an unknown-value first scan
+static scanner::FloatMatchMode g_float_mode = scanner::FloatMatchMode::Rounded;
+
+// Undo history: the scan state before each scan
+struct ScanState {
+    scanner::ScanResults results;
+    std::shared_ptr<scanner::MemorySnapshot> snapshot;
+    scanner::DataType type{scanner::DataType::Int32};
+};
+
+static std::vector<ScanState> g_history;
+constexpr size_t MAX_UNDO_STEPS = 5;
+
+// Moves the current state into the undo history and leaves it empty
+void push_history() {
+    g_history.push_back({std::move(g_results), std::move(g_snapshot), g_current_type});
+    if (g_history.size() > MAX_UNDO_STEPS) {
+        g_history.erase(g_history.begin());
+    }
+    g_results.clear();
+    g_snapshot.reset();
+}
+
+void clear_scan_state() {
+    g_results.clear();
+    g_snapshot.reset();
+    g_history.clear();
+}
+
+bool is_numeric_type(scanner::DataType type) {
+    return scanner::dispatch_numeric(type, []<typename T>() {});
+}
+
+std::string format_size(size_t bytes) {
+    std::ostringstream ss;
+    if (bytes >= 1024 * 1024) ss << (bytes / (1024 * 1024)) << " MB";
+    else ss << (bytes / 1024) << " KB";
+    return ss.str();
+}
+
+std::string describe_scan_state() {
+    std::ostringstream ss;
+    if (g_snapshot) {
+        ss << "unknown-value snapshot (" << format_size(g_snapshot->total_bytes()) << ")";
+    } else {
+        ss << g_results.count() << " matches";
+    }
+    return ss.str();
+}
 
 // Freeze list support
 struct FrozenEntry {
@@ -70,10 +131,15 @@ void print_help() {
               << "  modules                         - List loaded modules in target process\n"
               << "  regions                         - Display memory regions summary\n\n"
               << "Scanning Commands:\n"
-              << "  scan <type> <value>             - First scan (types: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, aob)\n"
-              << "                                    Examples: 'scan i32 1337', 'scan aob 48 8B ? ? 89'\n"
+              << "  scan <type> <value>             - First scan (types: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64,\n"
+              << "                                    str, wstr, aob). Use '?' as value for an unknown initial value.\n"
+              << "                                    Examples: 'scan i32 1337', 'scan f32 ?', 'scan wstr Player 1',\n"
+              << "                                    'scan aob 48 8B ? ? 89'\n"
               << "  next <cond> [val] [val2]        - Next scan (cond: exact, changed, unchanged, inc, dec,\n"
               << "                                    gt, lt, between, incby, decby). Example: 'next between 10 20'\n"
+              << "  undo                            - Go back to the results before the last scan (up to 5 steps)\n"
+              << "  floatmode [rounded|truncated|exact] - How 'exact' float values match (default: rounded)\n"
+              << "  save <file> / load <file>       - Save or load the current results\n"
               << "  group <type1> <val1> ...        - Grouped scan: find multiple values in same struct\n"
               << "                                    Example: 'group i32 100 i32 50 f32 25.5'\n"
               << "  ptrscan <addr> [depth] [offset] - Pointer Scanner: find static base pointer paths\n"
@@ -90,10 +156,10 @@ void print_help() {
               << "  quit                            - Exit CLI\n\n";
 }
 
-// Numeric types only (no aob); prints an error and returns nullopt for anything else
+// Numeric types only (no str/wstr/aob); prints an error and returns nullopt for anything else
 std::optional<scanner::DataType> parse_numeric_type(const std::string& type_str) {
     auto type = utils::parse_data_type(type_str);
-    if (!type || *type == scanner::DataType::AOB || *type == scanner::DataType::String) {
+    if (!type || !is_numeric_type(*type)) {
         std::cerr << "[!] Unknown type: '" << type_str << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64.\n";
         return std::nullopt;
     }
@@ -106,6 +172,31 @@ std::optional<scanner::ScanValue> parse_value(scanner::DataType type, const std:
         std::cerr << "[!] Invalid value: '" << val_str << "' (not a number, or out of range for this type).\n";
     }
     return value;
+}
+
+const char* float_mode_name(scanner::FloatMatchMode mode) {
+    switch (mode) {
+        case scanner::FloatMatchMode::Rounded:   return "rounded";
+        case scanner::FloatMatchMode::Truncated: return "truncated";
+        case scanner::FloatMatchMode::Exact:     return "exact";
+    }
+    return "?";
+}
+
+// For f32/f64 under the rounded/truncated float mode: the [low, high] range an exact value stands for
+std::optional<std::pair<scanner::ScanValue, scanner::ScanValue>> float_exact_range(scanner::DataType type,
+                                                                                    const std::string& val_str) {
+    if (type != scanner::DataType::Float && type != scanner::DataType::Double) return std::nullopt;
+    auto range = utils::float_match_range(val_str, g_float_mode);
+    if (!range) return std::nullopt;
+
+    std::cout << "[*] Matching " << utils::format_data_type(type) << " values in [" << range->first << ", "
+              << range->second << "] (floatmode " << float_mode_name(g_float_mode) << ")\n";
+    if (type == scanner::DataType::Float) {
+        return std::make_pair(scanner::ScanValue::of(type, static_cast<float>(range->first)),
+                              scanner::ScanValue::of(type, static_cast<float>(range->second)));
+    }
+    return std::make_pair(scanner::ScanValue::of(type, range->first), scanner::ScanValue::of(type, range->second));
 }
 
 void cmd_ps(const std::string& filter) {
@@ -143,7 +234,7 @@ void cmd_attach(uint32_t pid) {
         attached = g_process->attach(pid);
     }
 
-    g_results.clear();
+    clear_scan_state();
     if (dropped_freezes > 0) {
         std::cout << "[*] Cleared " << dropped_freezes << " frozen address(es) from the previous process.\n";
     }
@@ -162,7 +253,7 @@ void cmd_detach() {
         g_frozen_list.clear();
         if (g_process) g_process->detach();
     }
-    g_results.clear();
+    clear_scan_state();
     std::cout << "[*] Detached.\n";
 }
 
@@ -198,35 +289,65 @@ void cmd_regions() {
               << total_size << " bytes)\n\n";
 }
 
-void cmd_first_scan(const std::string& type_str, const std::string& val_str, const std::string& full_line) {
+// rest = everything after the type: a number, '?' (unknown initial value), text for str/wstr, or an AOB pattern
+void cmd_first_scan(const std::string& type_str, const std::string& rest) {
     if (!g_process || !g_process->is_attached()) {
         std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
         return;
     }
 
     auto type = utils::parse_data_type(type_str);
-    if (!type || *type == scanner::DataType::String) {
-        std::cerr << "[!] Unknown type: '" << type_str << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, aob.\n";
+    if (!type) {
+        std::cerr << "[!] Unknown type: '" << type_str
+                  << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, str, wstr, aob.\n";
         return;
     }
 
+    std::istringstream rest_stream(rest);
+    std::string val_str;
+    rest_stream >> val_str;
+
     if (*type == scanner::DataType::AOB) {
-        size_t pos = full_line.find("aob");
-        std::string pattern = (pos != std::string::npos) ? full_line.substr(pos + 3) : val_str;
-        if (!utils::parse_aob_pattern(pattern)) {
+        if (!utils::parse_aob_pattern(rest)) {
             std::cerr << "[!] Invalid AOB pattern. Example: 'scan aob 48 8B ? ? 89'\n";
             return;
         }
         std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
+        push_history();
         g_current_type = *type;
-        g_results = g_scanner->first_scan_aob(pattern, 1);
+        g_results = g_scanner->first_scan_aob(rest, 1);
+    } else if (*type == scanner::DataType::String || *type == scanner::DataType::String16) {
+        const bool utf16 = (*type == scanner::DataType::String16);
+        if (utf16 && !utils::utf8_to_utf16le(rest)) {
+            std::cerr << "[!] Text is not valid UTF-8 (non-ASCII input needs a UTF-8 console).\n";
+            return;
+        }
+        std::cout << "[*] Starting First Scan for type [" << type_str << "] \"" << rest << "\" ...\n";
+        push_history();
+        g_current_type = *type;
+        g_results = g_scanner->first_scan_string(rest, utf16, 1);
+    } else if (val_str == "?" || val_str == "unknown") {
+        std::cout << "[*] Capturing unknown-value snapshot for type [" << type_str << "] ...\n";
+        push_history();
+        g_current_type = *type;
+        g_snapshot = std::make_shared<scanner::MemorySnapshot>(
+            g_scanner->first_scan_unknown(*type, scanner::get_data_type_size(*type)));
+        std::cout << "[+] Snapshot captured: " << format_size(g_snapshot->total_bytes()) << ". "
+                  << "Change the value in the target, then use 'next changed/unchanged/inc/dec/...'.\n";
+        return;
     } else {
         auto val = parse_value(*type, val_str);
         if (!val) return;
+        const auto range = float_exact_range(*type, val_str);
         std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
+        push_history();
         g_current_type = *type;
-        g_results = g_scanner->first_scan(*type, scanner::ScanCondition::ExactValue, *val, {},
-                                          scanner::get_data_type_size(*type));
+        const size_t alignment = scanner::get_data_type_size(*type);
+        if (range) {
+            g_results = g_scanner->first_scan(*type, scanner::ScanCondition::Between, range->first, range->second, alignment);
+        } else {
+            g_results = g_scanner->first_scan(*type, scanner::ScanCondition::ExactValue, *val, {}, alignment);
+        }
     }
 
     std::cout << "[+] First Scan complete. Found " << g_results.count() << " match(es).\n";
@@ -237,7 +358,7 @@ void cmd_next_scan(const std::string& cond_str, const std::string& val_str, cons
         std::cerr << "[-] Not attached to any process.\n";
         return;
     }
-    if (g_results.empty()) {
+    if (g_results.empty() && !g_snapshot) {
         std::cerr << "[-] No active scan results. Run 'scan <type> <value>' first.\n";
         return;
     }
@@ -270,12 +391,13 @@ void cmd_next_scan(const std::string& cond_str, const std::string& val_str, cons
         return;
     }
 
-    if (g_current_type == scanner::DataType::AOB &&
+    if (!is_numeric_type(g_current_type) &&
         spec->cond != scanner::ScanCondition::Changed && spec->cond != scanner::ScanCondition::Unchanged) {
-        std::cerr << "[!] AOB results only support 'next changed' and 'next unchanged'.\n";
+        std::cerr << "[!] Text and AOB results only support 'next changed' and 'next unchanged'.\n";
         return;
     }
 
+    scanner::ScanCondition cond = spec->cond;
     scanner::ScanValue val;
     scanner::ScanValue val2;
     if (spec->value_count >= 1) {
@@ -288,10 +410,82 @@ void cmd_next_scan(const std::string& cond_str, const std::string& val_str, cons
         if (!parsed) return;
         val2 = *parsed;
     }
+    if (cond == scanner::ScanCondition::ExactValue) {
+        if (auto range = float_exact_range(g_current_type, val_str)) {
+            cond = scanner::ScanCondition::Between;
+            val = range->first;
+            val2 = range->second;
+        }
+    }
 
-    std::cout << "[*] Filtering " << g_results.count() << " results ...\n";
-    g_results = g_scanner->next_scan(g_results, spec->cond, val, val2);
+    std::cout << "[*] Filtering " << describe_scan_state() << " ...\n";
+    push_history();
+    const ScanState& previous = g_history.back();
+    if (previous.snapshot) {
+        g_results = g_scanner->next_scan(*previous.snapshot, cond, val, val2);
+    } else {
+        g_results = g_scanner->next_scan(previous.results, cond, val, val2);
+    }
     std::cout << "[+] Next Scan complete. " << g_results.count() << " match(es) remaining.\n";
+}
+
+void cmd_undo() {
+    if (g_history.empty()) {
+        std::cerr << "[-] Nothing to undo.\n";
+        return;
+    }
+    ScanState& previous = g_history.back();
+    g_results = std::move(previous.results);
+    g_snapshot = std::move(previous.snapshot);
+    g_current_type = previous.type;
+    g_history.pop_back();
+    std::cout << "[*] Restored previous results: " << describe_scan_state() << ".\n";
+}
+
+void cmd_floatmode(const std::string& mode) {
+    if (mode == "rounded") g_float_mode = scanner::FloatMatchMode::Rounded;
+    else if (mode == "truncated") g_float_mode = scanner::FloatMatchMode::Truncated;
+    else if (mode == "exact") g_float_mode = scanner::FloatMatchMode::Exact;
+    else if (!mode.empty()) {
+        std::cerr << "[!] Unknown float mode: '" << mode << "'. Use rounded, truncated or exact.\n";
+        return;
+    }
+    std::cout << "[*] Float mode: " << float_mode_name(g_float_mode) << "\n";
+}
+
+void cmd_save(const std::string& path) {
+    if (g_snapshot) {
+        std::cerr << "[-] An unknown-value snapshot can't be saved. Run a next scan first.\n";
+        return;
+    }
+    if (g_results.empty()) {
+        std::cerr << "[-] No results to save.\n";
+        return;
+    }
+    const uint32_t pid = (g_process && g_process->is_attached()) ? g_process->get_pid() : 0;
+    if (scanner::save_results(path, pid, g_current_type, g_results)) {
+        std::cout << "[+] Saved " << g_results.count() << " result(s) to " << path << "\n";
+    } else {
+        std::cerr << "[-] Failed to write " << path << "\n";
+    }
+}
+
+void cmd_load(const std::string& path) {
+    auto saved = scanner::load_results(path);
+    if (!saved) {
+        std::cerr << "[-] Could not read results from " << path << "\n";
+        return;
+    }
+    push_history();
+    g_results = std::move(saved->results);
+    g_current_type = saved->type;
+    std::cout << "[+] Loaded " << g_results.count() << " " << utils::format_data_type(g_current_type)
+              << " result(s) from " << path << "\n";
+
+    if (g_process && g_process->is_attached() && saved->pid != g_process->get_pid()) {
+        std::cout << "[!] These results were saved from PID " << saved->pid
+                  << "; addresses may not be valid in PID " << g_process->get_pid() << ".\n";
+    }
 }
 
 void cmd_grouped_scan(const std::vector<std::string>& tokens) {
@@ -391,7 +585,7 @@ void cmd_list_frozen() {
     std::cout << "--------------------------------------------------\n";
     for (size_t i = 0; i < g_frozen_list.size(); ++i) {
         const auto& f = g_frozen_list[i];
-        std::cout << " [" << std::setw(3) << i << "]  "
+        std::cout << " [" << std::right << std::setw(3) << i << "]  "
                   << utils::format_address(f.address) << "   "
                   << f.value.to_string() << (f.active ? " (Active)" : " (Paused)") << "\n";
     }
@@ -419,6 +613,11 @@ void cmd_unfreeze(const std::string& param) {
 }
 
 void cmd_list(size_t max_count = 20) {
+    if (g_snapshot) {
+        std::cout << "[*] Current state is an " << describe_scan_state()
+                  << ". Run 'next changed/unchanged/inc/dec/...' to get addresses.\n";
+        return;
+    }
     if (g_results.empty()) {
         std::cout << "[-] No results found.\n";
         return;
@@ -429,7 +628,7 @@ void cmd_list(size_t max_count = 20) {
     std::cout << "------------------------------------------------------------------\n";
     for (size_t i = 0; i < count; ++i) {
         const auto& m = g_results[i];
-        std::cout << " [" << std::setw(3) << i << "]  " 
+        std::cout << " [" << std::right << std::setw(3) << i << "]  " 
                   << utils::format_address(m.address) << "   "
                   << std::setw(16) << std::left << m.current_value.to_string() << "  "
                   << m.previous_value.to_string() << "\n";
@@ -551,11 +750,11 @@ bool handle_command(const std::string& line) {
     } else if (cmd == "regions") {
         cmd_regions();
     } else if (cmd == "scan") {
-        std::string type, val;
-        if (iss >> type >> val) {
-            cmd_first_scan(type, val, line);
+        std::string type, rest;
+        if (iss >> type && std::getline(iss >> std::ws, rest) && !rest.empty()) {
+            cmd_first_scan(type, rest);
         } else {
-            std::cout << "Usage: scan <type> <value>\n";
+            std::cout << "Usage: scan <type> <value|?|text|aob pattern>\n";
         }
     } else if (cmd == "next") {
         std::string cond, val, val2;
@@ -564,6 +763,20 @@ bool handle_command(const std::string& line) {
             cmd_next_scan(cond, val, val2);
         } else {
             std::cout << "Usage: next <exact/changed/unchanged/inc/dec/gt/lt/between/incby/decby> [value] [value2]\n";
+        }
+    } else if (cmd == "undo") {
+        cmd_undo();
+    } else if (cmd == "floatmode") {
+        std::string mode;
+        iss >> mode;
+        cmd_floatmode(mode);
+    } else if (cmd == "save" || cmd == "load") {
+        std::string path;
+        if (std::getline(iss >> std::ws, path) && !path.empty()) {
+            if (cmd == "save") cmd_save(path);
+            else cmd_load(path);
+        } else {
+            std::cout << "Usage: " << cmd << " <file>\n";
         }
     } else if (cmd == "group") {
         std::vector<std::string> tokens;
@@ -626,6 +839,10 @@ bool handle_command(const std::string& line) {
 }
 
 int main() {
+#ifdef _WIN32
+    // Found text (str/wstr) is printed as UTF-8
+    SetConsoleOutputCP(CP_UTF8);
+#endif
     print_banner();
     print_help();
 
@@ -635,7 +852,7 @@ int main() {
     std::string line;
     while (true) {
         if (g_process && g_process->is_attached()) {
-            std::cout << "[NCE PID:" << g_process->get_pid() << " (" << g_results.count() << " matches)] > ";
+            std::cout << "[NCE PID:" << g_process->get_pid() << " (" << describe_scan_state() << ")] > ";
         } else {
             std::cout << "[NCE (Detached)] > ";
         }
