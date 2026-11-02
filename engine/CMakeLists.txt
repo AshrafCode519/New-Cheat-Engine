@@ -9,10 +9,16 @@ add_library(engine STATIC
     src/scanner/grouped_scanner.cpp
     src/utils/hex_utils.cpp
     src/utils/text_encoding.cpp
+    src/table/cheat_table.cpp
 )
 
-target_include_directories(engine PUBLIC 
+target_include_directories(engine PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
+)
+
+# Header-only JSON library used by the cheat table code (not exposed in engine headers)
+target_include_directories(engine PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party
 )
 
 if (WIN32)

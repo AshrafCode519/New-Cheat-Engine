@@ -12,6 +12,7 @@
 #include <optional>
 #include <exception>
 #include <utility>
+#include <charconv>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -29,6 +30,7 @@
 #include "scanner/grouped_scanner.hpp"
 #include "utils/hex_utils.hpp"
 #include "utils/text_encoding.hpp"
+#include "table/cheat_table.hpp"
 
 using namespace nce;
 
@@ -133,6 +135,12 @@ static std::mutex g_freeze_mutex;
 static std::atomic<bool> g_freeze_running{true};
 static std::thread g_freeze_thread;
 
+// Cheat table and the target's modules (used to resolve its entries). The freeze thread writes frozen
+// table entries, so both are only touched under g_freeze_mutex. The table is kept across attach:
+// its module-relative entries are meant for the next run of the same program.
+static table::CheatTable g_table;
+static std::vector<hal::ModuleInfo> g_modules;
+
 void freeze_worker() {
     while (g_freeze_running) {
         {
@@ -143,6 +151,11 @@ void freeze_worker() {
                     scanner::dispatch_numeric(entry.type, [&]<typename T>() {
                         g_process->write(entry.address, std::get<T>(entry.value.value));
                     });
+                }
+                for (const auto& entry : g_table.entries) {
+                    if (entry.frozen_value) {
+                        table::write_entry(entry, *entry.frozen_value, *g_process, g_modules);
+                    }
                 }
             }
         }
@@ -184,6 +197,13 @@ void print_help() {
               << "  ptrrescan <new_addr>            - Keep only the paths that still lead to the value (after a restart)\n"
               << "  ptrlist [count] / ptrsave <file> / ptrload <file> - Show, save or load pointer paths\n"
               << "  list [count]                    - Display up to [count] scan results (default: 20)\n\n"
+              << "Cheat Table (survives restarts: module+offset or pointer paths, saved as JSON):\n"
+              << "  add #<result> [description]     - Add a scan result (e.g. 'add #0 Health')\n"
+              << "  add <addr> <type> [description] - Add an address; addptr <path#> <type> [desc] adds a pointer path\n"
+              << "  table                           - Show entries with their current values\n"
+              << "  tset <#> <value> / tdel <#>     - Write a value / remove an entry\n"
+              << "  tfreeze <#> [value] / tunfreeze <#> - Lock an entry (default: its current value)\n"
+              << "  tsave <file.json> / tload <file.json> - Save or load the table\n\n"
               << "Memory Operations:\n"
               << "  write <addr> <type> <val>       - Write value to memory address\n"
               << "  read <addr> <type>              - Read value from memory address\n"
@@ -267,15 +287,24 @@ void cmd_attach(uint32_t pid) {
         std::lock_guard<std::mutex> lock(g_freeze_mutex);
         dropped_freezes = g_frozen_list.size();
         g_frozen_list.clear();
+        // Absolute table addresses also belong to the old process; module-relative ones stay frozen
+        // (they only resolve if the new process has the same module)
+        for (auto& entry : g_table.entries) {
+            if (entry.is_absolute() && entry.frozen_value) {
+                entry.frozen_value.reset();
+                ++dropped_freezes;
+            }
+        }
         if (!g_process) {
             g_process = hal::IProcess::create();
         }
         attached = g_process->attach(pid);
+        g_modules = attached ? g_process->get_modules() : std::vector<hal::ModuleInfo>{};
     }
 
     clear_scan_state();
     if (dropped_freezes > 0) {
-        std::cout << "[*] Cleared " << dropped_freezes << " frozen address(es) from the previous process.\n";
+        std::cout << "[*] Unfroze " << dropped_freezes << " address(es) that belonged to the previous process.\n";
     }
 
     if (attached) {
@@ -291,6 +320,7 @@ void cmd_detach() {
         std::lock_guard<std::mutex> lock(g_freeze_mutex);
         g_frozen_list.clear();
         if (g_process) g_process->detach();
+        g_modules.clear();
     }
     clear_scan_state();
     std::cout << "[*] Detached.\n";
@@ -793,6 +823,173 @@ void cmd_ptrload(const std::string& path) {
     std::cout << "[+] Loaded " << g_pointer_paths.size() << " pointer path(s) from " << path << "\n";
 }
 
+// ---- Cheat table -------------------------------------------------------------------------------
+
+// A value as the user would type it back (text without quotes)
+std::string value_text(const scanner::ScanValue& value) {
+    if (value.type == scanner::DataType::String) return std::get<std::string>(value.value);
+    if (value.type == scanner::DataType::String16) {
+        const auto& bytes = std::get<std::vector<uint8_t>>(value.value);
+        return utils::utf16le_to_utf8(bytes.data(), bytes.size());
+    }
+    return value.to_string();
+}
+
+// Parses "3" into a valid index of a list of `size` items, or prints an error
+std::optional<size_t> parse_index(const std::string& text, size_t size, const char* what) {
+    size_t index = 0;
+    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), index);
+    if (ec != std::errc() || ptr != text.data() + text.size() || text.empty() || index >= size) {
+        std::cerr << "[-] No " << what << " #" << text << " (there are " << size << ").\n";
+        return std::nullopt;
+    }
+    return index;
+}
+
+// add <addr|#result> <type> [description]
+void cmd_table_add(const std::string& where, const std::string& type_str, const std::string& description) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Not attached to any process.\n";
+        return;
+    }
+
+    std::optional<table::TableEntry> entry;
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    if (!where.empty() && where[0] == '#') {
+        // From the scan results: address, type and text length come from the result itself
+        auto index = parse_index(where.substr(1), g_results.count(), "result");
+        if (!index) return;
+        entry = table::make_entry(g_results.address(*index), g_results.type(), g_modules, description,
+                                  g_results.value_size());
+    } else {
+        auto type = parse_numeric_type(type_str);
+        if (!type) return;
+        const uintptr_t address = utils::parse_address(where);
+        if (address == 0) {
+            std::cerr << "[-] Invalid address: " << where << "\n";
+            return;
+        }
+        entry = table::make_entry(address, *type, g_modules, description);
+    }
+
+    g_table.entries.push_back(*entry);
+    std::cout << "[+] Added #" << g_table.entries.size() - 1 << ": " << entry->location_string()
+              << (entry->is_absolute() ? "  (heap address: only valid until the target restarts)" : "") << "\n";
+}
+
+// addptr <path#> <type> [description]
+void cmd_table_add_pointer(const std::string& path_index, const std::string& type_str, const std::string& description) {
+    auto index = parse_index(path_index, g_pointer_paths.size(), "pointer path");
+    if (!index) return;
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
+
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    g_table.entries.push_back(table::make_entry(g_pointer_paths[*index], *type, description));
+    std::cout << "[+] Added #" << g_table.entries.size() - 1 << ": " << g_table.entries.back().location_string() << "\n";
+}
+
+void cmd_table_list() {
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    if (g_table.entries.empty()) {
+        std::cout << "[-] The table is empty. Add values with 'add #<result>' or 'add <addr> <type>'.\n";
+        return;
+    }
+    const bool attached = g_process && g_process->is_attached();
+    if (attached) g_modules = g_process->get_modules();
+
+    std::cout << "\n Index  Description           Type  Value              Location\n";
+    std::cout << "--------------------------------------------------------------------------------\n";
+    for (size_t i = 0; i < g_table.entries.size(); ++i) {
+        const auto& e = g_table.entries[i];
+        std::string value = "??";
+        if (attached) {
+            if (auto v = table::read_entry(e, *g_process, g_modules)) value = v->to_string();
+        }
+        if (e.frozen_value) value += " [frozen]";
+        std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20) << e.description
+                  << "  " << std::setw(4) << utils::format_data_type(e.type) << "  " << std::setw(17) << value
+                  << "  " << e.location_string() << "\n";
+    }
+    std::cout << std::right << "--------------------------------------------------------------------------------\n";
+}
+
+void cmd_table_set(const std::string& index_text, const std::string& value) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Not attached to any process.\n";
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
+    if (!index) return;
+    auto& e = g_table.entries[*index];
+    if (table::write_entry(e, value, *g_process, g_modules)) {
+        if (e.frozen_value) e.frozen_value = value; // keep a frozen entry at the new value
+        std::cout << "[+] #" << *index << " set to " << value << "\n";
+    } else {
+        std::cerr << "[-] Could not write '" << value << "' to #" << *index
+                  << " (invalid value, text too long, aob entry, or address not resolvable).\n";
+    }
+}
+
+void cmd_table_freeze(const std::string& index_text, const std::string& value, bool freeze) {
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
+    if (!index) return;
+    auto& e = g_table.entries[*index];
+
+    if (!freeze) {
+        e.frozen_value.reset();
+        std::cout << "[*] #" << *index << " unfrozen.\n";
+        return;
+    }
+
+    std::string frozen = value;
+    if (frozen.empty()) {
+        // Default: keep the value it has right now
+        auto current = (g_process && g_process->is_attached()) ? table::read_entry(e, *g_process, g_modules) : std::nullopt;
+        if (!current) {
+            std::cerr << "[-] Can't read #" << *index << " to freeze it; give a value: tfreeze " << *index << " <value>\n";
+            return;
+        }
+        frozen = value_text(*current);
+    }
+    e.frozen_value = frozen;
+    std::cout << "[+] #" << *index << " frozen at " << frozen << "\n";
+}
+
+void cmd_table_delete(const std::string& index_text) {
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
+    if (!index) return;
+    g_table.entries.erase(g_table.entries.begin() + static_cast<std::ptrdiff_t>(*index));
+    std::cout << "[*] Removed #" << *index << ".\n";
+}
+
+void cmd_table_save(const std::string& path) {
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    if (g_table.process_name.empty() && !g_modules.empty()) g_table.process_name = g_modules.front().name;
+    if (table::save_table(path, g_table)) {
+        std::cout << "[+] Saved " << g_table.entries.size() << " table entr(ies) to " << path << "\n";
+    } else {
+        std::cerr << "[-] Failed to write " << path << "\n";
+    }
+}
+
+void cmd_table_load(const std::string& path) {
+    auto loaded = table::load_table(path);
+    if (!loaded) {
+        std::cerr << "[-] Could not read a table from " << path << "\n";
+        return;
+    }
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    g_table = std::move(*loaded);
+    size_t frozen = 0;
+    for (const auto& e : g_table.entries) frozen += e.frozen_value ? 1 : 0;
+    std::cout << "[+] Loaded " << g_table.entries.size() << " entr(ies) for '" << g_table.process_name << "' from "
+              << path << (frozen ? " (" + std::to_string(frozen) + " frozen)" : std::string()) << "\n";
+}
+
 void cmd_freeze(const std::string& addr_str, const std::string& type_str, const std::string& val_str) {
     if (!g_process || !g_process->is_attached()) {
         std::cerr << "[-] Not attached to any process.\n";
@@ -1042,6 +1239,55 @@ bool handle_command(const std::string& line) {
             cmd_pointer_scan(addr_str, depth, offset, module);
         } else {
             std::cout << "Usage: ptrscan <addr> [max_depth=4] [max_offset=0x800] [base_module]\n";
+        }
+    } else if (cmd == "add" || cmd == "addptr") {
+        std::string where, rest;
+        iss >> where;
+        std::getline(iss >> std::ws, rest);
+        if (cmd == "add" && !where.empty() && where[0] == '#') {
+            cmd_table_add(where, "", rest); // the result already knows its type
+        } else {
+            std::istringstream rest_stream(rest);
+            std::string type, description;
+            rest_stream >> type;
+            std::getline(rest_stream >> std::ws, description);
+            if (where.empty() || type.empty()) {
+                std::cout << "Usage: add #<result> [description] | add <addr> <type> [description] | "
+                             "addptr <path#> <type> [description]\n";
+            } else if (cmd == "add") {
+                cmd_table_add(where, type, description);
+            } else {
+                cmd_table_add_pointer(where, type, description);
+            }
+        }
+    } else if (cmd == "table") {
+        cmd_table_list();
+    } else if (cmd == "tset") {
+        std::string index, value;
+        if (iss >> index && std::getline(iss >> std::ws, value) && !value.empty()) {
+            cmd_table_set(index, value);
+        } else {
+            std::cout << "Usage: tset <#> <value>\n";
+        }
+    } else if (cmd == "tfreeze" || cmd == "tunfreeze") {
+        std::string index, value;
+        if (iss >> index) {
+            std::getline(iss >> std::ws, value);
+            cmd_table_freeze(index, value, cmd == "tfreeze");
+        } else {
+            std::cout << "Usage: " << cmd << " <#>" << (cmd == "tfreeze" ? " [value]" : "") << "\n";
+        }
+    } else if (cmd == "tdel") {
+        std::string index;
+        if (iss >> index) cmd_table_delete(index);
+        else std::cout << "Usage: tdel <#>\n";
+    } else if (cmd == "tsave" || cmd == "tload") {
+        std::string path;
+        if (std::getline(iss >> std::ws, path) && !path.empty()) {
+            if (cmd == "tsave") cmd_table_save(path);
+            else cmd_table_load(path);
+        } else {
+            std::cout << "Usage: " << cmd << " <file.json>\n";
         }
     } else if (cmd == "ptrlist") {
         size_t count = 20;
