@@ -86,6 +86,11 @@ std::optional<scanner::AOBPattern> parse_aob_pattern(const std::string& pattern_
     return pattern;
 }
 
+std::string trim_cr(std::string line) {
+    if (!line.empty() && line.back() == '\r') line.pop_back();
+    return line;
+}
+
 std::optional<scanner::DataType> parse_data_type(const std::string& type_str) {
     using scanner::DataType;
     if (type_str == "i8") return DataType::Int8;

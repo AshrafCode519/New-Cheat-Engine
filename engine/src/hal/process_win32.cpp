@@ -54,6 +54,11 @@ public:
 
         if (m_handle) {
             m_pid = pid;
+            m_pointer_size = sizeof(uintptr_t);
+            BOOL is_wow64 = FALSE;
+            if (IsWow64Process(m_handle, &is_wow64) && is_wow64) {
+                m_pointer_size = 4; // 32-bit process on 64-bit Windows
+            }
             return true;
         }
 
@@ -77,6 +82,10 @@ public:
 
     [[nodiscard]] uint32_t get_pid() const noexcept override {
         return m_pid;
+    }
+
+    [[nodiscard]] size_t pointer_size() const noexcept override {
+        return m_pointer_size;
     }
 
     bool read_raw(uintptr_t address, void* buffer, size_t size) const override {
@@ -241,6 +250,7 @@ public:
 private:
     HANDLE m_handle{nullptr};
     uint32_t m_pid{0};
+    size_t m_pointer_size{sizeof(uintptr_t)};
     bool m_is_suspended{false};
     pfnNtSuspendProcess m_ntSuspend{nullptr};
     pfnNtResumeProcess  m_ntResume{nullptr};

@@ -15,6 +15,9 @@ std::string format_hex_dump(uintptr_t base_address, const uint8_t* data, size_t 
 
 std::optional<scanner::AOBPattern> parse_aob_pattern(const std::string& pattern_str);
 
+// Drops a trailing '\r' (files saved with CRLF line endings)
+std::string trim_cr(std::string line);
+
 // "i8".."i64", "u8".."u64", "f32"/"float", "f64"/"double", "str", "wstr", "aob"; nullopt for anything else
 std::optional<scanner::DataType> parse_data_type(const std::string& type_str);
 

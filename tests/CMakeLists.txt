@@ -3,6 +3,7 @@ add_executable(engine_tests
     test_parsing.cpp
     test_memory_scanner.cpp
     test_compact_results.cpp
+    test_pointer_scanner.cpp
     test_text_encoding.cpp
     test_results_io.cpp
     test_win32_process.cpp

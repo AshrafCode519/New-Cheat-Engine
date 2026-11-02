@@ -37,6 +37,9 @@ public:
     [[nodiscard]] virtual std::vector<MemoryRegion> query_regions(uint32_t filter_flags = FilterFlags::DefaultScanFilter) const = 0;
     [[nodiscard]] virtual std::vector<ModuleInfo> get_modules() const = 0;
 
+    // Size of a pointer in the target: 4 for 32-bit processes (WOW64 on 64-bit Windows), 8 otherwise
+    [[nodiscard]] virtual size_t pointer_size() const noexcept { return sizeof(uintptr_t); }
+
     virtual bool suspend() = 0;
     virtual bool resume() = 0;
 

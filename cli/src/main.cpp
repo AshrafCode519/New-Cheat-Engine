@@ -179,8 +179,10 @@ void print_help() {
               << "  save <file> / load <file>       - Save or load the current results\n"
               << "  group <type1> <val1> ...        - Grouped scan: find multiple values in same struct\n"
               << "                                    Example: 'group i32 100 i32 50 f32 25.5'\n"
-              << "  ptrscan <addr> [depth] [offset] - Pointer Scanner: find static base pointer paths\n"
-              << "                                    Example: 'ptrscan 0x12345678 4 0x800'\n"
+              << "  ptrscan <addr> [depth] [offset] [module] - Pointer Scanner: find static base pointer paths\n"
+              << "                                    Example: 'ptrscan 0x12345678 4 0x800 game.exe'\n"
+              << "  ptrrescan <new_addr>            - Keep only the paths that still lead to the value (after a restart)\n"
+              << "  ptrlist [count] / ptrsave <file> / ptrload <file> - Show, save or load pointer paths\n"
               << "  list [count]                    - Display up to [count] scan results (default: 20)\n\n"
               << "Memory Operations:\n"
               << "  write <addr> <type> <val>       - Write value to memory address\n"
@@ -680,7 +682,31 @@ void cmd_grouped_scan(const std::vector<std::string>& tokens) {
     }
 }
 
-void cmd_pointer_scan(const std::string& addr_str, size_t max_depth = 4, size_t max_offset = 0x800) {
+// Pointer paths from the last ptrscan / ptrload. Kept across attach/detach on purpose: paths are
+// module-relative, so they are meant to be rescanned in the restarted target.
+static std::vector<scanner::PointerPath> g_pointer_paths;
+
+void cmd_ptrlist(size_t max_count = 20) {
+    if (g_pointer_paths.empty()) {
+        std::cout << "[-] No pointer paths. Run 'ptrscan <addr>' or 'ptrload <file>' first.\n";
+        return;
+    }
+
+    const bool attached = g_process && g_process->is_attached();
+    const auto modules = attached ? g_process->get_modules() : std::vector<hal::ModuleInfo>{};
+    const size_t count = std::min(max_count, g_pointer_paths.size());
+    for (size_t i = 0; i < count; ++i) {
+        std::cout << "  [" << std::right << std::setw(3) << i << "] " << g_pointer_paths[i].to_string();
+        if (attached) {
+            const uintptr_t now = g_pointer_paths[i].resolve(*g_process, modules);
+            std::cout << "  => " << (now ? utils::format_address(now) : std::string("(unresolved)"));
+        }
+        std::cout << "\n";
+    }
+    std::cout << " Showing " << count << " of " << g_pointer_paths.size() << " path(s).\n";
+}
+
+void cmd_pointer_scan(const std::string& addr_str, size_t max_depth, size_t max_offset, const std::string& base_module) {
     if (!g_process || !g_process->is_attached()) {
         std::cerr << "[-] Not attached to any process.\n";
         return;
@@ -692,18 +718,79 @@ void cmd_pointer_scan(const std::string& addr_str, size_t max_depth = 4, size_t 
         return;
     }
 
-    std::cout << "[*] Starting Pointer Scanner for " << utils::format_address(target_addr) 
-              << " (Max Depth: " << max_depth << ", Max Offset: 0x" << std::hex << max_offset << std::dec << ") ...\n";
+    scanner::PointerScanOptions options;
+    options.max_depth = max_depth;
+    options.max_offset = max_offset;
+    options.base_module = base_module;
 
+    std::cout << "[*] Starting Pointer Scanner for " << utils::format_address(target_addr)
+              << " (Max Depth: " << max_depth << ", Max Offset: 0x" << std::hex << max_offset << std::dec
+              << ", Base: " << (base_module.empty() ? "any module" : base_module)
+              << ", " << (g_process->pointer_size() * 8) << "-bit target) ...\n";
+
+    const auto start = std::chrono::steady_clock::now();
     scanner::PointerScanner ptr_scanner(g_process);
-    auto paths = ptr_scanner.scan(target_addr, max_depth, max_offset, 100, [](size_t depth, size_t count) {
+    auto result = ptr_scanner.scan(target_addr, options, [](size_t depth, size_t count) {
         std::cout << "  -> Depth " << depth << " explored: " << count << " static path(s) found.\n";
     });
+    g_pointer_paths = std::move(result.paths);
 
-    std::cout << "\n[+] Pointer Scan complete. Total valid static paths found: " << paths.size() << "\n";
-    for (size_t i = 0; i < std::min(size_t(20), paths.size()); ++i) {
-        std::cout << "  [" << std::setw(2) << i << "] " << paths[i].to_string() << "\n";
+    std::cout << "\n[+] Pointer Scan complete in " << elapsed_ms(start) << " ms: " << g_pointer_paths.size()
+              << " path(s) (pointer map: " << result.pointer_map_size << " pointers, "
+              << result.nodes_explored << " nodes searched).\n";
+    if (result.truncated) {
+        std::cout << "[!] The search hit its limit, so some paths are missing. Narrow it with a lower depth,\n"
+                  << "    a smaller max offset, or a base module.\n";
     }
+    cmd_ptrlist(20);
+    if (!g_pointer_paths.empty()) {
+        std::cout << "[*] Restart the target, find the value's new address, then run 'ptrrescan <new addr>'\n"
+                  << "    to keep only the paths that survive. 'ptrsave <file>' keeps them across sessions.\n";
+    }
+}
+
+void cmd_ptrrescan(const std::string& addr_str) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Not attached to any process.\n";
+        return;
+    }
+    if (g_pointer_paths.empty()) {
+        std::cerr << "[-] No pointer paths to rescan. Run 'ptrscan' or 'ptrload' first.\n";
+        return;
+    }
+    uintptr_t target_addr = utils::parse_address(addr_str);
+    if (target_addr == 0) {
+        std::cerr << "[-] Invalid address: " << addr_str << "\n";
+        return;
+    }
+
+    const size_t before = g_pointer_paths.size();
+    g_pointer_paths = scanner::PointerScanner::verify_paths(*g_process, g_pointer_paths, target_addr);
+    std::cout << "[+] Rescan: " << g_pointer_paths.size() << " of " << before << " path(s) still lead to "
+              << utils::format_address(target_addr) << ".\n";
+    cmd_ptrlist(20);
+}
+
+void cmd_ptrsave(const std::string& path) {
+    if (g_pointer_paths.empty()) {
+        std::cerr << "[-] No pointer paths to save.\n";
+        return;
+    }
+    if (scanner::save_pointer_paths(path, g_pointer_paths)) {
+        std::cout << "[+] Saved " << g_pointer_paths.size() << " pointer path(s) to " << path << "\n";
+    } else {
+        std::cerr << "[-] Failed to write " << path << "\n";
+    }
+}
+
+void cmd_ptrload(const std::string& path) {
+    auto loaded = scanner::load_pointer_paths(path);
+    if (!loaded) {
+        std::cerr << "[-] Could not read pointer paths from " << path << "\n";
+        return;
+    }
+    g_pointer_paths = std::move(*loaded);
+    std::cout << "[+] Loaded " << g_pointer_paths.size() << " pointer path(s) from " << path << "\n";
 }
 
 void cmd_freeze(const std::string& addr_str, const std::string& type_str, const std::string& val_str) {
@@ -948,13 +1035,32 @@ bool handle_command(const std::string& line) {
         while (iss >> t) tokens.push_back(t);
         cmd_grouped_scan(tokens);
     } else if (cmd == "ptrscan") {
-        std::string addr_str;
+        std::string addr_str, module;
         size_t depth = 4, offset = 0x800;
         if (iss >> addr_str) {
-            iss >> depth >> std::hex >> offset;
-            cmd_pointer_scan(addr_str, depth, offset);
+            iss >> depth >> std::hex >> offset >> module;
+            cmd_pointer_scan(addr_str, depth, offset, module);
         } else {
-            std::cout << "Usage: ptrscan <addr> [max_depth=4] [max_offset=0x800]\n";
+            std::cout << "Usage: ptrscan <addr> [max_depth=4] [max_offset=0x800] [base_module]\n";
+        }
+    } else if (cmd == "ptrlist") {
+        size_t count = 20;
+        iss >> count;
+        cmd_ptrlist(count);
+    } else if (cmd == "ptrrescan") {
+        std::string addr_str;
+        if (iss >> addr_str) {
+            cmd_ptrrescan(addr_str);
+        } else {
+            std::cout << "Usage: ptrrescan <new_addr>\n";
+        }
+    } else if (cmd == "ptrsave" || cmd == "ptrload") {
+        std::string path;
+        if (std::getline(iss >> std::ws, path) && !path.empty()) {
+            if (cmd == "ptrsave") cmd_ptrsave(path);
+            else cmd_ptrload(path);
+        } else {
+            std::cout << "Usage: " << cmd << " <file>\n";
         }
     } else if (cmd == "freeze") {
         std::string addr, type, val;

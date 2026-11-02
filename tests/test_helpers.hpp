@@ -22,6 +22,19 @@ public:
         m_holes.push_back({offset, offset + size, listed});
     }
 
+    // Modules are given as offsets into the fake memory; the first one plays the executable
+    void add_module(const std::string& name, size_t offset, size_t size) {
+        m_modules.push_back({name, name, kBase + offset, size});
+    }
+
+    void set_pointer_size(size_t size) { m_pointer_size = size; }
+
+    // Writes a pointer of the configured size
+    void put_pointer(size_t offset, uintptr_t value) {
+        if (m_pointer_size == 4) put<uint32_t>(offset, static_cast<uint32_t>(value));
+        else put<uintptr_t>(offset, value);
+    }
+
     bool attach(uint32_t) override { m_attached = true; return true; }
     void detach() override { m_attached = false; }
     [[nodiscard]] bool is_attached() const noexcept override { return m_attached; }
@@ -66,7 +79,8 @@ public:
         return regions;
     }
 
-    [[nodiscard]] std::vector<hal::ModuleInfo> get_modules() const override { return {}; }
+    [[nodiscard]] std::vector<hal::ModuleInfo> get_modules() const override { return m_modules; }
+    [[nodiscard]] size_t pointer_size() const noexcept override { return m_pointer_size; }
 
     bool suspend() override { return true; }
     bool resume() override { return true; }
@@ -88,6 +102,8 @@ private:
 
     mutable std::vector<uint8_t> m_memory;
     std::vector<std::tuple<size_t, size_t, bool>> m_holes;
+    std::vector<hal::ModuleInfo> m_modules;
+    size_t m_pointer_size{sizeof(uintptr_t)};
     bool m_attached{true};
 };
 
