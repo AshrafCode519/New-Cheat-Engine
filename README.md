@@ -64,6 +64,14 @@ cmake -B build -G "MinGW Makefiles"
 cmake --build build
 ```
 
+### الواجهة الرسومية (Dear ImGui):
+البناء بيطلّع `build\bin\nce_gui.exe`: اختيار العملية، الفحص (First / Next / Undo / قيمة مش معروفة)، النتائج، جدول الغش (تجميد وتعديل وحفظ JSON)، والـ Pointer Scanner مع Rescan.
+```powershell
+.\build\bin\nce_gui.exe                                  # تشغيل عادي
+.\build\bin\nce_gui.exe --pid 1234 --table game.json    # اتصال مباشر بعملية وتحميل جدول
+.\build\bin\nce_gui.exe --pid 1234 --screenshot ui.bmp  # يرسم الواجهة في نافذة مخفية ويحفظها صورة (للاختبار)
+```
+
 ### تشغيل الاختبارات (doctest):
 ```powershell
 ctest --test-dir build --output-on-failure
