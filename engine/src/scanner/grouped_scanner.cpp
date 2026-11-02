@@ -28,15 +28,11 @@ bool check_val_at<double>(const uint8_t* ptr, double expected) {
 }
 
 bool check_entry_match(const uint8_t* ptr, const GroupedEntry& entry) {
-    switch (entry.type) {
-        case DataType::Int8:   return check_val_at<int8_t>(ptr, std::get<int8_t>(entry.value.value));
-        case DataType::Int16:  return check_val_at<int16_t>(ptr, std::get<int16_t>(entry.value.value));
-        case DataType::Int32:  return check_val_at<int32_t>(ptr, std::get<int32_t>(entry.value.value));
-        case DataType::Int64:  return check_val_at<int64_t>(ptr, std::get<int64_t>(entry.value.value));
-        case DataType::Float:  return check_val_at<float>(ptr, std::get<float>(entry.value.value));
-        case DataType::Double: return check_val_at<double>(ptr, std::get<double>(entry.value.value));
-        default: return false;
-    }
+    bool matched = false;
+    dispatch_numeric(entry.type, [&]<typename T>() {
+        matched = check_val_at<T>(ptr, std::get<T>(entry.value.value));
+    });
+    return matched;
 }
 
 } // anonymous namespace

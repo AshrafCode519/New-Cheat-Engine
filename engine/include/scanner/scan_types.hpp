@@ -107,5 +107,24 @@ inline size_t get_data_type_size(DataType type) noexcept {
     }
 }
 
+// Calls f.template operator()<T>() with the C++ type of a numeric DataType.
+// Returns false (without calling f) for String and AOB.
+template <typename F>
+bool dispatch_numeric(DataType type, F&& f) {
+    switch (type) {
+        case DataType::Int8:   f.template operator()<int8_t>();   return true;
+        case DataType::Int16:  f.template operator()<int16_t>();  return true;
+        case DataType::Int32:  f.template operator()<int32_t>();  return true;
+        case DataType::Int64:  f.template operator()<int64_t>();  return true;
+        case DataType::UInt8:  f.template operator()<uint8_t>();  return true;
+        case DataType::UInt16: f.template operator()<uint16_t>(); return true;
+        case DataType::UInt32: f.template operator()<uint32_t>(); return true;
+        case DataType::UInt64: f.template operator()<uint64_t>(); return true;
+        case DataType::Float:  f.template operator()<float>();    return true;
+        case DataType::Double: f.template operator()<double>();   return true;
+        default: return false;
+    }
+}
+
 } // namespace nce::scanner
 

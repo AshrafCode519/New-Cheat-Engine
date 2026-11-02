@@ -25,9 +25,9 @@
      * استخراج وتصنيف وحدات البرنامج (Modules) لحساب قواعد المؤشرات (Base Offsets).
    * **محرك الفحص المتوازي (MemoryScanner):**
      * فحص متوازي متعدد الخيوط (Multithreaded Chunk Scanning).
-     * دعم مختلف أنواع البيانات (`Int8`, `Int16`, `Int32`, `Int64`, `Float`, `Double`, `AOB`).
+     * دعم مختلف أنواع البيانات (`Int8`..`Int64`, `UInt8`..`UInt64`, `Float`, `Double`, `AOB`).
      * بحث متقدم عن أنماط البايتات مع الرموز البديلة (`AOB Scan with '?' wildcards`).
-     * فحص ترشيحي متسلسل (Next Scan): `Exact`, `Changed`, `Unchanged`, `Increased`, `Decreased`.
+     * فحص ترشيحي متسلسل (Next Scan): `Exact`, `Changed`, `Unchanged`, `Increased`, `Decreased`, `GreaterThan`, `LessThan`, `Between`, `IncreasedBy`, `DecreasedBy` (نتائج AOB تدعم `Changed` و `Unchanged` فقط).
    * **الفحص المجمع (Grouped Scanner):**
      * البحث عن متغيرات متعددة تقع متجاورة ضمن نفس الـ Struct في نافذة ذاكرة محددة (مثل `health` و `mana` و `armor` ضمن 256 بايت).
      * يقلص النتائج العشوائية الخاطئة بنسبة 99.9% في فحص واحد.
@@ -57,6 +57,12 @@
 cmake -B build -G "MinGW Makefiles"
 cmake --build build
 ```
+
+### تشغيل الاختبارات (doctest):
+```powershell
+ctest --test-dir build --output-on-failure
+```
+الاختبارات في مجلد `tests/`: اختبارات للمحرك على عملية وهمية في الذاكرة (`FakeProcess`)، واختبار حي لـ `Win32Process` بيعمل attach على نفسه. لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
 
 ### التشغيل والاختبار:
 1. قم بتشغيل الهدف التجريبي:

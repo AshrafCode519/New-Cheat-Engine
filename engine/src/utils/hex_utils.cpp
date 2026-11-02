@@ -2,6 +2,8 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <charconv>
+#include <system_error>
 
 namespace nce::utils {
 
@@ -81,6 +83,42 @@ std::optional<scanner::AOBPattern> parse_aob_pattern(const std::string& pattern_
     }
 
     return pattern;
+}
+
+std::optional<scanner::DataType> parse_data_type(const std::string& type_str) {
+    using scanner::DataType;
+    if (type_str == "i8") return DataType::Int8;
+    if (type_str == "i16") return DataType::Int16;
+    if (type_str == "i32" || type_str == "int") return DataType::Int32;
+    if (type_str == "i64") return DataType::Int64;
+    if (type_str == "u8") return DataType::UInt8;
+    if (type_str == "u16") return DataType::UInt16;
+    if (type_str == "u32") return DataType::UInt32;
+    if (type_str == "u64") return DataType::UInt64;
+    if (type_str == "f32" || type_str == "float") return DataType::Float;
+    if (type_str == "f64" || type_str == "double") return DataType::Double;
+    if (type_str == "aob") return DataType::AOB;
+    return std::nullopt;
+}
+
+std::optional<scanner::ScanValue> parse_scan_value(scanner::DataType type, const std::string& value_str) {
+    std::optional<scanner::ScanValue> result;
+    if (value_str.empty()) return result;
+
+    scanner::dispatch_numeric(type, [&]<typename T>() {
+        const char* first = value_str.data();
+        const char* last = first + value_str.size();
+        T value{};
+        auto [ptr, ec] = std::from_chars(first, last, value);
+        if (ec == std::errc() && ptr == last) {
+            scanner::ScanValue sv;
+            sv.type = type;
+            sv.value = value;
+            result = sv;
+        }
+    });
+
+    return result;
 }
 
 } // namespace nce::utils

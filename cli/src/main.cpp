@@ -9,6 +9,8 @@
 #include <atomic>
 #include <mutex>
 #include <chrono>
+#include <optional>
+#include <exception>
 
 #include "hal/process.hpp"
 #include "scanner/memory_scanner.hpp"
@@ -43,15 +45,9 @@ void freeze_worker() {
             if (g_process && g_process->is_attached()) {
                 for (const auto& entry : g_frozen_list) {
                     if (!entry.active) continue;
-                    switch (entry.type) {
-                        case scanner::DataType::Int8:   g_process->write(entry.address, std::get<int8_t>(entry.value.value)); break;
-                        case scanner::DataType::Int16:  g_process->write(entry.address, std::get<int16_t>(entry.value.value)); break;
-                        case scanner::DataType::Int32:  g_process->write(entry.address, std::get<int32_t>(entry.value.value)); break;
-                        case scanner::DataType::Int64:  g_process->write(entry.address, std::get<int64_t>(entry.value.value)); break;
-                        case scanner::DataType::Float:  g_process->write(entry.address, std::get<float>(entry.value.value)); break;
-                        case scanner::DataType::Double: g_process->write(entry.address, std::get<double>(entry.value.value)); break;
-                        default: break;
-                    }
+                    scanner::dispatch_numeric(entry.type, [&]<typename T>() {
+                        g_process->write(entry.address, std::get<T>(entry.value.value));
+                    });
                 }
             }
         }
@@ -74,9 +70,10 @@ void print_help() {
               << "  modules                         - List loaded modules in target process\n"
               << "  regions                         - Display memory regions summary\n\n"
               << "Scanning Commands:\n"
-              << "  scan <type> <value>             - First scan (types: i8, i16, i32, i64, f32, f64, aob)\n"
+              << "  scan <type> <value>             - First scan (types: i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, aob)\n"
               << "                                    Examples: 'scan i32 1337', 'scan aob 48 8B ? ? 89'\n"
-              << "  next <cond> [val]               - Next scan (cond: exact, changed, unchanged, inc, dec)\n"
+              << "  next <cond> [val] [val2]        - Next scan (cond: exact, changed, unchanged, inc, dec,\n"
+              << "                                    gt, lt, between, incby, decby). Example: 'next between 10 20'\n"
               << "  group <type1> <val1> ...        - Grouped scan: find multiple values in same struct\n"
               << "                                    Example: 'group i32 100 i32 50 f32 25.5'\n"
               << "  ptrscan <addr> [depth] [offset] - Pointer Scanner: find static base pointer paths\n"
@@ -93,34 +90,22 @@ void print_help() {
               << "  quit                            - Exit CLI\n\n";
 }
 
-scanner::DataType parse_type(const std::string& type_str) {
-    if (type_str == "i8") return scanner::DataType::Int8;
-    if (type_str == "i16") return scanner::DataType::Int16;
-    if (type_str == "i32" || type_str == "int") return scanner::DataType::Int32;
-    if (type_str == "i64") return scanner::DataType::Int64;
-    if (type_str == "f32" || type_str == "float") return scanner::DataType::Float;
-    if (type_str == "f64" || type_str == "double") return scanner::DataType::Double;
-    if (type_str == "aob") return scanner::DataType::AOB;
-    return scanner::DataType::Int32;
+// Numeric types only (no aob); prints an error and returns nullopt for anything else
+std::optional<scanner::DataType> parse_numeric_type(const std::string& type_str) {
+    auto type = utils::parse_data_type(type_str);
+    if (!type || *type == scanner::DataType::AOB || *type == scanner::DataType::String) {
+        std::cerr << "[!] Unknown type: '" << type_str << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64.\n";
+        return std::nullopt;
+    }
+    return type;
 }
 
-scanner::ScanValue parse_value(scanner::DataType type, const std::string& val_str) {
-    scanner::ScanValue sv;
-    sv.type = type;
-    try {
-        switch (type) {
-            case scanner::DataType::Int8:   sv.value = static_cast<int8_t>(std::stoi(val_str)); break;
-            case scanner::DataType::Int16:  sv.value = static_cast<int16_t>(std::stoi(val_str)); break;
-            case scanner::DataType::Int32:  sv.value = std::stoi(val_str); break;
-            case scanner::DataType::Int64:  sv.value = std::stoll(val_str); break;
-            case scanner::DataType::Float:  sv.value = std::stof(val_str); break;
-            case scanner::DataType::Double: sv.value = std::stod(val_str); break;
-            default: break;
-        }
-    } catch (...) {
-        std::cerr << "[!] Error parsing value: " << val_str << "\n";
+std::optional<scanner::ScanValue> parse_value(scanner::DataType type, const std::string& val_str) {
+    auto value = utils::parse_scan_value(type, val_str);
+    if (!value) {
+        std::cerr << "[!] Invalid value: '" << val_str << "' (not a number, or out of range for this type).\n";
     }
-    return sv;
+    return value;
 }
 
 void cmd_ps(const std::string& filter) {
@@ -144,16 +129,41 @@ void cmd_ps(const std::string& filter) {
 }
 
 void cmd_attach(uint32_t pid) {
-    if (!g_process) {
-        g_process = hal::IProcess::create();
+    bool attached = false;
+    size_t dropped_freezes = 0;
+    {
+        // The freeze thread writes through g_process while holding this lock, so the handle
+        // may only change under it. Frozen addresses belong to the old process: drop them.
+        std::lock_guard<std::mutex> lock(g_freeze_mutex);
+        dropped_freezes = g_frozen_list.size();
+        g_frozen_list.clear();
+        if (!g_process) {
+            g_process = hal::IProcess::create();
+        }
+        attached = g_process->attach(pid);
     }
-    if (g_process->attach(pid)) {
+
+    g_results.clear();
+    if (dropped_freezes > 0) {
+        std::cout << "[*] Cleared " << dropped_freezes << " frozen address(es) from the previous process.\n";
+    }
+
+    if (attached) {
         g_scanner = std::make_unique<scanner::MemoryScanner>(g_process);
-        g_results.clear();
         std::cout << "[+] Successfully attached to PID: " << pid << "\n";
     } else {
         std::cerr << "[-] Failed to attach to PID: " << pid << ". Run as Administrator or check PID.\n";
     }
+}
+
+void cmd_detach() {
+    {
+        std::lock_guard<std::mutex> lock(g_freeze_mutex);
+        g_frozen_list.clear();
+        if (g_process) g_process->detach();
+    }
+    g_results.clear();
+    std::cout << "[*] Detached.\n";
 }
 
 void cmd_modules() {
@@ -194,24 +204,35 @@ void cmd_first_scan(const std::string& type_str, const std::string& val_str, con
         return;
     }
 
-    g_current_type = parse_type(type_str);
-    size_t alignment = (g_current_type == scanner::DataType::AOB) ? 1 : scanner::get_data_type_size(g_current_type);
+    auto type = utils::parse_data_type(type_str);
+    if (!type || *type == scanner::DataType::String) {
+        std::cerr << "[!] Unknown type: '" << type_str << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, aob.\n";
+        return;
+    }
 
-    std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
-
-    if (g_current_type == scanner::DataType::AOB) {
+    if (*type == scanner::DataType::AOB) {
         size_t pos = full_line.find("aob");
         std::string pattern = (pos != std::string::npos) ? full_line.substr(pos + 3) : val_str;
-        g_results = g_scanner->first_scan_aob(pattern, alignment);
+        if (!utils::parse_aob_pattern(pattern)) {
+            std::cerr << "[!] Invalid AOB pattern. Example: 'scan aob 48 8B ? ? 89'\n";
+            return;
+        }
+        std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
+        g_current_type = *type;
+        g_results = g_scanner->first_scan_aob(pattern, 1);
     } else {
-        auto val = parse_value(g_current_type, val_str);
-        g_results = g_scanner->first_scan(g_current_type, scanner::ScanCondition::ExactValue, val, {}, alignment);
+        auto val = parse_value(*type, val_str);
+        if (!val) return;
+        std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
+        g_current_type = *type;
+        g_results = g_scanner->first_scan(*type, scanner::ScanCondition::ExactValue, *val, {},
+                                          scanner::get_data_type_size(*type));
     }
 
     std::cout << "[+] First Scan complete. Found " << g_results.count() << " match(es).\n";
 }
 
-void cmd_next_scan(const std::string& cond_str, const std::string& val_str) {
+void cmd_next_scan(const std::string& cond_str, const std::string& val_str, const std::string& val2_str) {
     if (!g_process || !g_process->is_attached()) {
         std::cerr << "[-] Not attached to any process.\n";
         return;
@@ -221,24 +242,55 @@ void cmd_next_scan(const std::string& cond_str, const std::string& val_str) {
         return;
     }
 
-    scanner::ScanCondition cond = scanner::ScanCondition::ExactValue;
-    if (cond_str == "exact") cond = scanner::ScanCondition::ExactValue;
-    else if (cond_str == "changed") cond = scanner::ScanCondition::Changed;
-    else if (cond_str == "unchanged") cond = scanner::ScanCondition::Unchanged;
-    else if (cond_str == "inc") cond = scanner::ScanCondition::Increased;
-    else if (cond_str == "dec") cond = scanner::ScanCondition::Decreased;
-    else {
-        std::cerr << "[!] Unknown condition: " << cond_str << ". Use exact/changed/unchanged/inc/dec.\n";
+    struct ConditionSpec {
+        const char* name;
+        scanner::ScanCondition cond;
+        int value_count;
+    };
+    static constexpr ConditionSpec conditions[] = {
+        {"exact",     scanner::ScanCondition::ExactValue,  1},
+        {"changed",   scanner::ScanCondition::Changed,     0},
+        {"unchanged", scanner::ScanCondition::Unchanged,   0},
+        {"inc",       scanner::ScanCondition::Increased,   0},
+        {"dec",       scanner::ScanCondition::Decreased,   0},
+        {"gt",        scanner::ScanCondition::GreaterThan, 1},
+        {"lt",        scanner::ScanCondition::LessThan,    1},
+        {"between",   scanner::ScanCondition::Between,     2},
+        {"incby",     scanner::ScanCondition::IncreasedBy, 1},
+        {"decby",     scanner::ScanCondition::DecreasedBy, 1},
+    };
+
+    const ConditionSpec* spec = nullptr;
+    for (const auto& c : conditions) {
+        if (cond_str == c.name) spec = &c;
+    }
+    if (!spec) {
+        std::cerr << "[!] Unknown condition: " << cond_str
+                  << ". Use exact/changed/unchanged/inc/dec/gt/lt/between/incby/decby.\n";
+        return;
+    }
+
+    if (g_current_type == scanner::DataType::AOB &&
+        spec->cond != scanner::ScanCondition::Changed && spec->cond != scanner::ScanCondition::Unchanged) {
+        std::cerr << "[!] AOB results only support 'next changed' and 'next unchanged'.\n";
         return;
     }
 
     scanner::ScanValue val;
-    if (cond == scanner::ScanCondition::ExactValue) {
-        val = parse_value(g_current_type, val_str);
+    scanner::ScanValue val2;
+    if (spec->value_count >= 1) {
+        auto parsed = parse_value(g_current_type, val_str);
+        if (!parsed) return;
+        val = *parsed;
+    }
+    if (spec->value_count >= 2) {
+        auto parsed = parse_value(g_current_type, val2_str);
+        if (!parsed) return;
+        val2 = *parsed;
     }
 
     std::cout << "[*] Filtering " << g_results.count() << " results ...\n";
-    g_results = g_scanner->next_scan(g_results, cond, val);
+    g_results = g_scanner->next_scan(g_results, spec->cond, val, val2);
     std::cout << "[+] Next Scan complete. " << g_results.count() << " match(es) remaining.\n";
 }
 
@@ -256,9 +308,11 @@ void cmd_grouped_scan(const std::vector<std::string>& tokens) {
 
     std::vector<scanner::GroupedEntry> entries;
     for (size_t i = 0; i < tokens.size(); i += 2) {
-        auto type = parse_type(tokens[i]);
-        auto val = parse_value(type, tokens[i + 1]);
-        entries.push_back({type, val, 0, false});
+        auto type = parse_numeric_type(tokens[i]);
+        if (!type) return;
+        auto val = parse_value(*type, tokens[i + 1]);
+        if (!val) return;
+        entries.push_back({*type, *val, 0, false});
     }
 
     std::cout << "[*] Running Grouped Scan with " << entries.size() << " members in 0x100 byte window...\n";
@@ -313,15 +367,17 @@ void cmd_freeze(const std::string& addr_str, const std::string& type_str, const 
         return;
     }
 
-    auto type = parse_type(type_str);
-    auto val = parse_value(type, val_str);
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
+    auto val = parse_value(*type, val_str);
+    if (!val) return;
 
     {
         std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        g_frozen_list.push_back({addr, type, val, true});
+        g_frozen_list.push_back({addr, *type, *val, true});
     }
 
-    std::cout << "[+] Frozen " << utils::format_address(addr) << " to value [" << val.to_string() << "].\n";
+    std::cout << "[+] Frozen " << utils::format_address(addr) << " to value [" << val->to_string() << "].\n";
 }
 
 void cmd_list_frozen() {
@@ -394,22 +450,18 @@ void cmd_write(const std::string& addr_str, const std::string& type_str, const s
         return;
     }
 
-    auto type = parse_type(type_str);
-    auto val = parse_value(type, val_str);
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
+    auto val = parse_value(*type, val_str);
+    if (!val) return;
 
     bool success = false;
-    switch (type) {
-        case scanner::DataType::Int8:   success = g_process->write(addr, std::get<int8_t>(val.value)); break;
-        case scanner::DataType::Int16:  success = g_process->write(addr, std::get<int16_t>(val.value)); break;
-        case scanner::DataType::Int32:  success = g_process->write(addr, std::get<int32_t>(val.value)); break;
-        case scanner::DataType::Int64:  success = g_process->write(addr, std::get<int64_t>(val.value)); break;
-        case scanner::DataType::Float:  success = g_process->write(addr, std::get<float>(val.value)); break;
-        case scanner::DataType::Double: success = g_process->write(addr, std::get<double>(val.value)); break;
-        default: break;
-    }
+    scanner::dispatch_numeric(*type, [&]<typename T>() {
+        success = g_process->write(addr, std::get<T>(val->value));
+    });
 
     if (success) {
-        std::cout << "[+] Successfully wrote value [" << val.to_string() << "] to " 
+        std::cout << "[+] Successfully wrote value [" << val->to_string() << "] to "
                   << utils::format_address(addr) << "\n";
     } else {
         std::cerr << "[-] Failed to write to " << utils::format_address(addr) << "\n";
@@ -428,50 +480,21 @@ void cmd_read(const std::string& addr_str, const std::string& type_str) {
         return;
     }
 
-    auto type = parse_type(type_str);
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
     std::cout << "Address: " << utils::format_address(addr) << " = ";
 
-    switch (type) {
-        case scanner::DataType::Int8: {
-            int8_t v = 0;
-            if (g_process->read(addr, v)) std::cout << static_cast<int>(v) << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
+    scanner::dispatch_numeric(*type, [&]<typename T>() {
+        T v{};
+        if (g_process->read(addr, v)) {
+            scanner::ScanValue sv;
+            sv.type = *type;
+            sv.value = v;
+            std::cout << sv.to_string() << "\n";
+        } else {
+            std::cout << "?? (Read failed)\n";
         }
-        case scanner::DataType::Int16: {
-            int16_t v = 0;
-            if (g_process->read(addr, v)) std::cout << v << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
-        }
-        case scanner::DataType::Int32: {
-            int32_t v = 0;
-            if (g_process->read(addr, v)) std::cout << v << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
-        }
-        case scanner::DataType::Int64: {
-            int64_t v = 0;
-            if (g_process->read(addr, v)) std::cout << v << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
-        }
-        case scanner::DataType::Float: {
-            float v = 0.0f;
-            if (g_process->read(addr, v)) std::cout << v << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
-        }
-        case scanner::DataType::Double: {
-            double v = 0.0;
-            if (g_process->read(addr, v)) std::cout << v << "\n";
-            else std::cout << "?? (Read failed)\n";
-            break;
-        }
-        default:
-            std::cout << "Unsupported read type.\n";
-            break;
-    }
+    });
 }
 
 void cmd_dump(const std::string& addr_str, size_t size = 64) {
@@ -486,12 +509,120 @@ void cmd_dump(const std::string& addr_str, size_t size = 64) {
         return;
     }
 
+    constexpr size_t MAX_DUMP_SIZE = 64 * 1024;
+    if (size == 0 || size > MAX_DUMP_SIZE) {
+        std::cerr << "[-] Dump size must be between 1 and " << MAX_DUMP_SIZE << " bytes.\n";
+        return;
+    }
+
     std::vector<uint8_t> buffer(size);
     if (g_process->read_raw(addr, buffer.data(), size)) {
         std::cout << "\n" << utils::format_hex_dump(addr, buffer.data(), size) << "\n";
     } else {
         std::cerr << "[-] Failed to read " << size << " bytes from " << utils::format_address(addr) << "\n";
     }
+}
+
+// Runs one command line. Returns false when the user asked to quit.
+bool handle_command(const std::string& line) {
+    std::istringstream iss(line);
+    std::string cmd;
+    iss >> cmd;
+
+    if (cmd == "quit" || cmd == "exit") {
+        return false;
+    } else if (cmd == "help" || cmd == "?") {
+        print_help();
+    } else if (cmd == "ps") {
+        std::string filter;
+        iss >> filter;
+        cmd_ps(filter);
+    } else if (cmd == "attach") {
+        uint32_t pid = 0;
+        if (iss >> pid) {
+            cmd_attach(pid);
+        } else {
+            std::cout << "Usage: attach <pid>\n";
+        }
+    } else if (cmd == "detach") {
+        cmd_detach();
+    } else if (cmd == "modules") {
+        cmd_modules();
+    } else if (cmd == "regions") {
+        cmd_regions();
+    } else if (cmd == "scan") {
+        std::string type, val;
+        if (iss >> type >> val) {
+            cmd_first_scan(type, val, line);
+        } else {
+            std::cout << "Usage: scan <type> <value>\n";
+        }
+    } else if (cmd == "next") {
+        std::string cond, val, val2;
+        if (iss >> cond) {
+            iss >> val >> val2;
+            cmd_next_scan(cond, val, val2);
+        } else {
+            std::cout << "Usage: next <exact/changed/unchanged/inc/dec/gt/lt/between/incby/decby> [value] [value2]\n";
+        }
+    } else if (cmd == "group") {
+        std::vector<std::string> tokens;
+        std::string t;
+        while (iss >> t) tokens.push_back(t);
+        cmd_grouped_scan(tokens);
+    } else if (cmd == "ptrscan") {
+        std::string addr_str;
+        size_t depth = 4, offset = 0x800;
+        if (iss >> addr_str) {
+            iss >> depth >> std::hex >> offset;
+            cmd_pointer_scan(addr_str, depth, offset);
+        } else {
+            std::cout << "Usage: ptrscan <addr> [max_depth=4] [max_offset=0x800]\n";
+        }
+    } else if (cmd == "freeze") {
+        std::string addr, type, val;
+        if (iss >> addr >> type >> val) {
+            cmd_freeze(addr, type, val);
+        } else {
+            std::cout << "Usage: freeze <addr> <type> <val>\n";
+        }
+    } else if (cmd == "frozen") {
+        cmd_list_frozen();
+    } else if (cmd == "unfreeze") {
+        std::string param = "all";
+        iss >> param;
+        cmd_unfreeze(param);
+    } else if (cmd == "list") {
+        size_t count = 20;
+        iss >> count;
+        cmd_list(count);
+    } else if (cmd == "write") {
+        std::string addr, type, val;
+        if (iss >> addr >> type >> val) {
+            cmd_write(addr, type, val);
+        } else {
+            std::cout << "Usage: write <addr> <type> <val>\n";
+        }
+    } else if (cmd == "read") {
+        std::string addr, type;
+        if (iss >> addr >> type) {
+            cmd_read(addr, type);
+        } else {
+            std::cout << "Usage: read <addr> <type>\n";
+        }
+    } else if (cmd == "dump") {
+        std::string addr;
+        size_t size = 64;
+        if (iss >> addr) {
+            iss >> size;
+            cmd_dump(addr, size);
+        } else {
+            std::cout << "Usage: dump <addr> [size]\n";
+        }
+    } else {
+        std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";
+    }
+    return true;
 }
 
 int main() {
@@ -512,104 +643,10 @@ int main() {
         if (!std::getline(std::cin, line)) break;
         if (line.empty()) continue;
 
-        std::istringstream iss(line);
-        std::string cmd;
-        iss >> cmd;
-
-        if (cmd == "quit" || cmd == "exit") {
-            break;
-        } else if (cmd == "help" || cmd == "?") {
-            print_help();
-        } else if (cmd == "ps") {
-            std::string filter;
-            iss >> filter;
-            cmd_ps(filter);
-        } else if (cmd == "attach") {
-            uint32_t pid = 0;
-            if (iss >> pid) {
-                cmd_attach(pid);
-            } else {
-                std::cout << "Usage: attach <pid>\n";
-            }
-        } else if (cmd == "detach") {
-            if (g_process) g_process->detach();
-            g_results.clear();
-            std::cout << "[*] Detached.\n";
-        } else if (cmd == "modules") {
-            cmd_modules();
-        } else if (cmd == "regions") {
-            cmd_regions();
-        } else if (cmd == "scan") {
-            std::string type, val;
-            if (iss >> type >> val) {
-                cmd_first_scan(type, val, line);
-            } else {
-                std::cout << "Usage: scan <type> <value>\n";
-            }
-        } else if (cmd == "next") {
-            std::string cond, val;
-            if (iss >> cond) {
-                iss >> val;
-                cmd_next_scan(cond, val);
-            } else {
-                std::cout << "Usage: next <exact/changed/unchanged/inc/dec> [value]\n";
-            }
-        } else if (cmd == "group") {
-            std::vector<std::string> tokens;
-            std::string t;
-            while (iss >> t) tokens.push_back(t);
-            cmd_grouped_scan(tokens);
-        } else if (cmd == "ptrscan") {
-            std::string addr_str;
-            size_t depth = 4, offset = 0x800;
-            if (iss >> addr_str) {
-                iss >> depth >> std::hex >> offset;
-                cmd_pointer_scan(addr_str, depth, offset);
-            } else {
-                std::cout << "Usage: ptrscan <addr> [max_depth=4] [max_offset=0x800]\n";
-            }
-        } else if (cmd == "freeze") {
-            std::string addr, type, val;
-            if (iss >> addr >> type >> val) {
-                cmd_freeze(addr, type, val);
-            } else {
-                std::cout << "Usage: freeze <addr> <type> <val>\n";
-            }
-        } else if (cmd == "frozen") {
-            cmd_list_frozen();
-        } else if (cmd == "unfreeze") {
-            std::string param = "all";
-            iss >> param;
-            cmd_unfreeze(param);
-        } else if (cmd == "list") {
-            size_t count = 20;
-            iss >> count;
-            cmd_list(count);
-        } else if (cmd == "write") {
-            std::string addr, type, val;
-            if (iss >> addr >> type >> val) {
-                cmd_write(addr, type, val);
-            } else {
-                std::cout << "Usage: write <addr> <type> <val>\n";
-            }
-        } else if (cmd == "read") {
-            std::string addr, type;
-            if (iss >> addr >> type) {
-                cmd_read(addr, type);
-            } else {
-                std::cout << "Usage: read <addr> <type>\n";
-            }
-        } else if (cmd == "dump") {
-            std::string addr;
-            size_t size = 64;
-            if (iss >> addr) {
-                iss >> size;
-                cmd_dump(addr, size);
-            } else {
-                std::cout << "Usage: dump <addr> [size]\n";
-            }
-        } else {
-            std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";
+        try {
+            if (!handle_command(line)) break;
+        } catch (const std::exception& e) {
+            std::cerr << "[!] Command failed: " << e.what() << "\n";
         }
     }
 
