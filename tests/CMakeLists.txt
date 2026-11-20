@@ -11,6 +11,7 @@ add_executable(engine_tests
     test_text_encoding.cpp
     test_results_io.cpp
     test_win32_process.cpp
+    test_session.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

@@ -12,6 +12,8 @@ add_library(engine STATIC
     src/utils/hex_utils.cpp
     src/utils/text_encoding.cpp
     src/table/cheat_table.cpp
+    src/session/scan_session.cpp
+    src/session/session.cpp
 )
 
 target_include_directories(engine PUBLIC

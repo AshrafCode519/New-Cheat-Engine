@@ -7,12 +7,12 @@
 #include <algorithm>
 #include <thread>
 #include <atomic>
-#include <mutex>
 #include <chrono>
 #include <optional>
 #include <exception>
 #include <utility>
 #include <charconv>
+#include <cctype>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -24,145 +24,49 @@
 #include <windows.h>
 #endif
 
-#include "hal/process.hpp"
-#include "scanner/memory_scanner.hpp"
-#include "scanner/pointer_scanner.hpp"
+#include "session/session.hpp"
 #include "scanner/grouped_scanner.hpp"
 #include "utils/hex_utils.hpp"
-#include "utils/text_encoding.hpp"
-#include "table/cheat_table.hpp"
-#include "scanner/value_tracker.hpp"
 
 using namespace nce;
 
-static std::shared_ptr<hal::IProcess> g_process;
-static std::unique_ptr<scanner::MemoryScanner> g_scanner;
-static scanner::ScanResults g_results;
-static scanner::DataType g_current_type = scanner::DataType::Int32;
-static std::shared_ptr<scanner::MemorySnapshot> g_snapshot; // set by an unknown-value first scan
-static std::shared_ptr<scanner::NoiseMap> g_noise;          // addresses that change on their own, learned on attach
+// The attached target with its search, noise map, cheat table (and the thread that keeps frozen
+// entries at their values) and pointer paths. This file only parses commands and prints.
+session::Session& ses() {
+    static session::Session s;
+    return s;
+}
+
 static scanner::FloatMatchMode g_float_mode = scanner::FloatMatchMode::Rounded;
-
-// Undo history: the scan state before each scan
-struct ScanState {
-    scanner::ScanResults results;
-    std::shared_ptr<scanner::MemorySnapshot> snapshot;
-    scanner::DataType type{scanner::DataType::Int32};
-};
-
-static std::vector<ScanState> g_history;
-constexpr size_t MAX_UNDO_STEPS = 5;
-
-// Moves the current state into the undo history and leaves it empty.
-// Snapshots can be as large as the scanned memory, so the history keeps only the newest one:
-// pushing a snapshot state drops every older entry.
-void push_history() {
-    const bool pushing_snapshot = static_cast<bool>(g_snapshot);
-    if (pushing_snapshot) {
-        g_history.clear();
-    }
-    g_history.push_back({std::move(g_results), std::move(g_snapshot), g_current_type});
-    if (g_history.size() > MAX_UNDO_STEPS) {
-        g_history.erase(g_history.begin());
-    }
-    g_results.clear();
-    g_snapshot.reset();
-}
-
-void clear_scan_state() {
-    g_results.clear();
-    g_snapshot.reset();
-    g_history.clear();
-}
 
 bool is_numeric_type(scanner::DataType type) {
     return scanner::dispatch_numeric(type, []<typename T>() {});
-}
-
-std::string format_size(size_t bytes) {
-    std::ostringstream ss;
-    if (bytes >= 1024 * 1024) ss << (bytes / (1024 * 1024)) << " MB";
-    else ss << (bytes / 1024) << " KB";
-    return ss.str();
-}
-
-std::string describe_scan_state() {
-    std::ostringstream ss;
-    if (g_snapshot) {
-        ss << g_snapshot->candidate_count() << " candidates, snapshot " << format_size(g_snapshot->memory_bytes());
-    } else {
-        ss << g_results.count() << " matches";
-    }
-    return ss.str();
 }
 
 long long elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
-// Makes the current scan state `source` filtered by one next-scan step. A snapshot stays a snapshot
-// until its candidates would take less memory as a results list.
-void filter_into_current(const ScanState& source, scanner::ScanCondition cond,
-                         const scanner::ScanValue& val1, const scanner::ScanValue& val2) {
-    g_current_type = source.type;
-    if (!source.snapshot) {
-        g_results = g_scanner->next_scan(source.results, cond, val1, val2);
-        g_snapshot.reset();
-        return;
-    }
-
-    auto filtered = std::make_shared<scanner::MemorySnapshot>(
-        g_scanner->filter_snapshot(*source.snapshot, cond, val1, val2));
-    const size_t result_bytes = filtered->candidate_count() *
-                                (sizeof(uintptr_t) + 2 * scanner::get_data_type_size(filtered->type));
-    if (result_bytes <= filtered->memory_bytes()) {
-        g_results = scanner::MemoryScanner::snapshot_to_results(*filtered);
-        g_snapshot.reset();
-    } else {
-        g_results.clear();
-        g_snapshot = std::move(filtered);
-    }
+std::string sentence(std::string text) {
+    if (!text.empty()) text[0] = static_cast<char>(std::toupper(static_cast<unsigned char>(text[0])));
+    return text;
 }
 
-// Freeze list support
-struct FrozenEntry {
-    uintptr_t address{0};
-    scanner::DataType type{scanner::DataType::Int32};
-    scanner::ScanValue value;
-    bool active{true};
-};
+// Prints what an engine operation did: its note when it worked, the reason when it didn't
+bool report(const session::Outcome& outcome) {
+    if (!outcome.ok) std::cerr << "[-] " << outcome.message << "\n";
+    else if (!outcome.message.empty()) std::cout << "[+] " << outcome.message << "\n";
+    return outcome.ok;
+}
 
-static std::vector<FrozenEntry> g_frozen_list;
-static std::mutex g_freeze_mutex;
-static std::atomic<bool> g_freeze_running{true};
-static std::thread g_freeze_thread;
-
-// Cheat table and the target's modules (used to resolve its entries). The freeze thread writes frozen
-// table entries, so both are only touched under g_freeze_mutex. The table is kept across attach:
-// its module-relative entries are meant for the next run of the same program.
-static table::CheatTable g_table;
-static std::vector<hal::ModuleInfo> g_modules;
-
-void freeze_worker() {
-    while (g_freeze_running) {
-        {
-            std::lock_guard<std::mutex> lock(g_freeze_mutex);
-            if (g_process && g_process->is_attached()) {
-                for (const auto& entry : g_frozen_list) {
-                    if (!entry.active) continue;
-                    scanner::dispatch_numeric(entry.type, [&]<typename T>() {
-                        g_process->write(entry.address, std::get<T>(entry.value.value));
-                    });
-                }
-                for (const auto& entry : g_table.entries) {
-                    if (entry.frozen_value) {
-                        table::write_entry(entry, *entry.frozen_value, *g_process, g_modules);
-                    }
-                }
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+bool require_attached() {
+    if (ses().attached()) return true;
+    if (ses().exited()) {
+        std::cerr << "[-] " << ses().process().name() << " exited. 'reattach' waits for it to start again.\n";
+    } else {
+        std::cerr << "[-] Not attached to any process. Use 'attach <pid>'.\n";
     }
+    return false;
 }
 
 void print_banner() {
@@ -216,9 +120,9 @@ void print_help() {
               << "  write <addr> <type> <val>       - Write value to memory address\n"
               << "  read <addr> <type>              - Read value from memory address\n"
               << "  dump <addr> [bytes]             - Hex dump memory (default: 64 bytes)\n"
-              << "  freeze <addr> <type> <val>      - Lock/freeze value continuously\n"
-              << "  frozen                          - List all frozen values\n"
-              << "  unfreeze [index|all]            - Remove value from freeze list\n\n"
+              << "  freeze <addr> <type> <val>      - Add an address to the table, frozen at a value\n"
+              << "  frozen                          - List the frozen table entries\n"
+              << "  unfreeze [#|all]                - Stop freezing a table entry (default: all)\n\n"
               << "  help                            - Show this help menu\n"
               << "  quit                            - Exit CLI\n\n";
 }
@@ -241,29 +145,28 @@ std::optional<scanner::ScanValue> parse_value(scanner::DataType type, const std:
     return value;
 }
 
-const char* float_mode_name(scanner::FloatMatchMode mode) {
-    switch (mode) {
-        case scanner::FloatMatchMode::Rounded:   return "rounded";
-        case scanner::FloatMatchMode::Truncated: return "truncated";
-        case scanner::FloatMatchMode::Exact:     return "exact";
+std::optional<uintptr_t> parse_address_arg(const std::string& text) {
+    const uintptr_t address = utils::parse_address(text);
+    if (address == 0) {
+        std::cerr << "[-] Invalid address: " << text << "\n";
+        return std::nullopt;
     }
-    return "?";
+    return address;
 }
 
-// For f32/f64 under the rounded/truncated float mode: the [low, high] range an exact value stands for
-std::optional<std::pair<scanner::ScanValue, scanner::ScanValue>> float_exact_range(scanner::DataType type,
-                                                                                    const std::string& val_str) {
-    if (type != scanner::DataType::Float && type != scanner::DataType::Double) return std::nullopt;
-    auto range = utils::float_match_range(val_str, g_float_mode);
-    if (!range) return std::nullopt;
-
-    std::cout << "[*] Matching " << utils::format_data_type(type) << " values in [" << range->first << ", "
-              << range->second << "] (floatmode " << float_mode_name(g_float_mode) << ")\n";
-    if (type == scanner::DataType::Float) {
-        return std::make_pair(scanner::ScanValue::of(type, static_cast<float>(range->first)),
-                              scanner::ScanValue::of(type, static_cast<float>(range->second)));
+// Parses "3" into a valid index of a list of `size` items, or prints an error
+std::optional<size_t> parse_index(const std::string& text, size_t size, const char* what) {
+    size_t index = 0;
+    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), index);
+    if (ec != std::errc() || ptr != text.data() + text.size() || text.empty() || index >= size) {
+        std::cerr << "[-] No " << what << " #" << text << " (there are " << size << ").\n";
+        return std::nullopt;
     }
-    return std::make_pair(scanner::ScanValue::of(type, range->first), scanner::ScanValue::of(type, range->second));
+    return index;
+}
+
+std::optional<size_t> parse_table_index(const std::string& text) {
+    return parse_index(text, ses().table().size(), "table entry");
 }
 
 void cmd_ps(const std::string& filter) {
@@ -286,32 +189,16 @@ void cmd_ps(const std::string& filter) {
     std::cout << " Found " << count << " process(es).\n\n";
 }
 
-void reconcile_table();
-
-std::string describe_noise() {
-    if (!g_noise || g_noise->empty()) return "no noise known";
-    std::ostringstream ss;
-    ss << "ignoring " << g_noise->noisy_slots() << " addresses that change on their own";
-    if (g_noise->skipped_bytes() > 0) ss << " (" << format_size(g_noise->skipped_bytes()) << " skipped whole)";
-    return ss.str();
-}
-
 // Samples the target 4 times a second; addresses that change in most samples are ignored by every scan
 void learn_noise(int seconds) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    scanner::NoiseMap::Options options;
+    if (!require_attached()) return;
+    scanner::NoiseOptions options;
     options.samples = static_cast<size_t>(std::max(3, seconds * 4));
 
     std::cout << "[*] Learning noise for " << seconds << " s - leave the target alone ..." << std::flush;
     const auto start = std::chrono::steady_clock::now();
-    auto noise = std::make_shared<scanner::NoiseMap>();
-    noise->learn(*g_process, options);
-    g_noise = noise;
-    g_scanner->set_noise_map(g_noise);
-    std::cout << " done in " << elapsed_ms(start) << " ms: " << describe_noise() << ".\n";
+    ses().set_noise(ses().learn_noise(options));
+    std::cout << " done in " << elapsed_ms(start) << " ms: " << ses().describe_noise() << ".\n";
 }
 
 void cmd_noise(const std::string& action, const std::string& argument) {
@@ -326,84 +213,62 @@ void cmd_noise(const std::string& action, const std::string& argument) {
         }
         learn_noise(seconds);
     } else if (action == "clear") {
-        g_noise.reset();
-        if (g_scanner) g_scanner->set_noise_map(nullptr);
+        ses().set_noise(nullptr);
         std::cout << "[*] Noise cleared: scans look at every address again.\n";
     } else if (action.empty()) {
-        std::cout << "[*] Noise: " << describe_noise() << ".\n";
+        std::cout << "[*] Noise: " << ses().describe_noise() << ".\n";
     } else {
         std::cout << "Usage: noise [learn [seconds] | clear]\n";
     }
 }
 
+// Permanent entries carry several pointer paths; after a restart they vote on where the value is now
+void print_reconciled(const std::vector<session::TableKeeper::ReconcileLine>& lines) {
+    for (const auto& line : lines) {
+        std::cout << "[*] #" << line.index << " " << line.description << ": " << session::describe_reconcile(line.result)
+                  << ".\n";
+    }
+}
+
 void cmd_attach(uint32_t pid) {
-    bool attached = false;
-    size_t dropped_freezes = 0;
-    {
-        // The freeze thread writes through g_process while holding this lock, so the handle
-        // may only change under it. Frozen addresses belong to the old process: drop them.
-        std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        dropped_freezes = g_frozen_list.size();
-        g_frozen_list.clear();
-        // Absolute table addresses also belong to the old process; module-relative ones stay frozen
-        // (they only resolve if the new process has the same module)
-        for (auto& entry : g_table.entries) {
-            if (entry.is_absolute() && entry.frozen_value) {
-                entry.frozen_value.reset();
-                ++dropped_freezes;
-            }
-        }
-        if (!g_process) {
-            g_process = hal::IProcess::create();
-        }
-        attached = g_process->attach(pid);
-        g_modules = attached ? g_process->get_modules() : std::vector<hal::ModuleInfo>{};
+    const auto attached = ses().attach(pid);
+    if (attached.unfrozen > 0) {
+        std::cout << "[*] Unfroze " << attached.unfrozen << " table entr(ies) at heap addresses of the previous process.\n";
     }
-
-    clear_scan_state();
-    if (dropped_freezes > 0) {
-        std::cout << "[*] Unfroze " << dropped_freezes << " address(es) that belonged to the previous process.\n";
-    }
-
-    g_noise.reset(); // learned for the previous process
-    if (attached) {
-        g_scanner = std::make_unique<scanner::MemoryScanner>(g_process);
-        std::cout << "[+] Successfully attached to PID: " << pid << " (" << g_process->name() << ")\n";
-        if (!g_process->can_write()) {
-            std::cout << "[!] Only read access was granted: writing and freezing won't work. Run as Administrator.\n";
-        }
-        learn_noise(4);
-        reconcile_table();
-    } else {
+    if (!attached.ok) {
         std::cerr << "[-] Failed to attach to PID: " << pid << ". Run as Administrator or check PID.\n";
+        return;
     }
+    std::cout << "[+] Successfully attached to PID: " << pid << " (" << ses().process().name() << ", "
+              << ses().process().pointer_size() * 8 << "-bit)\n";
+    if (attached.read_only) {
+        std::cout << "[!] Only read access was granted: writing and freezing won't work. Run as Administrator.\n";
+    }
+    learn_noise(4);
+    print_reconciled(attached.reconciled);
 }
 
 // After the target exits: waits for the same program to start again, gives it a moment to set up,
 // then attaches (which relearns noise, re-finds permanent table entries and resumes freezing)
 void cmd_reattach(int seconds) {
-    if (!g_process || g_process->name().empty()) {
+    const std::string name = ses().process().name();
+    if (name.empty()) {
         std::cerr << "[-] Attach to a program first; reattach waits for that program to restart.\n";
         return;
     }
-    if (g_process->is_attached()) {
-        std::cout << "[*] Still attached to " << g_process->name() << " (PID " << g_process->get_pid() << ").\n";
+    if (ses().attached()) {
+        std::cout << "[*] Still attached to " << name << " (PID " << ses().process().get_pid() << ").\n";
         return;
     }
 
-    const std::string name = g_process->name();
-    const uint32_t old_pid = g_process->get_pid();
     std::cout << "[*] Waiting up to " << seconds << " s for " << name << " to start again ..." << std::flush;
-
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
     while (std::chrono::steady_clock::now() < deadline) {
-        for (const auto& p : hal::IProcess::list_processes()) {
-            if (p.pid != old_pid && _stricmp(p.name.c_str(), name.c_str()) == 0) {
-                std::cout << " found PID " << p.pid << ".\n";
-                std::this_thread::sleep_for(std::chrono::seconds(3)); // let it set up its objects
-                cmd_attach(p.pid);
-                return;
-            }
+        if (auto restarted = ses().find_restart()) {
+            std::cout << " found PID " << restarted->pid << ".\n";
+            std::this_thread::sleep_for(std::chrono::seconds(3)); // let it set up its objects
+            cmd_attach(restarted->pid);
+            return;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(500));
     }
@@ -411,22 +276,13 @@ void cmd_reattach(int seconds) {
 }
 
 void cmd_detach() {
-    {
-        std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        g_frozen_list.clear();
-        if (g_process) g_process->detach();
-        g_modules.clear();
-    }
-    clear_scan_state();
+    ses().detach();
     std::cout << "[*] Detached.\n";
 }
 
 void cmd_modules() {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    auto modules = g_process->get_modules();
+    if (!require_attached()) return;
+    auto modules = ses().process().get_modules();
     std::cout << "\n Base Address        Size (Bytes)   Module Name\n";
     std::cout << "------------------------------------------------------------------\n";
     for (const auto& m : modules) {
@@ -439,168 +295,71 @@ void cmd_modules() {
 }
 
 void cmd_regions() {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    auto regions = g_process->query_regions();
+    if (!require_attached()) return;
+    auto regions = ses().process().query_regions();
     size_t total_size = 0;
     for (const auto& r : regions) total_size += r.size;
 
     std::cout << "\nMemory Regions Summary:\n";
     std::cout << " Readable/Writable Regions : " << regions.size() << "\n";
-    std::cout << " Total Scannable Memory    : " << (total_size / (1024 * 1024)) << " MB (" 
+    std::cout << " Total Scannable Memory    : " << (total_size / (1024 * 1024)) << " MB ("
               << total_size << " bytes)\n\n";
 }
 
 // rest = everything after the type: a number, '?' (unknown initial value), text for str/wstr, or an AOB pattern
 void cmd_first_scan(const std::string& type_str, const std::string& rest) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
-        return;
-    }
-
-    auto type = utils::parse_data_type(type_str);
-    if (!type) {
-        std::cerr << "[!] Unknown type: '" << type_str
-                  << "'. Use i8, i16, i32, i64, u8, u16, u32, u64, f32, f64, str, wstr, aob.\n";
-        return;
-    }
+    if (!require_attached()) return;
 
     std::istringstream rest_stream(rest);
-    std::string val_str;
-    rest_stream >> val_str;
+    std::string first_word;
+    rest_stream >> first_word;
+    const bool unknown = first_word == "?" || first_word == "unknown";
+    std::cout << (unknown ? "[*] Capturing unknown-value snapshot for type [" : "[*] Starting First Scan for type [")
+              << type_str << "] ...\n";
+
     const auto start = std::chrono::steady_clock::now();
-
-    if (*type == scanner::DataType::AOB) {
-        if (!utils::parse_aob_pattern(rest)) {
-            std::cerr << "[!] Invalid AOB pattern. Example: 'scan aob 48 8B ? ? 89'\n";
-            return;
-        }
-        std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
-        push_history();
-        g_current_type = *type;
-        g_results = g_scanner->first_scan_aob(rest, 1);
-    } else if (*type == scanner::DataType::String || *type == scanner::DataType::String16) {
-        const bool utf16 = (*type == scanner::DataType::String16);
-        if (utf16 && !utils::utf8_to_utf16le(rest)) {
-            std::cerr << "[!] Text is not valid UTF-8 (non-ASCII input needs a UTF-8 console).\n";
-            return;
-        }
-        std::cout << "[*] Starting First Scan for type [" << type_str << "] \"" << rest << "\" ...\n";
-        push_history();
-        g_current_type = *type;
-        g_results = g_scanner->first_scan_string(rest, utf16, 1);
-    } else if (val_str == "?" || val_str == "unknown") {
-        std::cout << "[*] Capturing unknown-value snapshot for type [" << type_str << "] ...\n";
-        push_history();
-        g_current_type = *type;
-        g_snapshot = std::make_shared<scanner::MemorySnapshot>(
-            g_scanner->first_scan_unknown(*type, scanner::get_data_type_size(*type)));
-        std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ". "
-                  << "Change the value in the target, then use 'next changed/unchanged/inc/dec/...'.\n";
+    auto& scans = ses().scans();
+    const auto outcome = scans.first_scan(type_str, rest, g_float_mode);
+    if (!outcome.ok) {
+        std::cerr << "[!] " << outcome.message << "\n";
         return;
-    } else {
-        auto val = parse_value(*type, val_str);
-        if (!val) return;
-        const auto range = float_exact_range(*type, val_str);
-        std::cout << "[*] Starting First Scan for type [" << type_str << "] ...\n";
-        push_history();
-        g_current_type = *type;
-        const size_t alignment = scanner::get_data_type_size(*type);
-        if (range) {
-            g_results = g_scanner->first_scan(*type, scanner::ScanCondition::Between, range->first, range->second, alignment);
-        } else {
-            g_results = g_scanner->first_scan(*type, scanner::ScanCondition::ExactValue, *val, {}, alignment);
-        }
     }
+    if (!outcome.message.empty()) std::cout << "[*] " << sentence(outcome.message) << "\n";
 
-    std::cout << "[+] First Scan complete in " << elapsed_ms(start) << " ms. Found " << g_results.count() << " match(es).\n";
+    if (scans.state().snapshot) {
+        std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << scans.describe() << ". "
+                  << "Change the value in the target, then use 'next changed/unchanged/inc/dec/...'.\n";
+    } else {
+        std::cout << "[+] First Scan complete in " << elapsed_ms(start) << " ms. Found " << scans.state().results.count()
+                  << " match(es).\n";
+    }
 }
 
 void cmd_next_scan(const std::string& cond_str, const std::string& val_str, const std::string& val2_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    if (g_results.empty() && !g_snapshot) {
+    if (!require_attached()) return;
+    auto& scans = ses().scans();
+    if (scans.empty()) {
         std::cerr << "[-] No active scan results. Run 'scan <type> <value>' first.\n";
         return;
     }
 
-    struct ConditionSpec {
-        const char* name;
-        scanner::ScanCondition cond;
-        int value_count;
-    };
-    static constexpr ConditionSpec conditions[] = {
-        {"exact",     scanner::ScanCondition::ExactValue,  1},
-        {"changed",   scanner::ScanCondition::Changed,     0},
-        {"unchanged", scanner::ScanCondition::Unchanged,   0},
-        {"inc",       scanner::ScanCondition::Increased,   0},
-        {"dec",       scanner::ScanCondition::Decreased,   0},
-        {"gt",        scanner::ScanCondition::GreaterThan, 1},
-        {"lt",        scanner::ScanCondition::LessThan,    1},
-        {"between",   scanner::ScanCondition::Between,     2},
-        {"incby",     scanner::ScanCondition::IncreasedBy, 1},
-        {"decby",     scanner::ScanCondition::DecreasedBy, 1},
-    };
-
-    const ConditionSpec* spec = nullptr;
-    for (const auto& c : conditions) {
-        if (cond_str == c.name) spec = &c;
-    }
-    if (!spec) {
-        std::cerr << "[!] Unknown condition: " << cond_str
-                  << ". Use exact/changed/unchanged/inc/dec/gt/lt/between/incby/decby.\n";
-        return;
-    }
-
-    if (!is_numeric_type(g_current_type) &&
-        spec->cond != scanner::ScanCondition::Changed && spec->cond != scanner::ScanCondition::Unchanged) {
-        std::cerr << "[!] Text and AOB results only support 'next changed' and 'next unchanged'.\n";
-        return;
-    }
-
-    scanner::ScanCondition cond = spec->cond;
-    scanner::ScanValue val;
-    scanner::ScanValue val2;
-    if (spec->value_count >= 1) {
-        auto parsed = parse_value(g_current_type, val_str);
-        if (!parsed) return;
-        val = *parsed;
-    }
-    if (spec->value_count >= 2) {
-        auto parsed = parse_value(g_current_type, val2_str);
-        if (!parsed) return;
-        val2 = *parsed;
-    }
-    if (cond == scanner::ScanCondition::ExactValue) {
-        if (auto range = float_exact_range(g_current_type, val_str)) {
-            cond = scanner::ScanCondition::Between;
-            val = range->first;
-            val2 = range->second;
-        }
-    }
-
-    std::cout << "[*] Filtering " << describe_scan_state() << " ...\n";
+    std::cout << "[*] Filtering " << scans.describe() << " ...\n";
     const auto start = std::chrono::steady_clock::now();
-    push_history();
-    filter_into_current(g_history.back(), cond, val, val2);
-    std::cout << "[+] Next Scan complete in " << elapsed_ms(start) << " ms: " << describe_scan_state() << " remaining.\n";
+    const auto outcome = scans.next_scan(cond_str, val_str, val2_str, g_float_mode);
+    if (!outcome.ok) {
+        std::cerr << "[!] " << outcome.message << "\n";
+        return;
+    }
+    if (!outcome.message.empty()) std::cout << "[*] " << sentence(outcome.message) << "\n";
+    std::cout << "[+] Next Scan complete in " << elapsed_ms(start) << " ms: " << scans.describe() << " remaining.\n";
 }
 
 void cmd_undo() {
-    if (g_history.empty()) {
+    if (!ses().scans().undo()) {
         std::cerr << "[-] Nothing to undo.\n";
         return;
     }
-    ScanState& previous = g_history.back();
-    g_results = std::move(previous.results);
-    g_snapshot = std::move(previous.snapshot);
-    g_current_type = previous.type;
-    g_history.pop_back();
-    std::cout << "[*] Restored previous results: " << describe_scan_state() << ".\n";
+    std::cout << "[*] Restored previous results: " << ses().scans().describe() << ".\n";
 }
 
 void cmd_floatmode(const std::string& mode) {
@@ -611,21 +370,22 @@ void cmd_floatmode(const std::string& mode) {
         std::cerr << "[!] Unknown float mode: '" << mode << "'. Use rounded, truncated or exact.\n";
         return;
     }
-    std::cout << "[*] Float mode: " << float_mode_name(g_float_mode) << "\n";
+    std::cout << "[*] Float mode: " << session::float_mode_name(g_float_mode) << "\n";
 }
 
 void cmd_save(const std::string& path) {
-    if (g_snapshot) {
+    const auto& state = ses().scans().state();
+    if (state.snapshot) {
         std::cerr << "[-] An unknown-value snapshot can't be saved. Run a next scan first.\n";
         return;
     }
-    if (g_results.empty()) {
+    if (state.results.empty()) {
         std::cerr << "[-] No results to save.\n";
         return;
     }
-    const uint32_t pid = (g_process && g_process->is_attached()) ? g_process->get_pid() : 0;
-    if (scanner::save_results(path, pid, g_current_type, g_results)) {
-        std::cout << "[+] Saved " << g_results.count() << " result(s) to " << path << "\n";
+    const uint32_t pid = ses().attached() ? ses().process().get_pid() : 0;
+    if (scanner::save_results(path, pid, state.type, state.results)) {
+        std::cout << "[+] Saved " << state.results.count() << " result(s) to " << path << "\n";
     } else {
         std::cerr << "[-] Failed to write " << path << "\n";
     }
@@ -637,19 +397,15 @@ void cmd_load(const std::string& path) {
         std::cerr << "[-] Could not read results from " << path << "\n";
         return;
     }
-    push_history();
-    g_results = std::move(saved->results);
-    g_current_type = saved->type;
-    std::cout << "[+] Loaded " << g_results.count() << " " << utils::format_data_type(g_current_type)
+    ses().scans().replace(std::move(saved->results), saved->type);
+    std::cout << "[+] Loaded " << ses().scans().state().results.count() << " " << utils::format_data_type(saved->type)
               << " result(s) from " << path << "\n";
 
-    if (g_process && g_process->is_attached() && saved->pid != g_process->get_pid()) {
+    if (ses().attached() && saved->pid != ses().process().get_pid()) {
         std::cout << "[!] These results were saved from PID " << saved->pid
-                  << "; addresses may not be valid in PID " << g_process->get_pid() << ".\n";
+                  << "; addresses may not be valid in PID " << ses().process().get_pid() << ".\n";
     }
 }
-
-void cmd_list(size_t max_count);
 
 std::string trim(const std::string& s) {
     const size_t first = s.find_first_not_of(" \t\r\n");
@@ -662,7 +418,7 @@ std::string describe_tracker(const scanner::ValueTracker& tracker) {
     std::ostringstream ss;
     ss << tracker.candidate_count() << " candidates";
     if (tracker.is_ranked()) ss << " (ranked)";
-    else ss << " (snapshot, " << format_size(tracker.memory_bytes()) << ")";
+    else ss << " (snapshot, " << session::format_size(tracker.memory_bytes()) << ")";
     return ss.str();
 }
 
@@ -682,10 +438,7 @@ void print_ranked(const scanner::ValueTracker& tracker, size_t count) {
 // the value and says how). Candidates are scored rather than cut on every answer, so one wrong answer
 // lowers the right address instead of losing it.
 void cmd_track(const std::string& type_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
-        return;
-    }
+    if (!require_attached()) return;
     // 'auto' follows i32, f32 and f64 together and lets the scoring pick the type
     std::vector<scanner::DataType> types;
     if (type_str == "auto") {
@@ -699,15 +452,14 @@ void cmd_track(const std::string& type_str) {
     constexpr size_t SHOW_BEST = 5;
     constexpr size_t MAX_HANDOVER = 5'000'000; // candidates turned into results when tracking stops
 
-    scanner::ValueTracker tracker(g_process, types);
-    tracker.set_noise_map(g_noise);
+    auto tracker = ses().new_tracker(types);
     std::cout << "[*] Tracking an unknown " << type_str << " value. Capturing snapshot ...\n";
     auto start = std::chrono::steady_clock::now();
-    tracker.start();
-    std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_tracker(tracker) << ".\n";
+    tracker->start();
+    std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_tracker(*tracker) << ".\n";
 
     for (int round = 1;; ++round) {
-        std::cout << "\n[track] Round " << round << " - " << describe_tracker(tracker) << ".\n"
+        std::cout << "\n[track] Round " << round << " - " << describe_tracker(*tracker) << ".\n"
                   << "        Leave the value alone: values that change on their own lose points.\n"
                   << "        Press Enter when you are ready to change it (or type 'done').\n";
 
@@ -718,10 +470,10 @@ void cmd_track(const std::string& type_str) {
             try {
                 size_t last_count = SIZE_MAX;
                 do {
-                    tracker.observe_quiet();
-                    const size_t count = tracker.candidate_count();
+                    tracker->observe_quiet();
+                    const size_t count = tracker->candidate_count();
                     if (count != last_count) {
-                        std::cout << "        [noise filter] " << describe_tracker(tracker) << "\n";
+                        std::cout << "        [noise filter] " << describe_tracker(*tracker) << "\n";
                         last_count = count;
                     }
                     for (int i = 0; i < 5 && !stop; ++i) {
@@ -755,36 +507,33 @@ void cmd_track(const std::string& type_str) {
         }
 
         start = std::chrono::steady_clock::now();
-        tracker.observe_event(*expected);
-        std::cout << "[+] Checked in " << elapsed_ms(start) << " ms: " << describe_tracker(tracker) << ".\n";
+        tracker->observe_event(*expected);
+        std::cout << "[+] Checked in " << elapsed_ms(start) << " ms: " << describe_tracker(*tracker) << ".\n";
 
-        if (tracker.candidate_count() == 0) {
+        if (tracker->candidate_count() == 0) {
             std::cout << "[-] No candidates left: the value did not change when you said it did.\n";
             break;
         }
-        if (tracker.is_ranked()) print_ranked(tracker, SHOW_BEST);
-        if (tracker.candidate_count() == 1) break;
+        if (tracker->is_ranked()) print_ranked(*tracker, SHOW_BEST);
+        if (tracker->candidate_count() == 1) break;
     }
 
     // Hand the candidates over as normal results, best first
-    if (tracker.candidate_count() > MAX_HANDOVER) {
-        std::cout << "[track] Stopped with " << describe_tracker(tracker)
+    if (tracker->candidate_count() > MAX_HANDOVER) {
+        std::cout << "[track] Stopped with " << describe_tracker(*tracker)
                   << ": too many to list. Run 'track' again and change the value a few times.\n";
         return;
     }
-    push_history();
-    g_current_type = tracker.best_type();
-    g_results = tracker.to_results();
-    std::cout << "[track] Stopped with " << g_results.count() << " " << utils::format_data_type(g_current_type)
-              << " result(s), best first" << (types.size() > 1 ? " (most likely type)" : "") << ". "
+    const auto best_type = tracker->best_type();
+    ses().scans().replace(tracker->to_results(), best_type);
+    std::cout << "[track] Stopped with " << ses().scans().state().results.count() << " "
+              << utils::format_data_type(best_type) << " result(s), best first"
+              << (types.size() > 1 ? " (most likely type)" : "") << ". "
               << "'list' shows them, 'add #0 <name>' adds the best one.\n";
 }
 
 void cmd_grouped_scan(const std::vector<std::string>& tokens) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
+    if (!require_attached()) return;
 
     if (tokens.size() < 2 || tokens.size() % 2 != 0) {
         std::cout << "Usage: group <type1> <val1> <type2> <val2> ...\n"
@@ -802,7 +551,7 @@ void cmd_grouped_scan(const std::vector<std::string>& tokens) {
     }
 
     std::cout << "[*] Running Grouped Scan with " << entries.size() << " members in 0x100 byte window...\n";
-    scanner::GroupedScanner gscanner(g_process);
+    scanner::GroupedScanner gscanner(ses().process_ptr());
     auto matches = gscanner.scan(entries, 0x100);
 
     std::cout << "[+] Found " << matches.size() << " matching struct(s):\n";
@@ -815,60 +564,53 @@ void cmd_grouped_scan(const std::vector<std::string>& tokens) {
     }
 }
 
-// Pointer paths from the last ptrscan / ptrload. Kept across attach/detach on purpose: paths are
-// module-relative, so they are meant to be rescanned in the restarted target.
-static std::vector<scanner::PointerPath> g_pointer_paths;
+// ---- Pointer paths (from the last ptrscan / ptrload; kept across attach, meant for the restarted target)
 
 void cmd_ptrlist(size_t max_count = 20) {
-    if (g_pointer_paths.empty()) {
+    const auto& paths = ses().pointer_paths();
+    if (paths.empty()) {
         std::cout << "[-] No pointer paths. Run 'ptrscan <addr>' or 'ptrload <file>' first.\n";
         return;
     }
 
-    const bool attached = g_process && g_process->is_attached();
-    const auto modules = attached ? g_process->get_modules() : std::vector<hal::ModuleInfo>{};
-    const size_t count = std::min(max_count, g_pointer_paths.size());
+    const bool attached = ses().attached();
+    const auto modules = attached ? ses().process().get_modules() : std::vector<hal::ModuleInfo>{};
+    const size_t count = std::min(max_count, paths.size());
     for (size_t i = 0; i < count; ++i) {
-        std::cout << "  [" << std::right << std::setw(3) << i << "] " << g_pointer_paths[i].to_string();
+        std::cout << "  [" << std::right << std::setw(3) << i << "] " << paths[i].to_string();
         if (attached) {
-            const uintptr_t now = g_pointer_paths[i].resolve(*g_process, modules);
+            const uintptr_t now = paths[i].resolve(ses().process(), modules);
             std::cout << "  => " << (now ? utils::format_address(now) : std::string("(unresolved)"));
         }
         std::cout << "\n";
     }
-    std::cout << " Showing " << count << " of " << g_pointer_paths.size() << " path(s).\n";
+    std::cout << " Showing " << count << " of " << paths.size() << " path(s).\n";
 }
 
 void cmd_pointer_scan(const std::string& addr_str, size_t max_depth, size_t max_offset, const std::string& base_module) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    uintptr_t target_addr = utils::parse_address(addr_str);
-    if (target_addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
+    if (!require_attached()) return;
+    auto target_addr = parse_address_arg(addr_str);
+    if (!target_addr) return;
 
     scanner::PointerScanOptions options;
     options.max_depth = max_depth;
     options.max_offset = max_offset;
     options.base_module = base_module;
 
-    std::cout << "[*] Starting Pointer Scanner for " << utils::format_address(target_addr)
+    std::cout << "[*] Starting Pointer Scanner for " << utils::format_address(*target_addr)
               << " (Max Depth: " << max_depth << ", Max Offset: 0x" << std::hex << max_offset << std::dec
               << ", Base: " << (base_module.empty() ? "any module" : base_module)
-              << ", " << (g_process->pointer_size() * 8) << "-bit target) ...\n";
+              << ", " << (ses().process().pointer_size() * 8) << "-bit target) ...\n";
 
     const auto start = std::chrono::steady_clock::now();
-    scanner::PointerScanner ptr_scanner(g_process);
-    auto result = ptr_scanner.scan(target_addr, options, [](size_t depth, size_t count) {
+    scanner::PointerScanner ptr_scanner(ses().process_ptr());
+    auto result = ptr_scanner.scan(*target_addr, options, [](size_t depth, size_t count) {
         std::cout << "  -> Depth " << depth << " explored: " << count << " static path(s) found.\n";
     });
-    g_pointer_paths = std::move(result.paths);
+    auto& paths = ses().pointer_paths();
+    paths = std::move(result.paths);
 
-    std::cout << "\n[+] Pointer Scan complete in " << elapsed_ms(start) << " ms: " << g_pointer_paths.size()
+    std::cout << "\n[+] Pointer Scan complete in " << elapsed_ms(start) << " ms: " << paths.size()
               << " path(s) (pointer map: " << result.pointer_map_size << " pointers, "
               << result.nodes_explored << " nodes searched).\n";
     if (result.truncated) {
@@ -876,41 +618,37 @@ void cmd_pointer_scan(const std::string& addr_str, size_t max_depth, size_t max_
                   << "    a smaller max offset, or a base module.\n";
     }
     cmd_ptrlist(20);
-    if (!g_pointer_paths.empty()) {
+    if (!paths.empty()) {
         std::cout << "[*] Restart the target, find the value's new address, then run 'ptrrescan <new addr>'\n"
                   << "    to keep only the paths that survive. 'ptrsave <file>' keeps them across sessions.\n";
     }
 }
 
 void cmd_ptrrescan(const std::string& addr_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    if (g_pointer_paths.empty()) {
+    if (!require_attached()) return;
+    auto& paths = ses().pointer_paths();
+    if (paths.empty()) {
         std::cerr << "[-] No pointer paths to rescan. Run 'ptrscan' or 'ptrload' first.\n";
         return;
     }
-    uintptr_t target_addr = utils::parse_address(addr_str);
-    if (target_addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
+    auto target_addr = parse_address_arg(addr_str);
+    if (!target_addr) return;
 
-    const size_t before = g_pointer_paths.size();
-    g_pointer_paths = scanner::PointerScanner::verify_paths(*g_process, g_pointer_paths, target_addr);
-    std::cout << "[+] Rescan: " << g_pointer_paths.size() << " of " << before << " path(s) still lead to "
-              << utils::format_address(target_addr) << ".\n";
+    const size_t before = paths.size();
+    paths = scanner::PointerScanner::verify_paths(ses().process(), paths, *target_addr);
+    std::cout << "[+] Rescan: " << paths.size() << " of " << before << " path(s) still lead to "
+              << utils::format_address(*target_addr) << ".\n";
     cmd_ptrlist(20);
 }
 
 void cmd_ptrsave(const std::string& path) {
-    if (g_pointer_paths.empty()) {
+    const auto& paths = ses().pointer_paths();
+    if (paths.empty()) {
         std::cerr << "[-] No pointer paths to save.\n";
         return;
     }
-    if (scanner::save_pointer_paths(path, g_pointer_paths)) {
-        std::cout << "[+] Saved " << g_pointer_paths.size() << " pointer path(s) to " << path << "\n";
+    if (scanner::save_pointer_paths(path, paths)) {
+        std::cout << "[+] Saved " << paths.size() << " pointer path(s) to " << path << "\n";
     } else {
         std::cerr << "[-] Failed to write " << path << "\n";
     }
@@ -922,346 +660,196 @@ void cmd_ptrload(const std::string& path) {
         std::cerr << "[-] Could not read pointer paths from " << path << "\n";
         return;
     }
-    g_pointer_paths = std::move(*loaded);
-    std::cout << "[+] Loaded " << g_pointer_paths.size() << " pointer path(s) from " << path << "\n";
+    ses().pointer_paths() = std::move(*loaded);
+    std::cout << "[+] Loaded " << ses().pointer_paths().size() << " pointer path(s) from " << path << "\n";
 }
 
 // ---- Cheat table -------------------------------------------------------------------------------
 
-// A value as the user would type it back (text without quotes)
-std::string value_text(const scanner::ScanValue& value) {
-    if (value.type == scanner::DataType::String) return std::get<std::string>(value.value);
-    if (value.type == scanner::DataType::String16) {
-        const auto& bytes = std::get<std::vector<uint8_t>>(value.value);
-        return utils::utf16le_to_utf8(bytes.data(), bytes.size());
-    }
-    return value.to_string();
-}
-
-// Parses "3" into a valid index of a list of `size` items, or prints an error
-std::optional<size_t> parse_index(const std::string& text, size_t size, const char* what) {
-    size_t index = 0;
-    auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), index);
-    if (ec != std::errc() || ptr != text.data() + text.size() || text.empty() || index >= size) {
-        std::cerr << "[-] No " << what << " #" << text << " (there are " << size << ").\n";
-        return std::nullopt;
-    }
-    return index;
-}
-
 // add <addr|#result> <type> [description]
 void cmd_table_add(const std::string& where, const std::string& type_str, const std::string& description) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
+    if (!require_attached()) return;
+
+    if (!where.empty() && where[0] == '#') {
+        // From the scan results: address, type and text length come from the result itself
+        const auto& results = ses().scans().state().results;
+        auto index = parse_index(where.substr(1), results.count(), "result");
+        if (!index) return;
+        report(ses().table().add_result(results, *index, description));
         return;
     }
 
-    std::optional<table::TableEntry> entry;
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    if (!where.empty() && where[0] == '#') {
-        // From the scan results: address, type and text length come from the result itself
-        auto index = parse_index(where.substr(1), g_results.count(), "result");
-        if (!index) return;
-        entry = table::make_entry(g_results.address(*index), g_results.type(), g_modules, description,
-                                  g_results.value_size());
-    } else {
-        auto type = parse_numeric_type(type_str);
-        if (!type) return;
-        const uintptr_t address = utils::parse_address(where);
-        if (address == 0) {
-            std::cerr << "[-] Invalid address: " << where << "\n";
-            return;
-        }
-        entry = table::make_entry(address, *type, g_modules, description);
-    }
-
-    g_table.entries.push_back(*entry);
-    std::cout << "[+] Added #" << g_table.entries.size() - 1 << ": " << entry->location_string()
-              << (entry->is_absolute() ? "  (heap address: only valid until the target restarts)" : "") << "\n";
+    auto type = parse_numeric_type(type_str);
+    if (!type) return;
+    auto address = parse_address_arg(where);
+    if (!address) return;
+    report(ses().table().add_address(*address, *type, description));
 }
 
 // addptr <path#> <type> [description]
 void cmd_table_add_pointer(const std::string& path_index, const std::string& type_str, const std::string& description) {
-    auto index = parse_index(path_index, g_pointer_paths.size(), "pointer path");
+    const auto& paths = ses().pointer_paths();
+    auto index = parse_index(path_index, paths.size(), "pointer path");
     if (!index) return;
     auto type = parse_numeric_type(type_str);
     if (!type) return;
-
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    g_table.entries.push_back(table::make_entry(g_pointer_paths[*index], *type, description));
-    std::cout << "[+] Added #" << g_table.entries.size() - 1 << ": " << g_table.entries.back().location_string() << "\n";
+    report(ses().table().add_pointer(paths[*index], *type, description));
 }
 
 void cmd_table_list() {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    if (g_table.entries.empty()) {
-        std::cout << "[-] The table is empty. Add values with 'add #<result>' or 'add <addr> <type>'.\n";
-        return;
-    }
-    const bool attached = g_process && g_process->is_attached();
-    if (attached) g_modules = g_process->get_modules();
+    ses().table().refresh_modules(); // the target may have loaded modules since attach
+    const bool attached = ses().attached();
+    auto& process = ses().process();
 
-    std::cout << "\n Index  Description           Type  Value              Location\n";
-    std::cout << "--------------------------------------------------------------------------------\n";
-    for (size_t i = 0; i < g_table.entries.size(); ++i) {
-        const auto& e = g_table.entries[i];
-        std::string value = "??";
-        if (attached) {
-            if (auto v = table::read_entry(e, *g_process, g_modules)) value = v->to_string();
+    ses().table().with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules) {
+        if (t.entries.empty()) {
+            std::cout << "[-] The table is empty. Add values with 'add #<result>' or 'add <addr> <type>'.\n";
+            return;
         }
-        if (e.frozen_value) value += " [frozen]";
-        std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20) << e.description
-                  << "  " << std::setw(4) << utils::format_data_type(e.type) << "  " << std::setw(17) << value
-                  << "  " << e.location_string() << "\n";
-    }
-    std::cout << std::right << "--------------------------------------------------------------------------------\n";
+        std::cout << "\n Index  Description           Type  Value              Location\n";
+        std::cout << "--------------------------------------------------------------------------------\n";
+        for (size_t i = 0; i < t.entries.size(); ++i) {
+            const auto& e = t.entries[i];
+            std::string value = "??";
+            if (attached) {
+                if (auto v = table::read_entry(e, process, modules)) value = v->to_string();
+            }
+            if (e.frozen_value) value += " [frozen]";
+            std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20) << e.description
+                      << "  " << std::setw(4) << utils::format_data_type(e.type) << "  " << std::setw(17) << value
+                      << "  " << e.location_string() << "\n";
+        }
+        std::cout << std::right << "--------------------------------------------------------------------------------\n";
+    });
 }
 
 void cmd_table_set(const std::string& index_text, const std::string& value) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
-    if (!index) return;
-    auto& e = g_table.entries[*index];
-    if (table::write_entry(e, value, *g_process, g_modules)) {
-        if (e.frozen_value) e.frozen_value = value; // keep a frozen entry at the new value
-        std::cout << "[+] #" << *index << " set to " << value << "\n";
-    } else {
-        std::cerr << "[-] Could not write '" << value << "' to #" << *index
-                  << " (invalid value, text too long, aob entry, or address not resolvable).\n";
-    }
+    if (!require_attached()) return;
+    auto index = parse_table_index(index_text);
+    if (index) report(ses().table().set_value(*index, value));
 }
 
 void cmd_table_freeze(const std::string& index_text, const std::string& value, bool freeze) {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
+    auto index = parse_table_index(index_text);
     if (!index) return;
-    auto& e = g_table.entries[*index];
-
     if (!freeze) {
-        e.frozen_value.reset();
-        std::cout << "[*] #" << *index << " unfrozen.\n";
+        report(ses().table().unfreeze(*index));
         return;
     }
-
-    std::string frozen = value;
-    if (frozen.empty()) {
-        // Default: keep the value it has right now
-        auto current = (g_process && g_process->is_attached()) ? table::read_entry(e, *g_process, g_modules) : std::nullopt;
-        if (!current) {
-            std::cerr << "[-] Can't read #" << *index << " to freeze it; give a value: tfreeze " << *index << " <value>\n";
-            return;
-        }
-        frozen = value_text(*current);
-    }
-    e.frozen_value = frozen;
-    std::cout << "[+] #" << *index << " frozen at " << frozen << "\n";
+    // Default: keep the value it has right now
+    report(ses().table().freeze(*index, value.empty() ? std::nullopt : std::optional<std::string>(value)));
 }
 
 void cmd_table_delete(const std::string& index_text) {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    auto index = parse_index(index_text, g_table.entries.size(), "table entry");
-    if (!index) return;
-    g_table.entries.erase(g_table.entries.begin() + static_cast<std::ptrdiff_t>(*index));
-    std::cout << "[*] Removed #" << *index << ".\n";
+    auto index = parse_table_index(index_text);
+    if (index) report(ses().table().remove(*index));
 }
 
 void cmd_table_save(const std::string& path) {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    if (g_table.process_name.empty() && !g_modules.empty()) g_table.process_name = g_modules.front().name;
-    if (table::save_table(path, g_table)) {
-        std::cout << "[+] Saved " << g_table.entries.size() << " table entr(ies) to " << path << "\n";
-    } else {
-        std::cerr << "[-] Failed to write " << path << "\n";
-    }
+    report(ses().table().save(path));
 }
 
 void cmd_table_load(const std::string& path) {
-    auto loaded = table::load_table(path);
-    if (!loaded) {
-        std::cerr << "[-] Could not read a table from " << path << "\n";
-        return;
-    }
-    {
-        std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        g_table = std::move(*loaded);
-        size_t frozen = 0;
-        for (const auto& e : g_table.entries) frozen += e.frozen_value ? 1 : 0;
-        std::cout << "[+] Loaded " << g_table.entries.size() << " entr(ies) for '" << g_table.process_name << "' from "
-                  << path << (frozen ? " (" + std::to_string(frozen) + " frozen)" : std::string()) << "\n";
-    }
-    reconcile_table();
-}
-
-// Permanent entries carry several pointer paths; after a restart they vote on where the value is now
-void reconcile_table() {
-    if (!g_process || !g_process->is_attached()) return;
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    for (size_t i = 0; i < g_table.entries.size(); ++i) {
-        auto& e = g_table.entries[i];
-        if (e.alternatives.empty()) continue;
-        const auto r = table::reconcile(e, *g_process, g_modules);
-        std::cout << "[*] #" << i << " " << e.description << ": ";
-        if (r.resolved == 0) {
-            std::cout << "none of its " << r.paths << " paths resolve here (another program?).\n";
-        } else if (r.ambiguous) {
-            std::cout << "close vote (" << r.agreeing << " of " << r.resolved << " paths agree on "
-                      << utils::format_address(r.address) << "): check the value; nothing dropped.\n";
-        } else {
-            std::cout << "found at " << utils::format_address(r.address) << " (" << r.agreeing << " of " << r.resolved
-                      << " paths lead there";
-            if (r.context_words > 0) {
-                std::cout << "; surroundings match " << r.context_matches << "/" << r.context_words << " words";
-            }
-            if (r.value_matches) std::cout << "; same value as when saved";
-            if (r.by_context) std::cout << "; chosen by its surroundings over the most-voted address";
-            std::cout << ")" << (r.changed ? ", kept those paths" : "") << ".\n";
-        }
-    }
+    if (report(ses().table().load(path))) print_reconciled(ses().table().reconcile());
 }
 
 // tperm <#>: turns an entry into pointer paths that survive restarts
 void cmd_table_permanent(const std::string& index_text) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    table::TableEntry entry;
-    size_t index = 0;
-    {
-        std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        auto parsed = parse_index(index_text, g_table.entries.size(), "table entry");
-        if (!parsed) return;
-        index = *parsed;
-        entry = g_table.entries[index];
-    }
-    if (!entry.is_absolute() && entry.location.offsets.empty()) {
-        std::cout << "[*] #" << index << " is a static address (" << entry.location_string()
+    if (!require_attached()) return;
+    auto index = parse_table_index(index_text);
+    if (!index) return;
+    const auto entry = ses().table().entry(*index);
+    if (!entry) return;
+    if (!entry->is_absolute() && entry->location.offsets.empty()) {
+        std::cout << "[*] #" << *index << " is a static address (" << entry->location_string()
                   << "): it already survives restarts.\n";
         return;
     }
 
     // The pointer scan runs without the table lock, so frozen values keep being written meanwhile
-    std::cout << "[*] Searching pointer paths to #" << index << " ...\n";
+    std::cout << "[*] Searching pointer paths to #" << *index << " ...\n";
     const auto start = std::chrono::steady_clock::now();
-    const auto paths = table::find_permanent_paths(entry, g_process, g_modules);
-    if (paths.empty()) {
-        std::cerr << "[-] No static pointer path leads to #" << index << ". It stays valid only until a restart.\n";
-        return;
-    }
-
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    auto& target = g_table.entries[index]; // the CLI runs one command at a time, so the index still holds
-    table::make_permanent(target, paths, *g_process, g_modules);
-    std::cout << "[+] #" << index << " is permanent in " << elapsed_ms(start) << " ms: " << target.location_string()
-              << " (+" << target.alternatives.size() << " other paths that vote after a restart).\n"
-              << "    Save the table ('tsave'); after a restart, 'attach' + 'tload' find the value again.\n";
+    const auto paths = ses().find_permanent_paths(*entry);
+    if (!report(ses().table().make_permanent(*index, *entry, paths))) return;
+    std::cout << "    Found in " << elapsed_ms(start) << " ms. Save the table ('tsave'); after a restart,\n"
+              << "    'attach' + 'tload' find the value again.\n";
 }
 
+// freeze <addr> <type> <value>: a frozen table entry, so 'table', 'tsave' and 'tperm' work on it too
 void cmd_freeze(const std::string& addr_str, const std::string& type_str, const std::string& val_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    uintptr_t addr = utils::parse_address(addr_str);
-    if (addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
-
+    if (!require_attached()) return;
+    auto address = parse_address_arg(addr_str);
+    if (!address) return;
     auto type = parse_numeric_type(type_str);
     if (!type) return;
-    auto val = parse_value(*type, val_str);
-    if (!val) return;
+    if (!parse_value(*type, val_str)) return;
 
-    {
-        std::lock_guard<std::mutex> lock(g_freeze_mutex);
-        g_frozen_list.push_back({addr, *type, *val, true});
+    if (!report(ses().table().add_address(*address, *type, ""))) return;
+    const size_t index = ses().table().size() - 1;
+    if (report(ses().table().freeze(index, val_str))) {
+        std::cout << "    'unfreeze " << index << "' stops it, 'tdel " << index << "' removes it from the table.\n";
     }
-
-    std::cout << "[+] Frozen " << utils::format_address(addr) << " to value [" << val->to_string() << "].\n";
 }
 
 void cmd_list_frozen() {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    if (g_frozen_list.empty()) {
-        std::cout << "[-] No frozen addresses.\n";
-        return;
-    }
-
-    std::cout << "\n Index   Address              Locked Value\n";
-    std::cout << "--------------------------------------------------\n";
-    for (size_t i = 0; i < g_frozen_list.size(); ++i) {
-        const auto& f = g_frozen_list[i];
-        std::cout << " [" << std::right << std::setw(3) << i << "]  "
-                  << utils::format_address(f.address) << "   "
-                  << f.value.to_string() << (f.active ? " (Active)" : " (Paused)") << "\n";
-    }
-    std::cout << "--------------------------------------------------\n\n";
+    ses().table().with([](const table::CheatTable& t, const std::vector<hal::ModuleInfo>&) {
+        const auto frozen = std::count_if(t.entries.begin(), t.entries.end(), [](const auto& e) { return e.frozen_value.has_value(); });
+        if (frozen == 0) {
+            std::cout << "[-] No frozen entries. 'freeze <addr> <type> <value>' or 'tfreeze <#>' adds one.\n";
+            return;
+        }
+        std::cout << "\n Index  Description           Frozen at          Location\n";
+        std::cout << "--------------------------------------------------------------------------------\n";
+        for (size_t i = 0; i < t.entries.size(); ++i) {
+            const auto& e = t.entries[i];
+            if (!e.frozen_value) continue;
+            std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20) << e.description
+                      << "  " << std::setw(17) << *e.frozen_value << "  " << e.location_string() << "\n";
+        }
+        std::cout << std::right << "--------------------------------------------------------------------------------\n";
+    });
 }
 
 void cmd_unfreeze(const std::string& param) {
-    std::lock_guard<std::mutex> lock(g_freeze_mutex);
     if (param == "all") {
-        g_frozen_list.clear();
-        std::cout << "[*] Unfroze all addresses.\n";
-    } else {
-        try {
-            size_t idx = std::stoul(param);
-            if (idx < g_frozen_list.size()) {
-                g_frozen_list.erase(g_frozen_list.begin() + idx);
-                std::cout << "[*] Removed index " << idx << " from freeze list.\n";
-            } else {
-                std::cerr << "[-] Index out of bounds.\n";
-            }
-        } catch (...) {
-            std::cerr << "[-] Invalid index: " << param << "\n";
-        }
+        std::cout << "[*] Unfroze " << ses().table().unfreeze_all() << " entr(ies).\n";
+        return;
     }
+    auto index = parse_table_index(param);
+    if (index) report(ses().table().unfreeze(*index));
 }
 
 void cmd_list(size_t max_count = 20) {
-    if (g_snapshot) {
-        std::cout << "[*] Current state is an " << describe_scan_state()
+    const auto& scans = ses().scans();
+    if (scans.state().snapshot) {
+        std::cout << "[*] Current state is an " << scans.describe()
                   << ". Run 'next changed/unchanged/inc/dec/...' to get addresses.\n";
         return;
     }
-    if (g_results.empty()) {
+    const auto& results = scans.state().results;
+    if (results.empty()) {
         std::cout << "[-] No results found.\n";
         return;
     }
 
-    size_t count = std::min(max_count, g_results.count());
+    size_t count = std::min(max_count, results.count());
     std::cout << "\n Index   Address              Current Value     Previous Value\n";
     std::cout << "------------------------------------------------------------------\n";
     for (size_t i = 0; i < count; ++i) {
-        const auto& m = g_results[i];
-        std::cout << " [" << std::right << std::setw(3) << i << "]  " 
+        const auto& m = results[i];
+        std::cout << " [" << std::right << std::setw(3) << i << "]  "
                   << utils::format_address(m.address) << "   "
                   << std::setw(16) << std::left << m.current_value.to_string() << "  "
                   << m.previous_value.to_string() << "\n";
     }
-    std::cout << "------------------------------------------------------------------\n";
-    std::cout << " Showing " << count << " of " << g_results.count() << " match(es).\n\n";
+    std::cout << std::right << "------------------------------------------------------------------\n";
+    std::cout << " Showing " << count << " of " << results.count() << " match(es).\n\n";
 }
 
 void cmd_write(const std::string& addr_str, const std::string& type_str, const std::string& val_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    uintptr_t addr = utils::parse_address(addr_str);
-    if (addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
-
+    if (!require_attached()) return;
+    auto addr = parse_address_arg(addr_str);
+    if (!addr) return;
     auto type = parse_numeric_type(type_str);
     if (!type) return;
     auto val = parse_value(*type, val_str);
@@ -1269,40 +857,29 @@ void cmd_write(const std::string& addr_str, const std::string& type_str, const s
 
     bool success = false;
     scanner::dispatch_numeric(*type, [&]<typename T>() {
-        success = g_process->write(addr, std::get<T>(val->value));
+        success = ses().process().write(*addr, std::get<T>(val->value));
     });
 
     if (success) {
         std::cout << "[+] Successfully wrote value [" << val->to_string() << "] to "
-                  << utils::format_address(addr) << "\n";
+                  << utils::format_address(*addr) << "\n";
     } else {
-        std::cerr << "[-] Failed to write to " << utils::format_address(addr) << "\n";
+        std::cerr << "[-] Failed to write to " << utils::format_address(*addr) << "\n";
     }
 }
 
 void cmd_read(const std::string& addr_str, const std::string& type_str) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    uintptr_t addr = utils::parse_address(addr_str);
-    if (addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
-
+    if (!require_attached()) return;
+    auto addr = parse_address_arg(addr_str);
+    if (!addr) return;
     auto type = parse_numeric_type(type_str);
     if (!type) return;
-    std::cout << "Address: " << utils::format_address(addr) << " = ";
+    std::cout << "Address: " << utils::format_address(*addr) << " = ";
 
     scanner::dispatch_numeric(*type, [&]<typename T>() {
         T v{};
-        if (g_process->read(addr, v)) {
-            scanner::ScanValue sv;
-            sv.type = *type;
-            sv.value = v;
-            std::cout << sv.to_string() << "\n";
+        if (ses().process().read(*addr, v)) {
+            std::cout << scanner::ScanValue::of(*type, v).to_string() << "\n";
         } else {
             std::cout << "?? (Read failed)\n";
         }
@@ -1310,16 +887,9 @@ void cmd_read(const std::string& addr_str, const std::string& type_str) {
 }
 
 void cmd_dump(const std::string& addr_str, size_t size = 64) {
-    if (!g_process || !g_process->is_attached()) {
-        std::cerr << "[-] Not attached to any process.\n";
-        return;
-    }
-
-    uintptr_t addr = utils::parse_address(addr_str);
-    if (addr == 0) {
-        std::cerr << "[-] Invalid address: " << addr_str << "\n";
-        return;
-    }
+    if (!require_attached()) return;
+    auto addr = parse_address_arg(addr_str);
+    if (!addr) return;
 
     constexpr size_t MAX_DUMP_SIZE = 64 * 1024;
     if (size == 0 || size > MAX_DUMP_SIZE) {
@@ -1328,10 +898,10 @@ void cmd_dump(const std::string& addr_str, size_t size = 64) {
     }
 
     std::vector<uint8_t> buffer(size);
-    if (g_process->read_raw(addr, buffer.data(), size)) {
-        std::cout << "\n" << utils::format_hex_dump(addr, buffer.data(), size) << "\n";
+    if (ses().process().read_raw(*addr, buffer.data(), size)) {
+        std::cout << "\n" << utils::format_hex_dump(*addr, buffer.data(), size) << "\n";
     } else {
-        std::cerr << "[-] Failed to read " << size << " bytes from " << utils::format_address(addr) << "\n";
+        std::cerr << "[-] Failed to read " << size << " bytes from " << utils::format_address(*addr) << "\n";
     }
 }
 
@@ -1546,15 +1116,12 @@ int main() {
     print_banner();
     print_help();
 
-    // Start background thread for continuous value freezing
-    g_freeze_thread = std::thread(freeze_worker);
-
     std::string line;
     while (true) {
-        if (g_process && g_process->is_attached()) {
-            std::cout << "[NCE PID:" << g_process->get_pid() << " (" << describe_scan_state() << ")] > ";
-        } else if (g_process && g_process->get_pid() != 0) {
-            std::cout << "[NCE (" << g_process->name() << " exited - 'reattach' waits for it)] > ";
+        if (ses().attached()) {
+            std::cout << "[NCE PID:" << ses().process().get_pid() << " (" << ses().scans().describe() << ")] > ";
+        } else if (ses().exited()) {
+            std::cout << "[NCE (" << ses().process().name() << " exited - 'reattach' waits for it)] > ";
         } else {
             std::cout << "[NCE (Detached)] > ";
         }
@@ -1569,13 +1136,6 @@ int main() {
         }
     }
 
-    g_freeze_running = false;
-    if (g_freeze_thread.joinable()) {
-        g_freeze_thread.join();
-    }
-
-    if (g_process) {
-        g_process->detach();
-    }
+    ses().detach();
     return 0;
 }

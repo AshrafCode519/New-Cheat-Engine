@@ -17,23 +17,16 @@
 #include "imgui_impl_win32.h"
 #include "imgui_stdlib.h"
 
-#include "hal/process.hpp"
-#include "scanner/memory_scanner.hpp"
-#include "scanner/pointer_scanner.hpp"
-#include "scanner/value_tracker.hpp"
-#include "table/cheat_table.hpp"
+#include "session/session.hpp"
 #include "utils/hex_utils.hpp"
-#include "utils/text_encoding.hpp"
 
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cstring>
 #include <fstream>
 #include <functional>
 #include <future>
 #include <memory>
-#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -161,49 +154,29 @@ LRESULT WINAPI window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
 const char* const kTypeNames[] = {"i8", "i16", "i32", "i64", "u8", "u16", "u32", "u64", "f32", "f64", "str", "wstr", "aob"};
 constexpr int kDefaultType = 2; // i32
 
-struct NextCondition {
-    const char* label;
-    scanner::ScanCondition cond;
-    int value_count;
-};
-const NextCondition kNextConditions[] = {
-    {"Exact value",  scanner::ScanCondition::ExactValue,  1},
-    {"Changed",      scanner::ScanCondition::Changed,     0},
-    {"Unchanged",    scanner::ScanCondition::Unchanged,   0},
-    {"Increased",    scanner::ScanCondition::Increased,   0},
-    {"Decreased",    scanner::ScanCondition::Decreased,   0},
-    {"Greater than", scanner::ScanCondition::GreaterThan, 1},
-    {"Less than",    scanner::ScanCondition::LessThan,    1},
-    {"Between",      scanner::ScanCondition::Between,     2},
-    {"Increased by", scanner::ScanCondition::IncreasedBy, 1},
-    {"Decreased by", scanner::ScanCondition::DecreasedBy, 1},
-};
-const char* const kNextLabels[] = {"Exact value", "Changed", "Unchanged", "Increased", "Decreased",
-                                   "Greater than", "Less than", "Between", "Increased by", "Decreased by"};
+const std::vector<const char*>& next_labels() {
+    static const std::vector<const char*> labels = [] {
+        std::vector<const char*> list;
+        for (const auto& c : session::ScanSession::next_conditions()) list.push_back(c.label);
+        return list;
+    }();
+    return labels;
+}
 
-const char* const kFloatModes[] = {"rounded", "truncated", "exact"};
-
-struct ScanState {
-    scanner::ScanResults results;
-    std::shared_ptr<scanner::MemorySnapshot> snapshot; // set after an unknown-value first scan
-    scanner::DataType type{scanner::DataType::Int32};
-};
+const char* const kFloatModes[] = {"rounded", "truncated", "exact"}; // in FloatMatchMode order
 
 // A finished job hands back the step that applies its result on the UI thread
 using ApplyResult = std::function<void()>;
 
-constexpr size_t MAX_UNDO_STEPS = 5;
-
 struct App {
-    std::shared_ptr<hal::IProcess> process = hal::IProcess::create();
-    std::unique_ptr<scanner::MemoryScanner> scanner;
+    // The target, its search, noise map, cheat table (with the freeze thread) and pointer paths. Scans run
+    // as jobs on a worker thread, and the UI doesn't touch the search while one runs.
+    session::Session session;
     std::vector<hal::ProcessInfo> processes;
     std::string process_filter;
     int selected_process = -1;
     std::string attached_label;
 
-    ScanState state;
-    std::vector<ScanState> history; // undo steps; only the newest snapshot is kept
     int type_index = kDefaultType;
     bool unknown_value = false;
     std::string first_value;
@@ -216,11 +189,8 @@ struct App {
     std::string job_label;
     std::chrono::steady_clock::time_point job_start;
     std::string status = "Pick a process and attach.";
+    bool status_timed = true; // a finished job adds its time to the status, unless it failed
 
-    // The freeze thread writes frozen entries, so the table and the module list are guarded by table_mutex
-    std::mutex table_mutex;
-    table::CheatTable table;
-    std::vector<hal::ModuleInfo> modules;
     std::vector<std::string> edit_buffers; // per-entry value text while typing
     std::string table_note;                // what reconciling permanent entries found after attach / load
     int editing_row = -1;
@@ -244,10 +214,7 @@ struct App {
     uint32_t ptr_offset = 0x800;
     std::string ptr_module;
     int ptr_add_type = kDefaultType;
-    std::vector<scanner::PointerPath> pointer_paths;
 
-    // Addresses that change on their own, learned for a few seconds after attaching; every scan ignores them
-    std::shared_ptr<scanner::NoiseMap> noise;
     bool track_pending = false; // --track: start once the noise is learned
 
     // When the target exits, wait for the same program to start again and attach to it
@@ -255,8 +222,6 @@ struct App {
     std::chrono::steady_clock::time_point next_reattach_check;
     uint32_t restart_pid = 0;                              // the new process, once seen
     std::chrono::steady_clock::time_point restart_seen_at; // attach a few seconds later, once it has set up
-
-    std::atomic<bool> freeze_running{true};
 };
 
 scanner::DataType type_at(int index) {
@@ -275,7 +240,17 @@ bool is_numeric(scanner::DataType type) {
 }
 
 bool is_attached(const App& app) {
-    return app.process && app.process->is_attached();
+    return app.session.attached();
+}
+
+scanner::FloatMatchMode float_mode(const App& app) {
+    return static_cast<scanner::FloatMatchMode>(app.float_mode);
+}
+
+// What a table or scan operation did, as the status line
+void show(App& app, const session::Outcome& outcome) {
+    app.status = outcome.message;
+    app.status_timed = outcome.ok;
 }
 
 bool job_running(const App& app) {
@@ -291,24 +266,6 @@ long long elapsed_ms(std::chrono::steady_clock::time_point start) {
     return std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - start).count();
 }
 
-// A value as the user would type it back (text without quotes)
-std::string value_text(const scanner::ScanValue& value) {
-    if (value.type == scanner::DataType::String) return std::get<std::string>(value.value);
-    if (value.type == scanner::DataType::String16) {
-        const auto& bytes = std::get<std::vector<uint8_t>>(value.value);
-        return utils::utf16le_to_utf8(bytes.data(), bytes.size());
-    }
-    return value.to_string();
-}
-
-std::string describe(const ScanState& state) {
-    if (state.snapshot) {
-        return std::to_string(state.snapshot->candidate_count()) + " candidates (snapshot, " +
-               std::to_string(state.snapshot->memory_bytes() / 1024) + " KB)";
-    }
-    return std::to_string(state.results.count()) + " results";
-}
-
 void start_job(App& app, std::string label, std::function<ApplyResult()> work) {
     app.job_label = std::move(label);
     app.job_start = std::chrono::steady_clock::now();
@@ -321,32 +278,12 @@ void poll_job(App& app) {
     const long long ms = elapsed_ms(app.job_start);
     try {
         auto apply = app.job.get();
+        app.status_timed = true;
         apply();
-        app.status += " (" + std::to_string(ms) + " ms)";
+        if (app.status_timed) app.status += " (" + std::to_string(ms) + " ms)";
     } catch (const std::exception& e) {
         app.status = app.job_label + " failed: " + e.what() + ". Use Undo to go back.";
     }
-}
-
-// Moves the current scan state into the undo history (a snapshot state drops older entries)
-void push_history(App& app) {
-    if (app.state.snapshot) app.history.clear();
-    app.history.push_back(std::move(app.state));
-    if (app.history.size() > MAX_UNDO_STEPS) app.history.erase(app.history.begin());
-    app.state = {};
-}
-
-// For f32/f64 under the rounded/truncated mode: the [low, high] range an exact value stands for
-std::optional<std::pair<scanner::ScanValue, scanner::ScanValue>> float_range(const App& app, scanner::DataType type,
-                                                                            const std::string& text) {
-    if (type != scanner::DataType::Float && type != scanner::DataType::Double) return std::nullopt;
-    auto range = utils::float_match_range(text, static_cast<scanner::FloatMatchMode>(app.float_mode));
-    if (!range) return std::nullopt;
-    if (type == scanner::DataType::Float) {
-        return std::make_pair(scanner::ScanValue::of(type, static_cast<float>(range->first)),
-                              scanner::ScanValue::of(type, static_cast<float>(range->second)));
-    }
-    return std::make_pair(scanner::ScanValue::of(type, range->first), scanner::ScanValue::of(type, range->second));
 }
 
 // ---- Actions -------------------------------------------------------------------------------------
@@ -359,96 +296,58 @@ void refresh_processes(App& app) {
     app.selected_process = -1;
 }
 
-std::string describe_noise(const App& app) {
-    if (!app.noise || app.noise->empty()) return "none known";
-    std::string text = std::to_string(app.noise->noisy_slots()) + " addresses ignored";
-    if (app.noise->skipped_bytes() > 0) {
-        text += ", " + std::to_string(app.noise->skipped_bytes() / 1024) + " KB skipped";
-    }
-    return text;
-}
-
 // prefix: status text to keep in front of the result (e.g. what attach reported)
 void learn_noise(App& app, const std::string& prefix = "") {
     start_job(app, "Learning noise (leave the target alone)", [&app, prefix]() -> ApplyResult {
-        auto noise = std::make_shared<scanner::NoiseMap>();
-        noise->learn(*app.process);
+        auto noise = app.session.learn_noise();
         return [&app, noise, prefix]() {
-            app.noise = noise;
-            app.scanner->set_noise_map(noise);
-            app.status = prefix + "Noise: " + describe_noise(app) + ".";
+            app.session.set_noise(noise);
+            app.status = prefix + "Noise: " + app.session.describe_noise() + ".";
         };
     });
 }
 
-// Permanent entries carry several pointer paths; after a restart they find the value's new address
-// (see table::reconcile). Call with table_mutex held.
-std::string reconcile_table(App& app) {
-    std::string summary;
-    for (auto& e : app.table.entries) {
-        if (e.alternatives.empty()) continue;
-        const auto r = table::reconcile(e, *app.process, app.modules);
-        const std::string name = e.description.empty() ? e.location_string() : e.description;
-        if (r.resolved == 0) summary += " " + name + ": not found here.";
-        else if (r.ambiguous) summary += " " + name + ": unsure, check its value.";
-        else summary += " " + name + ": found" + (r.by_context ? " (by its surroundings)." : ".");
+// What permanent entries found after a restart (see table::reconcile), one line per entry
+std::string describe_reconciled(const std::vector<session::TableKeeper::ReconcileLine>& lines) {
+    std::string text;
+    for (const auto& line : lines) {
+        if (!text.empty()) text += "\n";
+        text += line.description + ": " + session::describe_reconcile(line.result) + ".";
     }
-    return summary;
+    return text;
 }
 
+// The pointer scan runs as a job on a copy of the entry; applying it fails if the entry changed meanwhile
 void make_entry_permanent(App& app, size_t index) {
-    const table::TableEntry entry = app.table.entries[index]; // called with table_mutex held
-    const auto modules = app.modules;
-    start_job(app, "Finding pointer paths", [&app, entry, modules, index]() -> ApplyResult {
-        auto paths = std::make_shared<std::vector<scanner::PointerPath>>(
-            table::find_permanent_paths(entry, app.process, modules));
+    const auto entry = app.session.table().entry(index);
+    if (!entry) return;
+    start_job(app, "Finding pointer paths", [&app, entry = *entry, index]() -> ApplyResult {
+        auto paths = std::make_shared<std::vector<scanner::PointerPath>>(app.session.find_permanent_paths(entry));
         return [&app, entry, index, paths]() {
-            std::lock_guard<std::mutex> lock(app.table_mutex);
-            auto& entries = app.table.entries;
-            // The table may have changed while the scan ran: only update the same entry
-            const bool same = index < entries.size() && entries[index].location.module_name == entry.location.module_name &&
-                              entries[index].location.base_offset == entry.location.base_offset &&
-                              entries[index].location.offsets == entry.location.offsets;
-            if (paths->empty()) {
-                app.status = "No static pointer path leads to it; it stays valid only until a restart.";
-            } else if (!same) {
-                app.status = "The table changed during the search; press Keep again.";
-            } else {
-                table::make_permanent(entries[index], *paths, *app.process, app.modules);
-                app.status = "Kept: " + entries[index].location_string() + " (+" +
-                             std::to_string(entries[index].alternatives.size()) +
-                             " paths that find it after a restart). Save the table.";
-            }
+            const auto outcome = app.session.table().make_permanent(index, entry, *paths);
+            show(app, outcome);
+            if (outcome.ok) app.status += " Save the table.";
         };
     });
 }
 
 void attach(App& app, const hal::ProcessInfo& info, const std::string& note = "") {
-    bool ok = false;
-    {
-        std::lock_guard<std::mutex> lock(app.table_mutex);
-        // Absolute addresses belong to the previous process; module-relative entries stay frozen
-        for (auto& e : app.table.entries) {
-            if (e.is_absolute()) e.frozen_value.reset();
-        }
-        ok = app.process->attach(info.pid);
-        app.modules = ok ? app.process->get_modules() : std::vector<hal::ModuleInfo>{};
-        app.table_note = ok ? reconcile_table(app) : std::string();
-    }
-
-    app.state = {};
-    app.history.clear();
     app.tracker.reset(); // attaching is disabled while a job runs, so no job is using it
     app.track_stage = App::TrackStage::Off;
     unregister_hotkeys();
     app.track_best.clear();
-    app.scanner = ok ? std::make_unique<scanner::MemoryScanner>(app.process) : nullptr;
-    app.noise.reset(); // learned for the previous process
-    if (ok) {
+    app.editing_row = -1;
+
+    const auto report = app.session.attach(info.pid);
+    app.table_note = describe_reconciled(report.reconciled);
+    if (report.ok) {
         app.attached_label = info.name + " (PID " + std::to_string(info.pid) + ", " +
-                             std::to_string(app.process->pointer_size() * 8) + "-bit)";
+                             std::to_string(app.session.process().pointer_size() * 8) + "-bit)";
         app.status = note + "Attached to " + app.attached_label + ".";
-        if (!app.process->can_write()) {
+        if (report.unfrozen > 0) {
+            app.status += " Unfroze " + std::to_string(report.unfrozen) + " heap entries of the previous process.";
+        }
+        if (report.read_only) {
             app.status += " Only read access was granted: writing and freezing won't work (run as Administrator).";
         }
         learn_noise(app, app.status + " ");
@@ -462,8 +361,8 @@ void attach(App& app, const hal::ProcessInfo& info, const std::string& note = ""
 // new instance a few seconds after it appears (so it has set up the objects the table's pointers use).
 // Attaching re-finds permanent entries and the freeze thread resumes on its own.
 void tick_reattach(App& app) {
-    if (!app.auto_reattach || job_running(app) || app.process->get_pid() == 0 || app.process->is_attached() ||
-        app.process->name().empty()) {
+    const std::string name = app.session.process().name();
+    if (!app.auto_reattach || job_running(app) || !app.session.exited() || name.empty()) {
         app.restart_pid = 0;
         return;
     }
@@ -484,159 +383,51 @@ void tick_reattach(App& app) {
 
     if (now < app.next_reattach_check) return;
     app.next_reattach_check = now + std::chrono::seconds(1);
-    const std::string name = app.process->name();
-    for (const auto& p : hal::IProcess::list_processes()) {
-        if (p.pid != app.process->get_pid() && _stricmp(p.name.c_str(), name.c_str()) == 0) {
-            app.restart_pid = p.pid;
-            app.restart_seen_at = now;
-            app.status = name + " started again (PID " + std::to_string(p.pid) + "); attaching in a moment.";
-            return;
-        }
+    if (auto restarted = app.session.find_restart()) {
+        app.restart_pid = restarted->pid;
+        app.restart_seen_at = now;
+        app.status = name + " started again (PID " + std::to_string(restarted->pid) + "); attaching in a moment.";
+        return;
     }
     app.status = name + " exited. Waiting for it to start again.";
 }
 
+// Scans run on the worker thread: the session checks the input and scans, the UI shows the outcome
 void first_scan(App& app) {
-    const scanner::DataType type = type_at(app.type_index);
-    const std::string text = app.first_value;
-
-    if (is_numeric(type) && app.unknown_value) {
-        push_history(app);
-        start_job(app, "Snapshot", [&app, type]() -> ApplyResult {
-            auto snapshot = std::make_shared<scanner::MemorySnapshot>(
-                app.scanner->first_scan_unknown(type, scanner::get_data_type_size(type)));
-            return [&app, snapshot, type]() {
-                app.state.type = type;
-                app.state.snapshot = snapshot;
-                app.status = "Snapshot taken: " + describe(app.state) + ". Change the value, then run a next scan.";
-            };
-        });
-        return;
-    }
-
-    std::function<scanner::ScanResults()> scan;
-    if (type == scanner::DataType::AOB) {
-        if (!utils::parse_aob_pattern(text)) {
-            app.status = "Invalid AOB pattern. Example: 48 8B ? ? 89";
-            return;
-        }
-        scan = [&app, text] { return app.scanner->first_scan_aob(text, 1); };
-    } else if (type == scanner::DataType::String || type == scanner::DataType::String16) {
-        const bool utf16 = (type == scanner::DataType::String16);
-        if (text.empty() || (utf16 && !utils::utf8_to_utf16le(text))) {
-            app.status = "Type the text to search for.";
-            return;
-        }
-        scan = [&app, text, utf16] { return app.scanner->first_scan_string(text, utf16, 1); };
-    } else {
-        auto value = utils::parse_scan_value(type, text);
-        if (!value) {
-            app.status = "'" + text + "' is not a valid " + utils::format_data_type(type) + " value.";
-            return;
-        }
-        const size_t alignment = scanner::get_data_type_size(type);
-        if (auto range = float_range(app, type, text)) {
-            scan = [&app, type, range, alignment] {
-                return app.scanner->first_scan(type, scanner::ScanCondition::Between, range->first, range->second, alignment);
-            };
-        } else {
-            scan = [&app, type, value, alignment] {
-                return app.scanner->first_scan(type, scanner::ScanCondition::ExactValue, *value, {}, alignment);
-            };
-        }
-    }
-
-    push_history(app);
-    start_job(app, "First scan", [&app, scan, type]() -> ApplyResult {
-        auto results = std::make_shared<scanner::ScanResults>(scan());
-        return [&app, results, type]() {
-            app.state.type = type;
-            app.state.results = std::move(*results);
-            app.status = "First scan: " + describe(app.state) + ".";
+    const std::string type = kTypeNames[app.type_index];
+    const bool unknown = is_numeric(type_at(app.type_index)) && app.unknown_value;
+    const std::string input = unknown ? "?" : app.first_value;
+    start_job(app, unknown ? "Snapshot" : "First scan", [&app, type, input, mode = float_mode(app)]() -> ApplyResult {
+        auto outcome = app.session.scans().first_scan(type, input, mode);
+        return [&app, outcome]() {
+            if (!outcome.ok) return show(app, outcome);
+            const auto& scans = app.session.scans();
+            app.status = scans.state().snapshot
+                ? "Snapshot taken: " + scans.describe() + ". Change the value, then run a next scan."
+                : "First scan: " + scans.describe() + (outcome.message.empty() ? "" : ", " + outcome.message) + ".";
         };
     });
 }
 
 void next_scan(App& app) {
-    if (app.state.results.empty() && !app.state.snapshot) {
-        app.status = "Run a first scan first.";
-        return;
-    }
-
-    const auto& spec = kNextConditions[app.next_index];
-    const scanner::DataType type = app.state.type;
-    scanner::ScanCondition cond = spec.cond;
-
-    if (!is_numeric(type) && cond != scanner::ScanCondition::Changed && cond != scanner::ScanCondition::Unchanged) {
-        app.status = "Text and AOB results only support Changed / Unchanged.";
-        return;
-    }
-
-    scanner::ScanValue val1;
-    scanner::ScanValue val2;
-    if (spec.value_count >= 1) {
-        auto parsed = utils::parse_scan_value(type, app.next_value1);
-        if (!parsed) {
-            app.status = "'" + app.next_value1 + "' is not a valid " + utils::format_data_type(type) + " value.";
-            return;
-        }
-        val1 = *parsed;
-    }
-    if (spec.value_count >= 2) {
-        auto parsed = utils::parse_scan_value(type, app.next_value2);
-        if (!parsed) {
-            app.status = "'" + app.next_value2 + "' is not a valid " + utils::format_data_type(type) + " value.";
-            return;
-        }
-        val2 = *parsed;
-    }
-    if (cond == scanner::ScanCondition::ExactValue) {
-        if (auto range = float_range(app, type, app.next_value1)) {
-            cond = scanner::ScanCondition::Between;
-            val1 = range->first;
-            val2 = range->second;
-        }
-    }
-
-    push_history(app);
-    const ScanState* previous = &app.history.back(); // stays put: scans and undo are disabled while the job runs
-    start_job(app, "Next scan", [&app, previous, cond, val1, val2]() -> ApplyResult {
-        auto next = std::make_shared<ScanState>();
-        next->type = previous->type;
-        if (previous->snapshot) {
-            // Stay a snapshot until the candidates take less memory as a results list
-            auto filtered = std::make_shared<scanner::MemorySnapshot>(
-                app.scanner->filter_snapshot(*previous->snapshot, cond, val1, val2));
-            const size_t result_bytes = filtered->candidate_count() *
-                                        (sizeof(uintptr_t) + 2 * scanner::get_data_type_size(filtered->type));
-            if (result_bytes <= filtered->memory_bytes()) {
-                next->results = scanner::MemoryScanner::snapshot_to_results(*filtered);
-            } else {
-                next->snapshot = filtered;
-            }
-        } else {
-            next->results = app.scanner->next_scan(previous->results, cond, val1, val2);
-        }
-        return [&app, next]() {
-            app.state = std::move(*next);
-            app.status = "Next scan: " + describe(app.state) + " left.";
+    const std::string condition = session::ScanSession::next_conditions()[app.next_index].name;
+    start_job(app, "Next scan", [&app, condition, v1 = app.next_value1, v2 = app.next_value2,
+                                 mode = float_mode(app)]() -> ApplyResult {
+        auto outcome = app.session.scans().next_scan(condition, v1, v2, mode);
+        return [&app, outcome]() {
+            if (!outcome.ok) return show(app, outcome);
+            app.status = "Next scan: " + app.session.scans().describe() + " left" +
+                         (outcome.message.empty() ? "" : ", " + outcome.message) + ".";
         };
     });
 }
 
 void undo(App& app) {
-    if (app.history.empty()) return;
-    app.state = std::move(app.history.back());
-    app.history.pop_back();
-    app.status = "Back to " + describe(app.state) + ".";
+    if (app.session.scans().undo()) app.status = "Back to " + app.session.scans().describe() + ".";
 }
 
 void add_result_to_table(App& app, size_t row) {
-    const auto& r = app.state.results;
-    std::lock_guard<std::mutex> lock(app.table_mutex);
-    app.table.entries.push_back(table::make_entry(r.address(row), r.type(), app.modules, "", r.value_size()));
-    const auto& e = app.table.entries.back();
-    app.status = "Added " + e.location_string() + (e.is_absolute() ? " (heap address: valid until the target restarts)" : "") + ".";
+    show(app, app.session.table().add_result(app.session.scans().state().results, row, ""));
 }
 
 // ---- Smart track ---------------------------------------------------------------------------------
@@ -657,8 +448,7 @@ void start_tracking(App& app) {
     // Auto type follows i32, f32 and f64 together and lets the scoring pick the type
     auto types = app.track_auto_type ? scanner::ValueTracker::auto_types()
                                      : std::vector<scanner::DataType>{type_at(app.type_index)};
-    app.tracker = std::make_unique<scanner::ValueTracker>(app.process, std::move(types));
-    app.tracker->set_noise_map(app.noise);
+    app.tracker = app.session.new_tracker(std::move(types)); // ignores the learned noise too
     app.track_best.clear();
     app.track_stop_requested = false;
     start_job(app, "Snapshot", [&app]() -> ApplyResult {
@@ -686,10 +476,9 @@ void track_event(App& app, const scanner::Expectation& expected) {
 
 void stop_tracking(App& app) {
     if (app.tracker->candidate_count() <= TRACK_MAX_HANDOVER) {
-        push_history(app);
-        app.state.type = app.tracker->best_type();
-        app.state.results = app.tracker->to_results();
-        app.status = "Smart track stopped: " + describe(app.state) + ", best first.";
+        const auto type = app.tracker->best_type();
+        app.session.scans().replace(app.tracker->to_results(), type);
+        app.status = "Smart track stopped: " + app.session.scans().describe() + ", best first.";
     } else {
         app.status = "Smart track stopped with too many candidates to list; change the value a few times next time.";
     }
@@ -747,20 +536,6 @@ void tick_tracking(App& app) {
     });
 }
 
-void freeze_worker(App* app) {
-    while (app->freeze_running) {
-        {
-            std::lock_guard<std::mutex> lock(app->table_mutex);
-            if (is_attached(*app)) {
-                for (const auto& e : app->table.entries) {
-                    if (e.frozen_value) table::write_entry(e, *e.frozen_value, *app->process, app->modules);
-                }
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
-}
-
 // ---- Panels --------------------------------------------------------------------------------------
 
 void draw_process_bar(App& app) {
@@ -800,7 +575,7 @@ void draw_process_bar(App& app) {
     ImGui::Checkbox("Auto re-attach", &app.auto_reattach);
     ImGui::SameLine();
     if (is_attached(app)) ImGui::Text("Attached: %s", app.attached_label.c_str());
-    else if (app.process->get_pid() != 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s exited", app.process->name().c_str());
+    else if (app.session.exited()) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s exited", app.session.process().name().c_str());
     else ImGui::TextDisabled("Not attached");
 }
 
@@ -832,8 +607,8 @@ void draw_scan_controls(App& app) {
     if (ImGui::Button("First Scan", ImVec2(button_width, 0))) first_scan(app);
 
     ImGui::SetNextItemWidth(em(8));
-    ImGui::Combo("##next_condition", &app.next_index, kNextLabels, IM_ARRAYSIZE(kNextLabels));
-    const int value_count = kNextConditions[app.next_index].value_count;
+    ImGui::Combo("##next_condition", &app.next_index, next_labels().data(), static_cast<int>(next_labels().size()));
+    const int value_count = session::ScanSession::next_conditions()[app.next_index].value_count;
     const float undo_width = ImGui::CalcTextSize("Undo").x + style.FramePadding.x * 2 + style.ItemSpacing.x;
     if (value_count >= 1) {
         ImGui::SameLine();
@@ -850,20 +625,20 @@ void draw_scan_controls(App& app) {
     ImGui::SameLine();
     if (ImGui::Button("Next Scan", ImVec2(button_width, 0))) next_scan(app);
     ImGui::SameLine();
-    ImGui::BeginDisabled(app.history.empty());
+    // A running scan job changes the history: only look at it when none runs
+    ImGui::BeginDisabled(job_running(app) || !app.session.scans().can_undo());
     if (ImGui::Button("Undo")) undo(app);
     ImGui::EndDisabled();
 
     // Noise: learned after attaching; relearn while leaving the target alone, or stop ignoring it
     ImGui::AlignTextToFramePadding();
-    ImGui::TextDisabled("Noise: %s", describe_noise(app).c_str());
+    ImGui::TextDisabled("Noise: %s", app.session.describe_noise().c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Relearn")) learn_noise(app);
     ImGui::SameLine();
-    ImGui::BeginDisabled(!app.noise);
+    ImGui::BeginDisabled(!app.session.noise());
     if (ImGui::SmallButton("Clear")) {
-        app.noise.reset();
-        app.scanner->set_noise_map(nullptr);
+        app.session.set_noise(nullptr);
         app.status = "Noise cleared: scans look at every address again.";
     }
     ImGui::EndDisabled();
@@ -962,9 +737,7 @@ void draw_tracking(App& app) {
 
     if (add_row) {
         const auto& c = app.track_best[*add_row];
-        std::lock_guard<std::mutex> lock(app.table_mutex);
-        app.table.entries.push_back(table::make_entry(c.address, c.value.type, app.modules));
-        app.status = "Added " + app.table.entries.back().location_string() + " to the cheat table.";
+        show(app, app.session.table().add_address(c.address, c.value.type, ""));
     }
 }
 
@@ -974,13 +747,14 @@ void draw_results(App& app) {
         ImGui::Text("%s ... %.1f s", app.job_label.c_str(), elapsed_ms(app.job_start) / 1000.0);
         return;
     }
-    if (app.state.snapshot) {
+    const auto& scans = app.session.scans();
+    if (scans.state().snapshot) {
         ImGui::TextWrapped("%s. Change the value in the target, then run a next scan "
-                           "(Changed / Unchanged / Increased / Decreased ...).", describe(app.state).c_str());
+                           "(Changed / Unchanged / Increased / Decreased ...).", scans.describe().c_str());
         return;
     }
 
-    const auto& results = app.state.results;
+    const auto& results = scans.state().results;
     ImGui::Text("%zu results  (double-click or + to add to the cheat table)", results.count());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
@@ -1012,7 +786,7 @@ void draw_results(App& app) {
 
             ImGui::TableNextColumn();
             std::string current = "??";
-            if (!live.empty() && app.process->read_raw(results.address(i), live.data(), live.size())) {
+            if (!live.empty() && app.session.process().read_raw(results.address(i), live.data(), live.size())) {
                 if (auto v = scanner::value_from_bytes(results.type(), live.data(), live.size())) current = v->to_string();
             }
             ImGui::TextUnformatted(current.c_str());
@@ -1032,38 +806,75 @@ void draw_results(App& app) {
     if (add_row) add_result_to_table(app, *add_row);
 }
 
+// A click in the table, applied once the table lock is released (the operations take the lock themselves)
+struct TableAction {
+    enum class Kind { None, Freeze, Unfreeze, Write, Remove, Keep } kind = Kind::None;
+    size_t row = 0;
+    std::string value;
+};
+
+void apply_table_action(App& app, const TableAction& action) {
+    using Kind = TableAction::Kind;
+    auto& keeper = app.session.table();
+    switch (action.kind) {
+        case Kind::None: break;
+        case Kind::Freeze: show(app, keeper.freeze(action.row, std::nullopt)); break; // at its current value
+        case Kind::Unfreeze: show(app, keeper.unfreeze(action.row)); break;
+        case Kind::Write: show(app, keeper.set_value(action.row, action.value)); break;
+        case Kind::Remove:
+            show(app, keeper.remove(action.row));
+            if (action.row < app.edit_buffers.size()) {
+                app.edit_buffers.erase(app.edit_buffers.begin() + static_cast<std::ptrdiff_t>(action.row));
+            }
+            app.editing_row = -1;
+            break;
+        case Kind::Keep: make_entry_permanent(app, action.row); break;
+    }
+}
+
+TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules);
+
 void draw_cheat_table(App& app) {
-    std::lock_guard<std::mutex> lock(app.table_mutex);
-    auto& entries = app.table.entries;
-    app.edit_buffers.resize(entries.size());
+    auto& keeper = app.session.table();
     const bool attached = is_attached(app);
 
     ImGui::SetNextItemWidth(-em(8));
     ImGui::InputTextWithHint("##table_path", "table.json", &app.table_path);
     ImGui::SameLine();
-    if (ImGui::Button("Save")) {
-        if (app.table.process_name.empty() && !app.modules.empty()) app.table.process_name = app.modules.front().name;
-        app.status = table::save_table(app.table_path, app.table)
-            ? "Saved " + std::to_string(entries.size()) + " entries to " + app.table_path + "."
-            : "Could not write " + app.table_path + ".";
-    }
+    if (ImGui::Button("Save")) show(app, keeper.save(app.table_path));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
-        if (auto loaded = table::load_table(app.table_path)) {
-            app.table = std::move(*loaded);
+        const auto loaded = keeper.load(app.table_path);
+        show(app, loaded);
+        if (loaded.ok) {
             app.editing_row = -1;
-            app.status = "Loaded " + std::to_string(entries.size()) + " entries for " + app.table.process_name + ".";
-            app.table_note = attached ? reconcile_table(app) : std::string();
-        } else {
-            app.status = "Could not read a table from " + app.table_path + ".";
+            app.table_note = attached ? describe_reconciled(keeper.reconcile()) : std::string();
         }
-        return; // entries changed under us; draw them next frame
     }
-    if (!app.table_note.empty()) ImGui::TextWrapped("After restart:%s", app.table_note.c_str());
+    if (!app.table_note.empty()) {
+        ImGui::TextDisabled("After restart:");
+        ImGui::TextWrapped("%s", app.table_note.c_str());
+    }
+
+    TableAction action;
+    keeper.with([&](table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules) {
+        action = draw_table_rows(app, t, modules); // the freeze thread waits meanwhile
+    });
+    apply_table_action(app, action);
+}
+
+// The rows, drawn under the table lock: the description is edited in place, any other click is returned
+TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules) {
+    using Kind = TableAction::Kind;
+    TableAction action;
+    auto& entries = t.entries;
+    app.edit_buffers.resize(entries.size());
+    const bool attached = is_attached(app);
+    auto& process = app.session.process();
 
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV |
                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
-    if (!ImGui::BeginTable("cheat_table", 6, flags, ImVec2(0, em(14)))) return;
+    if (!ImGui::BeginTable("cheat_table", 6, flags, ImVec2(0, em(14)))) return action;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("Freeze", ImGuiTableColumnFlags_WidthFixed, em(3.8f));
     ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch, 1.2f);
@@ -1073,22 +884,17 @@ void draw_cheat_table(App& app) {
     ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
     ImGui::TableHeadersRow();
 
-    std::optional<size_t> remove_row;
     for (size_t i = 0; i < entries.size(); ++i) {
         auto& e = entries[i];
         const auto row = static_cast<int>(i);
-        const auto current = attached ? table::read_entry(e, *app.process, app.modules) : std::nullopt;
+        const auto current = attached ? table::read_entry(e, process, modules) : std::nullopt;
 
         ImGui::TableNextRow();
         ImGui::PushID(row);
 
         ImGui::TableNextColumn();
         bool frozen = e.frozen_value.has_value();
-        if (ImGui::Checkbox("##freeze", &frozen)) {
-            if (!frozen) e.frozen_value.reset();
-            else if (current) e.frozen_value = value_text(*current);
-            else app.status = "Can't read the value to freeze it.";
-        }
+        if (ImGui::Checkbox("##freeze", &frozen)) action = {frozen ? Kind::Freeze : Kind::Unfreeze, i, {}};
 
         ImGui::TableNextColumn();
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -1099,15 +905,10 @@ void draw_cheat_table(App& app) {
 
         // Shows the live value; typing a new one and pressing Enter writes it
         ImGui::TableNextColumn();
-        if (app.editing_row != row) app.edit_buffers[i] = current ? value_text(*current) : "??";
+        if (app.editing_row != row) app.edit_buffers[i] = current ? session::value_text(*current) : "??";
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::InputText("##value", &app.edit_buffers[i], ImGuiInputTextFlags_EnterReturnsTrue)) {
-            if (attached && table::write_entry(e, app.edit_buffers[i], *app.process, app.modules)) {
-                if (e.frozen_value) e.frozen_value = app.edit_buffers[i];
-                app.status = "Wrote " + app.edit_buffers[i] + ".";
-            } else {
-                app.status = "Could not write '" + app.edit_buffers[i] + "'.";
-            }
+            action = {Kind::Write, i, app.edit_buffers[i]};
         }
         if (ImGui::IsItemActive()) app.editing_row = row;
         else if (app.editing_row == row) app.editing_row = -1;
@@ -1119,7 +920,7 @@ void draw_cheat_table(App& app) {
         // Keep: pointer paths that find a heap value again after a restart (static addresses already do)
         const bool is_static = !e.is_absolute() && e.location.offsets.empty();
         ImGui::BeginDisabled(!attached || job_running(app) || is_static || !e.alternatives.empty());
-        if (ImGui::SmallButton(e.alternatives.empty() ? "Keep" : "Kept")) make_entry_permanent(app, i);
+        if (ImGui::SmallButton(e.alternatives.empty() ? "Keep" : "Kept")) action = {Kind::Keep, i, {}};
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(is_static ? "A static address: it already survives restarts."
@@ -1127,7 +928,7 @@ void draw_cheat_table(App& app) {
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("Pointers")) {
-            const uintptr_t address = attached ? e.address(*app.process, app.modules) : 0;
+            const uintptr_t address = attached ? e.address(process, modules) : 0;
             if (address) {
                 app.ptr_target = utils::format_address(address);
                 if (is_numeric(e.type)) app.ptr_add_type = type_index_of(e.type);
@@ -1135,16 +936,11 @@ void draw_cheat_table(App& app) {
             }
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("X")) remove_row = i;
+        if (ImGui::SmallButton("X")) action = {Kind::Remove, i, {}};
         ImGui::PopID();
     }
     ImGui::EndTable();
-
-    if (remove_row) {
-        entries.erase(entries.begin() + static_cast<std::ptrdiff_t>(*remove_row));
-        app.edit_buffers.erase(app.edit_buffers.begin() + static_cast<std::ptrdiff_t>(*remove_row));
-        app.editing_row = -1;
-    }
+    return action;
 }
 
 void draw_pointer_scanner(App& app) {
@@ -1174,10 +970,10 @@ void draw_pointer_scanner(App& app) {
             options.base_module = app.ptr_module;
             start_job(app, "Pointer scan", [&app, target, options]() -> ApplyResult {
                 auto result = std::make_shared<scanner::PointerScanResult>(
-                    scanner::PointerScanner(app.process).scan(target, options));
+                    scanner::PointerScanner(app.session.process_ptr()).scan(target, options));
                 return [&app, result]() {
-                    app.pointer_paths = std::move(result->paths);
-                    app.status = "Pointer scan: " + std::to_string(app.pointer_paths.size()) + " paths" +
+                    app.session.pointer_paths() = std::move(result->paths);
+                    app.status = "Pointer scan: " + std::to_string(app.session.pointer_paths().size()) + " paths" +
                                  (result->truncated ? " (hit the search limit: lower the depth or max offset)" : "") +
                                  ". Restart the target, find the value again, then Rescan.";
                 };
@@ -1185,12 +981,13 @@ void draw_pointer_scanner(App& app) {
         }
     }
     ImGui::SameLine();
-    ImGui::BeginDisabled(app.pointer_paths.empty());
+    auto& paths = app.session.pointer_paths(); // only a finished pointer scan job replaces them
+    ImGui::BeginDisabled(paths.empty());
     if (ImGui::Button("Rescan")) {
         const uintptr_t target = utils::parse_address(app.ptr_target);
-        const size_t before = app.pointer_paths.size();
-        app.pointer_paths = scanner::PointerScanner::verify_paths(*app.process, app.pointer_paths, target);
-        app.status = "Rescan: " + std::to_string(app.pointer_paths.size()) + " of " + std::to_string(before) +
+        const size_t before = paths.size();
+        paths = scanner::PointerScanner::verify_paths(app.session.process(), paths, target);
+        app.status = "Rescan: " + std::to_string(paths.size()) + " of " + std::to_string(before) +
                      " paths still lead to " + app.ptr_target + ".";
     }
     ImGui::EndDisabled();
@@ -1209,13 +1006,13 @@ void draw_pointer_scanner(App& app) {
 
     std::optional<size_t> add_row;
     ImGuiListClipper clipper;
-    clipper.Begin(static_cast<int>(app.pointer_paths.size()));
+    clipper.Begin(static_cast<int>(paths.size()));
     while (clipper.Step()) {
         for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; ++row) {
             ImGui::TableNextRow();
             ImGui::PushID(row);
             ImGui::TableNextColumn();
-            ImGui::TextUnformatted(app.pointer_paths[static_cast<size_t>(row)].to_string().c_str());
+            ImGui::TextUnformatted(paths[static_cast<size_t>(row)].to_string().c_str());
             ImGui::TableNextColumn();
             if (ImGui::SmallButton("Add")) add_row = static_cast<size_t>(row);
             ImGui::PopID();
@@ -1223,11 +1020,7 @@ void draw_pointer_scanner(App& app) {
     }
     ImGui::EndTable();
 
-    if (add_row) {
-        std::lock_guard<std::mutex> lock(app.table_mutex);
-        app.table.entries.push_back(table::make_entry(app.pointer_paths[*add_row], type_at(app.ptr_add_type)));
-        app.status = "Added " + app.table.entries.back().location_string() + " to the cheat table.";
-    }
+    if (add_row) show(app, app.session.table().add_pointer(paths[*add_row], type_at(app.ptr_add_type), ""));
 }
 
 void draw_ui(App& app) {
@@ -1310,11 +1103,9 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
     }
     if (!options.table.empty()) {
         app.table_path = options.table;
-        if (auto loaded = table::load_table(options.table)) {
-            std::lock_guard<std::mutex> lock(app.table_mutex);
-            app.table = std::move(*loaded);
-            if (is_attached(app)) app.table_note = reconcile_table(app);
-        }
+        const auto loaded = app.session.table().load(options.table);
+        if (!loaded.ok) app.status = loaded.message;
+        else if (is_attached(app)) app.table_note = describe_reconciled(app.session.table().reconcile());
     }
     if (!options.track.empty() && is_attached(app)) {
         if (options.track == "auto") {
@@ -1426,7 +1217,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     App app;
     apply_launch_options(app, options);
-    std::thread freeze_thread(freeze_worker, &app);
 
     constexpr int SCREENSHOT_FRAME = 10; // let tables settle their column widths first
     int frame = 0;
@@ -1484,8 +1274,6 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     }
 
     unregister_hotkeys();
-    app.freeze_running = false;
-    freeze_thread.join();
     if (app.job.valid()) app.job.wait(); // let a running scan finish before tearing down
 
     ImGui_ImplDX11_Shutdown();
