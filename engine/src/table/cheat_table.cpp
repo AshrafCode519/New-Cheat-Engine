@@ -153,6 +153,7 @@ ReconcileResult reconcile(TableEntry& entry, const hal::IProcess& process, const
         uintptr_t address{0};
         size_t votes{0};
         size_t matches{0};      // remembered non-zero context words still there
+        double nearness{0};     // the same words, each weighted by 1 / its distance from the value in words
         bool value_equal{false};
     };
     std::vector<uintptr_t> leads_to(paths.size(), 0);
@@ -186,20 +187,24 @@ ReconcileResult reconcile(TableEntry& entry, const hal::IProcess& process, const
                 const bool overlaps_value = off + 4 > radius && off < radius + value_size;
                 uint32_t saved = 0;
                 std::memcpy(&saved, entry.context.data() + off, 4);
-                if (!overlaps_value && saved != 0 && std::memcmp(window.data() + off, &saved, 4) == 0) ++c.matches;
+                if (overlaps_value || saved == 0 || std::memcmp(window.data() + off, &saved, 4) != 0) continue;
+                ++c.matches;
+                // 1 for the words touching the value, 1/2 for the next ones, ...
+                const size_t distance = off < radius ? (radius - off) / 4 : (off - (radius + value_size)) / 4 + 1;
+                c.nearness += 1.0 / static_cast<double>(distance);
             }
         }
     }
 
-    // Context first: matched words, plus a bonus for still holding the remembered value
-    auto context_key = [](const Candidate& c) { return c.matches * 2 + (c.value_equal ? 3 : 0); };
-    size_t best_key = 0;
+    // Context first: near words, plus still holding the remembered value (as much as a direct neighbour)
+    auto context_key = [](const Candidate& c) { return c.nearness + (c.value_equal ? 1.0 : 0.0); };
+    double best_key = 0;
     for (const auto& c : candidates) best_key = std::max(best_key, context_key(c));
 
-    // Candidates still in the running: the best context match(es), or everyone if the context says nothing
+    // Candidates still in the running: about the best context match, or everyone if the context says nothing
     std::vector<size_t> pool;
     for (size_t i = 0; i < candidates.size(); ++i) {
-        if (best_key == 0 || context_key(candidates[i]) == best_key) pool.push_back(i);
+        if (best_key == 0 || context_key(candidates[i]) >= 0.75 * best_key) pool.push_back(i);
     }
 
     // Among them, most votes wins; ties go to the better-ranked path (earlier candidate)

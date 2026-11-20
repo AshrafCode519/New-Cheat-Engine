@@ -69,9 +69,12 @@ struct ReconcileResult {
 };
 
 // After a restart: follows every path of the entry and chooses among the addresses they lead to. The
-// address whose surroundings match the remembered context best wins (holding the remembered value counts
-// too); without a clear difference there, the address most paths agree on wins (ties go to the best-ranked
-// path). Keeps only the paths leading to the choice, the best of them as the location.
+// address whose surroundings match the remembered context best wins. A remembered word counts by its
+// nearness to the value (1 / distance in words): the value's own object sits right next to it, while words
+// further away may be heap block headers that any block of that size has. Holding the remembered value
+// counts like a direct neighbour. Among the addresses within 3/4 of the best match, the one most paths agree
+// on wins (ties go to the best-ranked path). Keeps only the paths leading to the choice, the best of them
+// as the location.
 // Entries without alternatives are left alone; on an ambiguous choice nothing changes.
 ReconcileResult reconcile(TableEntry& entry, const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules);
 

@@ -234,6 +234,25 @@ TEST_CASE("the remembered surroundings beat a majority of paths that move togeth
     CHECK(table::reconcile(blind, *g.process, g.modules).address == old_place);
 }
 
+TEST_CASE("the value's direct neighbours count more than far words any heap block has") {
+    // Seen on target_dummy: heap block headers 6-9 words before the value matched at an unrelated block
+    // that most paths led to, while the real value kept only its two struct neighbours and its value.
+    // Counting every word alike chose the unrelated block (4 far words beat 2 near ones and the value).
+    PermanentFixture f(3, 5);
+    const size_t value = f.b - kBase + 0x10;
+    for (size_t k = 0; k < 4; ++k) f.process->put<uint32_t>(value - 0x24 + 4 * k, 0xABC00000 + static_cast<uint32_t>(k));
+    auto entry = permanent_entry(f);
+
+    f.restart(); // the headers stay at the old place, where the 5 decoys still lead
+    const auto result = table::reconcile(entry, *f.process, f.modules);
+    CHECK(result.address == f.b + 0x10);
+    CHECK(result.agreeing == 3);
+    CHECK(result.by_context);
+    CHECK(result.value_matches);
+    CHECK(result.context_words == 6);
+    CHECK(result.context_matches == 2);
+}
+
 TEST_CASE("reconcile changes nothing on a close vote or when nothing resolves") {
     PermanentFixture f(1); // one real chain against the decoy: 1 vote each after the restart
     auto entry = permanent_entry(f);
