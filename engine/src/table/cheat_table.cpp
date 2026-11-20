@@ -5,6 +5,7 @@
 #include <nlohmann/json.hpp>
 #include <algorithm>
 #include <charconv>
+#include <cstring>
 #include <fstream>
 #include <sstream>
 
@@ -49,7 +50,189 @@ size_t entry_size(const TableEntry& entry) {
     return is_numeric ? numeric : entry.length;
 }
 
+// "module" (omitted for an absolute address), "offset" and "pointer" (omitted for a static address)
+void write_path(json& item, const scanner::PointerPath& path) {
+    if (!path.module_name.empty()) item["module"] = path.module_name;
+    item["offset"] = to_hex(path.base_offset);
+    if (!path.offsets.empty()) {
+        json offsets = json::array();
+        for (const auto o : path.offsets) offsets.push_back(to_hex(static_cast<uint64_t>(o)));
+        item["pointer"] = offsets;
+    }
+}
+
+std::optional<scanner::PointerPath> read_path(const json& item) {
+    scanner::PointerPath path;
+    path.module_name = item.value("module", "");
+    auto offset = from_hex<uintptr_t>(item.value("offset", ""));
+    if (!offset) return std::nullopt;
+    path.base_offset = *offset;
+
+    if (const auto pointer = item.find("pointer"); pointer != item.end()) {
+        if (!pointer->is_array()) return std::nullopt;
+        for (const auto& o : *pointer) {
+            if (!o.is_string()) return std::nullopt;
+            auto value = from_hex<int64_t>(o.get<std::string>());
+            if (!value) return std::nullopt;
+            path.offsets.push_back(*value);
+        }
+    }
+    return path;
+}
+
+std::string bytes_to_hex(const std::vector<uint8_t>& bytes) {
+    constexpr char digits[] = "0123456789ABCDEF";
+    std::string out;
+    out.reserve(bytes.size() * 2);
+    for (const uint8_t b : bytes) {
+        out.push_back(digits[b >> 4]);
+        out.push_back(digits[b & 0xF]);
+    }
+    return out;
+}
+
+std::optional<std::vector<uint8_t>> hex_to_bytes(const std::string& hex) {
+    if (hex.size() % 2 != 0) return std::nullopt;
+    std::vector<uint8_t> bytes(hex.size() / 2);
+    for (size_t i = 0; i < bytes.size(); ++i) {
+        const char* first = hex.data() + i * 2;
+        auto [ptr, ec] = std::from_chars(first, first + 2, bytes[i], 16);
+        if (ec != std::errc() || ptr != first + 2) return std::nullopt;
+    }
+    return bytes;
+}
+
+bool same_path(const scanner::PointerPath& a, const scanner::PointerPath& b) {
+    return a.module_name == b.module_name && a.base_offset == b.base_offset && a.offsets == b.offsets;
+}
+
 } // anonymous namespace
+
+std::vector<scanner::PointerPath> find_permanent_paths(const TableEntry& entry, std::shared_ptr<hal::IProcess> process,
+                                                       const std::vector<hal::ModuleInfo>& modules) {
+    const uintptr_t address = entry.address(*process, modules);
+    if (address == 0) return {};
+
+    // The default search: many paths give reconcile many voters; ranking puts the likely ones first
+    scanner::PointerScanner scanner(std::move(process));
+    return scanner.scan(address).paths;
+}
+
+bool make_permanent(TableEntry& entry, const std::vector<scanner::PointerPath>& paths, const hal::IProcess& process,
+                    const std::vector<hal::ModuleInfo>& modules, size_t max_alternatives) {
+    if (paths.empty()) return false;
+
+    // Remember the surroundings while the entry still points at the value
+    entry.context.clear();
+    const uintptr_t address = entry.address(process, modules);
+    const size_t radius = TableEntry::CONTEXT_RADIUS;
+    if (address > radius) {
+        std::vector<uint8_t> window(2 * radius + entry_size(entry));
+        if (process.read_raw(address - radius, window.data(), window.size())) entry.context = std::move(window);
+    }
+
+    entry.location = paths.front();
+    const size_t kept = std::min(paths.size() - 1, max_alternatives);
+    entry.alternatives.assign(paths.begin() + 1, paths.begin() + 1 + static_cast<std::ptrdiff_t>(kept));
+    return true;
+}
+
+ReconcileResult reconcile(TableEntry& entry, const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules) {
+    ReconcileResult result;
+    if (entry.alternatives.empty()) return result;
+
+    // Every path in rank order: the location first, then the alternatives
+    std::vector<scanner::PointerPath> paths;
+    paths.reserve(entry.alternatives.size() + 1);
+    paths.push_back(entry.location);
+    paths.insert(paths.end(), entry.alternatives.begin(), entry.alternatives.end());
+    result.paths = paths.size();
+
+    // The addresses the paths lead to now, in order of their best-ranked path, with their vote counts
+    struct Candidate {
+        uintptr_t address{0};
+        size_t votes{0};
+        size_t matches{0};      // remembered non-zero context words still there
+        bool value_equal{false};
+    };
+    std::vector<uintptr_t> leads_to(paths.size(), 0);
+    std::vector<Candidate> candidates;
+    for (size_t i = 0; i < paths.size(); ++i) {
+        leads_to[i] = paths[i].resolve(process, modules);
+        if (leads_to[i] == 0) continue;
+        ++result.resolved;
+        auto it = std::find_if(candidates.begin(), candidates.end(), [&](const Candidate& c) { return c.address == leads_to[i]; });
+        if (it == candidates.end()) candidates.push_back({leads_to[i], 1});
+        else ++it->votes;
+    }
+    if (candidates.empty()) return result; // nothing resolves (other program, module not loaded): keep everything
+
+    // Compare each candidate's surroundings with the remembered ones, word by word (zero words prove nothing)
+    const size_t radius = TableEntry::CONTEXT_RADIUS;
+    const size_t value_size = entry_size(entry);
+    const bool has_context = entry.context.size() == 2 * radius + value_size;
+    if (has_context) {
+        for (size_t off = 0; off + 4 <= entry.context.size(); off += 4) {
+            const bool overlaps_value = off + 4 > radius && off < radius + value_size;
+            uint32_t saved = 0;
+            std::memcpy(&saved, entry.context.data() + off, 4);
+            if (!overlaps_value && saved != 0) ++result.context_words;
+        }
+        std::vector<uint8_t> window(entry.context.size());
+        for (auto& c : candidates) {
+            if (c.address <= radius || !process.read_raw(c.address - radius, window.data(), window.size())) continue;
+            c.value_equal = std::memcmp(window.data() + radius, entry.context.data() + radius, value_size) == 0;
+            for (size_t off = 0; off + 4 <= window.size(); off += 4) {
+                const bool overlaps_value = off + 4 > radius && off < radius + value_size;
+                uint32_t saved = 0;
+                std::memcpy(&saved, entry.context.data() + off, 4);
+                if (!overlaps_value && saved != 0 && std::memcmp(window.data() + off, &saved, 4) == 0) ++c.matches;
+            }
+        }
+    }
+
+    // Context first: matched words, plus a bonus for still holding the remembered value
+    auto context_key = [](const Candidate& c) { return c.matches * 2 + (c.value_equal ? 3 : 0); };
+    size_t best_key = 0;
+    for (const auto& c : candidates) best_key = std::max(best_key, context_key(c));
+
+    // Candidates still in the running: the best context match(es), or everyone if the context says nothing
+    std::vector<size_t> pool;
+    for (size_t i = 0; i < candidates.size(); ++i) {
+        if (best_key == 0 || context_key(candidates[i]) == best_key) pool.push_back(i);
+    }
+
+    // Among them, most votes wins; ties go to the better-ranked path (earlier candidate)
+    size_t winner = pool.front();
+    for (const size_t i : pool) {
+        if (candidates[i].votes > candidates[winner].votes) winner = i;
+    }
+    size_t runner_up = 0;
+    for (const size_t i : pool) {
+        if (i != winner) runner_up = std::max(runner_up, candidates[i].votes);
+    }
+
+    const Candidate& chosen = candidates[winner];
+    size_t most_votes = 0;
+    for (const auto& c : candidates) most_votes = std::max(most_votes, c.votes);
+    result.address = chosen.address;
+    result.agreeing = chosen.votes;
+    result.context_matches = chosen.matches;
+    result.value_matches = chosen.value_equal;
+    result.by_context = best_key > 0 && pool.size() == 1 && chosen.votes < most_votes;
+    result.ambiguous = runner_up > 0 && runner_up * 2 >= chosen.votes;
+    if (result.ambiguous) return result; // no clear choice: change nothing, the user decides
+
+    std::vector<scanner::PointerPath> agreeing;
+    agreeing.reserve(chosen.votes);
+    for (size_t i = 0; i < paths.size(); ++i) {
+        if (leads_to[i] == chosen.address) agreeing.push_back(std::move(paths[i]));
+    }
+    result.changed = agreeing.size() != result.paths || !same_path(agreeing.front(), entry.location);
+    entry.location = std::move(agreeing.front());
+    entry.alternatives.assign(std::make_move_iterator(agreeing.begin() + 1), std::make_move_iterator(agreeing.end()));
+    return result;
+}
 
 uintptr_t TableEntry::address(const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules) const {
     if (!is_absolute()) return location.resolve(process, modules);
@@ -159,15 +342,19 @@ std::string to_json(const CheatTable& table) {
             {"description", e.description},
             {"type", utils::format_data_type(e.type)},
         };
-        if (!e.is_absolute()) item["module"] = e.location.module_name;
-        item["offset"] = to_hex(e.location.base_offset);
-        if (!e.location.offsets.empty()) {
-            json offsets = json::array();
-            for (const auto o : e.location.offsets) offsets.push_back(to_hex(static_cast<uint64_t>(o)));
-            item["pointer"] = offsets;
-        }
+        write_path(item, e.location);
         if (e.length > 0) item["length"] = e.length;
         if (e.frozen_value) item["freeze"] = *e.frozen_value;
+        if (!e.context.empty()) item["context"] = bytes_to_hex(e.context);
+        if (!e.alternatives.empty()) {
+            json alternatives = json::array();
+            for (const auto& path : e.alternatives) {
+                json alternative = json::object();
+                write_path(alternative, path);
+                alternatives.push_back(alternative);
+            }
+            item["alternatives"] = alternatives;
+        }
         entries.push_back(item);
     }
 
@@ -201,20 +388,9 @@ std::optional<CheatTable> from_json(const std::string& text) {
         if (!type) return std::nullopt;
         e.type = *type;
 
-        e.location.module_name = item.value("module", "");
-        auto offset = from_hex<uintptr_t>(item.value("offset", ""));
-        if (!offset) return std::nullopt;
-        e.location.base_offset = *offset;
-
-        if (const auto pointer = item.find("pointer"); pointer != item.end()) {
-            if (!pointer->is_array()) return std::nullopt;
-            for (const auto& o : *pointer) {
-                if (!o.is_string()) return std::nullopt;
-                auto value = from_hex<int64_t>(o.get<std::string>());
-                if (!value) return std::nullopt;
-                e.location.offsets.push_back(*value);
-            }
-        }
+        auto location = read_path(item);
+        if (!location) return std::nullopt;
+        e.location = std::move(*location);
 
         if (const auto length = item.find("length"); length != item.end()) {
             if (!length->is_number_unsigned()) return std::nullopt;
@@ -227,6 +403,21 @@ std::optional<CheatTable> from_json(const std::string& text) {
         if (const auto freeze = item.find("freeze"); freeze != item.end()) {
             if (!freeze->is_string()) return std::nullopt;
             e.frozen_value = freeze->get<std::string>();
+        }
+
+        if (const auto context = item.find("context"); context != item.end()) {
+            auto bytes = context->is_string() ? hex_to_bytes(context->get<std::string>()) : std::nullopt;
+            if (!bytes) return std::nullopt;
+            e.context = std::move(*bytes);
+        }
+
+        if (const auto alternatives = item.find("alternatives"); alternatives != item.end()) {
+            if (!alternatives->is_array()) return std::nullopt;
+            for (const auto& alternative : *alternatives) {
+                auto path = alternative.is_object() ? read_path(alternative) : std::nullopt;
+                if (!path || path->module_name.empty()) return std::nullopt; // alternatives are pointer paths
+                e.alternatives.push_back(std::move(*path));
+            }
         }
 
         table.entries.push_back(std::move(e));

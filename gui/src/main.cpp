@@ -104,10 +104,41 @@ void cleanup_device() {
     if (g_device) { g_device->Release(); g_device = nullptr; }
 }
 
+// Global hotkeys for smart track, so the user can answer without leaving the game. Each action has a
+// numpad key and a Ctrl+Shift+digit alternative (for keyboards without a numpad).
+enum HotkeyAction { HOTKEY_READY = 1, HOTKEY_DOWN, HOTKEY_UP, HOTKEY_CHANGED };
+HWND g_window = nullptr;
+std::vector<int> g_hotkeys_pressed; // filled by window_proc, drained by the main loop (same thread)
+
+bool register_hotkeys() {
+    const UINT numpad[] = {VK_NUMPAD0, VK_SUBTRACT, VK_ADD, VK_MULTIPLY};
+    bool ok = true;
+    for (int action = HOTKEY_READY; action <= HOTKEY_CHANGED; ++action) {
+        ok &= RegisterHotKey(g_window, action, MOD_NOREPEAT, numpad[action - 1]) != FALSE;
+        ok &= RegisterHotKey(g_window, action + 10, MOD_CONTROL | MOD_SHIFT | MOD_NOREPEAT, '0' + action) != FALSE;
+    }
+    return ok;
+}
+
+void unregister_hotkeys() {
+    for (int action = HOTKEY_READY; action <= HOTKEY_CHANGED; ++action) {
+        UnregisterHotKey(g_window, action);
+        UnregisterHotKey(g_window, action + 10);
+    }
+}
+
+// Audible feedback: the game is in front, so the window can't show anything
+void beep(DWORD frequency, DWORD ms) {
+    std::thread([frequency, ms] { Beep(frequency, ms); }).detach();
+}
+
 LRESULT WINAPI window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wparam, lparam)) return true;
 
     switch (msg) {
+        case WM_HOTKEY:
+            g_hotkeys_pressed.push_back(static_cast<int>(wparam) % 10);
+            return 0;
         case WM_SIZE:
             if (wparam == SIZE_MINIMIZED) return 0;
             g_resize_width = LOWORD(lparam);
@@ -191,6 +222,7 @@ struct App {
     table::CheatTable table;
     std::vector<hal::ModuleInfo> modules;
     std::vector<std::string> edit_buffers; // per-entry value text while typing
+    std::string table_note;                // what reconciling permanent entries found after attach / load
     int editing_row = -1;
     std::string table_path = "table.json";
 
@@ -342,6 +374,48 @@ void learn_noise(App& app) {
     });
 }
 
+// Permanent entries carry several pointer paths; after a restart they find the value's new address
+// (see table::reconcile). Call with table_mutex held.
+std::string reconcile_table(App& app) {
+    std::string summary;
+    for (auto& e : app.table.entries) {
+        if (e.alternatives.empty()) continue;
+        const auto r = table::reconcile(e, *app.process, app.modules);
+        const std::string name = e.description.empty() ? e.location_string() : e.description;
+        if (r.resolved == 0) summary += " " + name + ": not found here.";
+        else if (r.ambiguous) summary += " " + name + ": unsure, check its value.";
+        else summary += " " + name + ": found" + (r.by_context ? " (by its surroundings)." : ".");
+    }
+    return summary;
+}
+
+void make_entry_permanent(App& app, size_t index) {
+    const table::TableEntry entry = app.table.entries[index]; // called with table_mutex held
+    const auto modules = app.modules;
+    start_job(app, "Finding pointer paths", [&app, entry, modules, index]() -> ApplyResult {
+        auto paths = std::make_shared<std::vector<scanner::PointerPath>>(
+            table::find_permanent_paths(entry, app.process, modules));
+        return [&app, entry, index, paths]() {
+            std::lock_guard<std::mutex> lock(app.table_mutex);
+            auto& entries = app.table.entries;
+            // The table may have changed while the scan ran: only update the same entry
+            const bool same = index < entries.size() && entries[index].location.module_name == entry.location.module_name &&
+                              entries[index].location.base_offset == entry.location.base_offset &&
+                              entries[index].location.offsets == entry.location.offsets;
+            if (paths->empty()) {
+                app.status = "No static pointer path leads to it; it stays valid only until a restart.";
+            } else if (!same) {
+                app.status = "The table changed during the search; press Keep again.";
+            } else {
+                table::make_permanent(entries[index], *paths, *app.process, app.modules);
+                app.status = "Kept: " + entries[index].location_string() + " (+" +
+                             std::to_string(entries[index].alternatives.size()) +
+                             " paths that find it after a restart). Save the table.";
+            }
+        };
+    });
+}
+
 void attach(App& app, const hal::ProcessInfo& info) {
     bool ok = false;
     {
@@ -352,6 +426,7 @@ void attach(App& app, const hal::ProcessInfo& info) {
         }
         ok = app.process->attach(info.pid);
         app.modules = ok ? app.process->get_modules() : std::vector<hal::ModuleInfo>{};
+        app.table_note = ok ? reconcile_table(app) : std::string();
     }
 
     app.state = {};
@@ -543,6 +618,7 @@ void start_tracking(App& app) {
             refresh_track(app);
             app.track_stage = App::TrackStage::Quiet;
             app.status = "Smart track: " + app.track_summary + ". Leave the value alone, then press \"I'll change it now\".";
+            if (!register_hotkeys()) app.status += " Some hotkeys are taken by another program.";
         };
     });
 }
@@ -554,6 +630,7 @@ void track_event(App& app, const scanner::Expectation& expected) {
             refresh_track(app);
             app.track_stage = App::TrackStage::Quiet;
             app.status = "Smart track: " + app.track_summary + ". Leave the value alone again.";
+            beep(1320, 90); // checked: the user may be in the game
         };
     });
 }
@@ -571,6 +648,31 @@ void stop_tracking(App& app) {
     app.track_stage = App::TrackStage::Off;
     app.track_best.clear();
     app.track_stop_requested = false;
+    unregister_hotkeys();
+}
+
+// Hotkeys pressed while the game was in front: Num0 "I'll change it", then Num- / Num+ / Num* once changed
+void process_hotkeys(App& app) {
+    using Kind = scanner::Expectation::Kind;
+    size_t handled = 0;
+    for (; handled < g_hotkeys_pressed.size(); ++handled) {
+        if (job_running(app)) break; // keep the rest for a later frame
+        const int action = g_hotkeys_pressed[handled];
+        if (app.track_stage == App::TrackStage::Off) continue;
+
+        if (action == HOTKEY_READY) {
+            if (app.track_stage == App::TrackStage::Quiet) {
+                app.track_stage = App::TrackStage::Changing;
+                app.status = "Smart track: change the value, then press Num- / Num+ / Num*.";
+                beep(880, 80);
+            }
+        } else if (app.track_stage != App::TrackStage::Changing) {
+            beep(220, 200); // press Num0 before changing the value, or the change counts as noise
+        } else {
+            track_event(app, {action == HOTKEY_DOWN ? Kind::Decreased : action == HOTKEY_UP ? Kind::Increased : Kind::Changed});
+        }
+    }
+    g_hotkeys_pressed.erase(g_hotkeys_pressed.begin(), g_hotkeys_pressed.begin() + static_cast<std::ptrdiff_t>(handled));
 }
 
 // Every frame: while the user leaves the value alone, keep watching for values that change on their own
@@ -741,6 +843,8 @@ void draw_tracking(App& app) {
 
     if (app.track_stage == Stage::Quiet) {
         ImGui::TextWrapped("Leave the value alone: values that change on their own lose points.");
+        ImGui::TextDisabled("From the game: Num0 = I'll change it, then Num- down / Num+ up / Num* changed "
+                            "(or Ctrl+Shift+1, then 2 / 3 / 4)");
         // A watch job may still be running; it finishes and no new one starts
         if (ImGui::Button("I'll change it now")) app.track_stage = Stage::Changing;
     } else {
@@ -897,11 +1001,13 @@ void draw_cheat_table(App& app) {
             app.table = std::move(*loaded);
             app.editing_row = -1;
             app.status = "Loaded " + std::to_string(entries.size()) + " entries for " + app.table.process_name + ".";
+            app.table_note = attached ? reconcile_table(app) : std::string();
         } else {
             app.status = "Could not read a table from " + app.table_path + ".";
         }
         return; // entries changed under us; draw them next frame
     }
+    if (!app.table_note.empty()) ImGui::TextWrapped("After restart:%s", app.table_note.c_str());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV |
                                   ImGuiTableFlags_Resizable | ImGuiTableFlags_ScrollY;
@@ -912,7 +1018,7 @@ void draw_cheat_table(App& app) {
     ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(7));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
     ImGui::TableHeadersRow();
 
     std::optional<size_t> remove_row;
@@ -958,6 +1064,16 @@ void draw_cheat_table(App& app) {
         ImGui::TextUnformatted(e.location_string().c_str());
 
         ImGui::TableNextColumn();
+        // Keep: pointer paths that find a heap value again after a restart (static addresses already do)
+        const bool is_static = !e.is_absolute() && e.location.offsets.empty();
+        ImGui::BeginDisabled(!attached || job_running(app) || is_static || !e.alternatives.empty());
+        if (ImGui::SmallButton(e.alternatives.empty() ? "Keep" : "Kept")) make_entry_permanent(app, i);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip(is_static ? "A static address: it already survives restarts."
+                                        : "Find pointer paths so this value is found again after the game restarts.");
+        }
+        ImGui::SameLine();
         if (ImGui::SmallButton("Pointers")) {
             const uintptr_t address = attached ? e.address(*app.process, app.modules) : 0;
             if (address) {
@@ -1143,6 +1259,7 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
         if (auto loaded = table::load_table(options.table)) {
             std::lock_guard<std::mutex> lock(app.table_mutex);
             app.table = std::move(*loaded);
+            if (is_attached(app)) app.table_note = reconcile_table(app);
         }
     }
     if (!options.track.empty() && is_attached(app)) {
@@ -1226,6 +1343,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     HWND hwnd = CreateWindowW(wc.lpszClassName, L"New Cheat Engine", WS_OVERLAPPEDWINDOW, 100, 100, 1400, 860,
                               nullptr, nullptr, wc.hInstance, nullptr);
 
+    g_window = hwnd;
     if (!create_device(hwnd)) {
         cleanup_device();
         UnregisterClassW(wc.lpszClassName, wc.hInstance);
@@ -1284,6 +1402,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         }
 
         poll_job(app);
+        process_hotkeys(app);
         tick_tracking(app);
 
         ImGui_ImplDX11_NewFrame();
@@ -1307,6 +1426,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         g_swap_chain_occluded = (hr == DXGI_STATUS_OCCLUDED);
     }
 
+    unregister_hotkeys();
     app.freeze_running = false;
     freeze_thread.join();
     if (app.job.valid()) app.job.wait(); // let a running scan finish before tearing down

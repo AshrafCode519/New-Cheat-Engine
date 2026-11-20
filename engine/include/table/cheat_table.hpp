@@ -3,6 +3,7 @@
 #include "../hal/process.hpp"
 #include "../scanner/scan_types.hpp"
 #include "../scanner/pointer_scanner.hpp"
+#include <memory>
 #include <optional>
 #include <string>
 #include <vector>
@@ -19,6 +20,16 @@ struct TableEntry {
     size_t length{0};                        // byte length of str / wstr / aob entries
     std::optional<std::string> frozen_value; // value text to keep writing, as the user typed it
 
+    // Other pointer paths that led to the same value when it was made permanent. After a restart they
+    // vote on where the value is now (see reconcile), and the ones that disagree are dropped.
+    std::vector<scanner::PointerPath> alternatives;
+
+    // The bytes around the value when it was made permanent: CONTEXT_RADIUS before it, the value, and
+    // CONTEXT_RADIUS after it. Votes alone can be fooled (many paths share one route through the heap and
+    // move together), so reconcile prefers the address whose surroundings still look like this.
+    std::vector<uint8_t> context;
+    static constexpr size_t CONTEXT_RADIUS = 64;
+
     [[nodiscard]] bool is_absolute() const noexcept { return location.module_name.empty(); }
 
     // Current address, or 0 if it can't be resolved (module not loaded, broken pointer)
@@ -32,6 +43,37 @@ struct CheatTable {
     std::string process_name;
     std::vector<TableEntry> entries;
 };
+
+// Pointer paths that lead to the entry's current address, best first (scanned with small offsets
+// first, the default max offset if those find nothing). Slow: run it off the UI thread. Fails (empty)
+// if the entry can't be resolved or no static path exists.
+std::vector<scanner::PointerPath> find_permanent_paths(const TableEntry& entry, std::shared_ptr<hal::IProcess> process,
+                                                       const std::vector<hal::ModuleInfo>& modules);
+
+// Makes the entry survive restarts: remembers the bytes around its value, then the best path becomes
+// its location and up to max_alternatives more are kept for reconcile. False if `paths` is empty.
+bool make_permanent(TableEntry& entry, const std::vector<scanner::PointerPath>& paths, const hal::IProcess& process,
+                    const std::vector<hal::ModuleInfo>& modules, size_t max_alternatives = 1000);
+
+struct ReconcileResult {
+    size_t paths{0};          // location + alternatives
+    size_t resolved{0};       // paths that could be followed to some address
+    size_t agreeing{0};       // paths that lead to the chosen address
+    uintptr_t address{0};     // the chosen address (0 = no paths resolved)
+    size_t context_words{0};  // non-zero 4-byte words remembered around the value
+    size_t context_matches{0};// how many of them the chosen address still has
+    bool value_matches{false};// the chosen address holds the remembered value
+    bool by_context{false};   // the surroundings decided, not the vote
+    bool ambiguous{false};    // no clear choice: nothing was changed, check the value
+    bool changed{false};      // the entry's paths were updated
+};
+
+// After a restart: follows every path of the entry and chooses among the addresses they lead to. The
+// address whose surroundings match the remembered context best wins (holding the remembered value counts
+// too); without a clear difference there, the address most paths agree on wins (ties go to the best-ranked
+// path). Keeps only the paths leading to the choice, the best of them as the location.
+// Entries without alternatives are left alone; on an ambiguous choice nothing changes.
+ReconcileResult reconcile(TableEntry& entry, const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules);
 
 // Entry for an address found by a scan: module-relative if the address lies inside a module.
 // length is the byte size for str / wstr / aob (ignored for numbers).

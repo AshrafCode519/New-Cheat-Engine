@@ -208,6 +208,8 @@ void print_help() {
               << "  table                           - Show entries with their current values\n"
               << "  tset <#> <value> / tdel <#>     - Write a value / remove an entry\n"
               << "  tfreeze <#> [value] / tunfreeze <#> - Lock an entry (default: its current value)\n"
+              << "  tperm <#>                       - Make an entry permanent: keeps its best pointer paths, which\n"
+              << "                                    vote on the value's new address after every restart\n"
               << "  tsave <file.json> / tload <file.json> - Save or load the table\n\n"
               << "Memory Operations:\n"
               << "  write <addr> <type> <val>       - Write value to memory address\n"
@@ -282,6 +284,8 @@ void cmd_ps(const std::string& filter) {
     std::cout << "----------------------------------------\n";
     std::cout << " Found " << count << " process(es).\n\n";
 }
+
+void reconcile_table();
 
 std::string describe_noise() {
     if (!g_noise || g_noise->empty()) return "no noise known";
@@ -365,6 +369,7 @@ void cmd_attach(uint32_t pid) {
         g_scanner = std::make_unique<scanner::MemoryScanner>(g_process);
         std::cout << "[+] Successfully attached to PID: " << pid << "\n";
         learn_noise(4);
+        reconcile_table();
     } else {
         std::cerr << "[-] Failed to attach to PID: " << pid << ". Run as Administrator or check PID.\n";
     }
@@ -1045,12 +1050,81 @@ void cmd_table_load(const std::string& path) {
         std::cerr << "[-] Could not read a table from " << path << "\n";
         return;
     }
+    {
+        std::lock_guard<std::mutex> lock(g_freeze_mutex);
+        g_table = std::move(*loaded);
+        size_t frozen = 0;
+        for (const auto& e : g_table.entries) frozen += e.frozen_value ? 1 : 0;
+        std::cout << "[+] Loaded " << g_table.entries.size() << " entr(ies) for '" << g_table.process_name << "' from "
+                  << path << (frozen ? " (" + std::to_string(frozen) + " frozen)" : std::string()) << "\n";
+    }
+    reconcile_table();
+}
+
+// Permanent entries carry several pointer paths; after a restart they vote on where the value is now
+void reconcile_table() {
+    if (!g_process || !g_process->is_attached()) return;
     std::lock_guard<std::mutex> lock(g_freeze_mutex);
-    g_table = std::move(*loaded);
-    size_t frozen = 0;
-    for (const auto& e : g_table.entries) frozen += e.frozen_value ? 1 : 0;
-    std::cout << "[+] Loaded " << g_table.entries.size() << " entr(ies) for '" << g_table.process_name << "' from "
-              << path << (frozen ? " (" + std::to_string(frozen) + " frozen)" : std::string()) << "\n";
+    for (size_t i = 0; i < g_table.entries.size(); ++i) {
+        auto& e = g_table.entries[i];
+        if (e.alternatives.empty()) continue;
+        const auto r = table::reconcile(e, *g_process, g_modules);
+        std::cout << "[*] #" << i << " " << e.description << ": ";
+        if (r.resolved == 0) {
+            std::cout << "none of its " << r.paths << " paths resolve here (another program?).\n";
+        } else if (r.ambiguous) {
+            std::cout << "close vote (" << r.agreeing << " of " << r.resolved << " paths agree on "
+                      << utils::format_address(r.address) << "): check the value; nothing dropped.\n";
+        } else {
+            std::cout << "found at " << utils::format_address(r.address) << " (" << r.agreeing << " of " << r.resolved
+                      << " paths lead there";
+            if (r.context_words > 0) {
+                std::cout << "; surroundings match " << r.context_matches << "/" << r.context_words << " words";
+            }
+            if (r.value_matches) std::cout << "; same value as when saved";
+            if (r.by_context) std::cout << "; chosen by its surroundings over the most-voted address";
+            std::cout << ")" << (r.changed ? ", kept those paths" : "") << ".\n";
+        }
+    }
+}
+
+// tperm <#>: turns an entry into pointer paths that survive restarts
+void cmd_table_permanent(const std::string& index_text) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Not attached to any process.\n";
+        return;
+    }
+
+    table::TableEntry entry;
+    size_t index = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_freeze_mutex);
+        auto parsed = parse_index(index_text, g_table.entries.size(), "table entry");
+        if (!parsed) return;
+        index = *parsed;
+        entry = g_table.entries[index];
+    }
+    if (!entry.is_absolute() && entry.location.offsets.empty()) {
+        std::cout << "[*] #" << index << " is a static address (" << entry.location_string()
+                  << "): it already survives restarts.\n";
+        return;
+    }
+
+    // The pointer scan runs without the table lock, so frozen values keep being written meanwhile
+    std::cout << "[*] Searching pointer paths to #" << index << " ...\n";
+    const auto start = std::chrono::steady_clock::now();
+    const auto paths = table::find_permanent_paths(entry, g_process, g_modules);
+    if (paths.empty()) {
+        std::cerr << "[-] No static pointer path leads to #" << index << ". It stays valid only until a restart.\n";
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(g_freeze_mutex);
+    auto& target = g_table.entries[index]; // the CLI runs one command at a time, so the index still holds
+    table::make_permanent(target, paths, *g_process, g_modules);
+    std::cout << "[+] #" << index << " is permanent in " << elapsed_ms(start) << " ms: " << target.location_string()
+              << " (+" << target.alternatives.size() << " other paths that vote after a restart).\n"
+              << "    Save the table ('tsave'); after a restart, 'attach' + 'tload' find the value again.\n";
 }
 
 void cmd_freeze(const std::string& addr_str, const std::string& type_str, const std::string& val_str) {
@@ -1344,6 +1418,10 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: " << cmd << " <#>" << (cmd == "tfreeze" ? " [value]" : "") << "\n";
         }
+    } else if (cmd == "tperm") {
+        std::string index;
+        if (iss >> index) cmd_table_permanent(index);
+        else std::cout << "Usage: tperm <#>\n";
     } else if (cmd == "tdel") {
         std::string index;
         if (iss >> index) cmd_table_delete(index);

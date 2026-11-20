@@ -131,6 +131,152 @@ TEST_CASE("tables round-trip through JSON") {
     CHECK(from_file->entries.size() == t.entries.size());
 }
 
+namespace {
+
+// A heap value reachable from several statics: [game.exe + 0x100/0x180/0x1C0] -> A, [A + 8] -> B,
+// value at B + 0x10 inside a struct with constant neighbours (0x1111 before, 0x2222 after it).
+// Decoys [other.dll + 0x200 + 8k] -> B + 8 reach it only by coincidence.
+struct PermanentFixture {
+    std::shared_ptr<FakeProcess> process = std::make_shared<FakeProcess>(0x10000);
+    std::vector<hal::ModuleInfo> modules;
+    uintptr_t b = kBase + 0x6000;
+
+    explicit PermanentFixture(int statics = 3, int decoys = 1) {
+        process->add_module("game.exe", 0x0, 0x1000);
+        process->add_module("other.dll", 0x1000, 0x1000);
+        const size_t static_slots[] = {0x100, 0x180, 0x1C0};
+        for (int i = 0; i < statics; ++i) process->put_pointer(static_slots[i], kBase + 0x4000);
+        for (int i = 0; i < decoys; ++i) process->put_pointer(0x1200 + 8 * static_cast<size_t>(i), b + 0x8);
+        process->put_pointer(0x4008, b);
+        write_struct(b);
+        modules = process->get_modules();
+    }
+
+    void write_struct(uintptr_t at) {
+        process->put<uint32_t>(at - kBase + 0x0C, 0x1111);
+        process->put<int32_t>(at - kBase + 0x10, 1337);
+        process->put<uint32_t>(at - kBase + 0x14, 0x2222);
+    }
+
+    // A restart: the object is allocated elsewhere, and its old place is reused by something else that
+    // the coincidental decoys still point into
+    void restart() {
+        const uintptr_t old = b;
+        b += 0x2000;
+        process->put_pointer(0x4008, b);
+        write_struct(b);
+        process->put<uint32_t>(old - kBase + 0x0C, 0x7777);
+        process->put<int32_t>(old - kBase + 0x10, 2228282);
+        process->put<uint32_t>(old - kBase + 0x14, 0);
+    }
+};
+
+table::TableEntry permanent_entry(PermanentFixture& f) {
+    auto entry = table::make_entry(f.b + 0x10, DataType::Int32, f.modules, "Score");
+    REQUIRE(table::make_permanent(entry, table::find_permanent_paths(entry, f.process, f.modules), *f.process, f.modules));
+    return entry;
+}
+
+} // anonymous namespace
+
+TEST_CASE("a permanent entry finds its value again after a restart") {
+    PermanentFixture f;
+    auto entry = table::make_entry(f.b + 0x10, DataType::Int32, f.modules, "Score");
+    REQUIRE(entry.is_absolute());
+
+    const auto paths = table::find_permanent_paths(entry, f.process, f.modules);
+    REQUIRE(paths.size() == 4); // three real chains and the decoy
+    REQUIRE(table::make_permanent(entry, paths, *f.process, f.modules));
+    CHECK_FALSE(entry.is_absolute());
+    CHECK(entry.alternatives.size() == 3);
+    CHECK(entry.location.module_name == "game.exe"); // main module ranks first
+    CHECK(entry.context.size() == 2 * table::TableEntry::CONTEXT_RADIUS + 4);
+
+    f.restart();
+    const auto result = table::reconcile(entry, *f.process, f.modules);
+    CHECK(result.paths == 4);
+    CHECK(result.resolved == 4);
+    CHECK(result.agreeing == 3);
+    CHECK(result.address == f.b + 0x10);
+    CHECK(result.context_words == 2); // 0x1111 and 0x2222 (zero words don't count)
+    CHECK(result.context_matches == 2);
+    CHECK(result.value_matches);
+    CHECK_FALSE(result.ambiguous);
+    CHECK(result.changed);
+    CHECK(entry.alternatives.size() == 2); // the decoy is gone
+    CHECK(std::get<int32_t>(table::read_entry(entry, *f.process, f.modules)->value) == 1337);
+
+    // The next restart has nothing left to drop
+    f.restart();
+    CHECK_FALSE(table::reconcile(entry, *f.process, f.modules).changed);
+}
+
+TEST_CASE("the remembered surroundings beat a majority of paths that move together") {
+    // Seen on target_dummy: hundreds of paths through the same heap structures outvoted the real chain
+    PermanentFixture f(3, 5);
+    auto entry = permanent_entry(f);
+    REQUIRE(entry.alternatives.size() == 7);
+
+    f.restart(); // the 5 decoys now lead to the old place, the 3 real chains to the new one
+    const auto result = table::reconcile(entry, *f.process, f.modules);
+    CHECK(result.address == f.b + 0x10);
+    CHECK(result.agreeing == 3);
+    CHECK(result.by_context);
+    CHECK_FALSE(result.ambiguous);
+    CHECK(std::get<int32_t>(table::read_entry(entry, *f.process, f.modules)->value) == 1337);
+
+    // Without the context the vote alone picks the old place
+    PermanentFixture g(3, 5);
+    auto blind = permanent_entry(g);
+    blind.context.clear();
+    const uintptr_t old_place = g.b + 0x10;
+    g.restart();
+    CHECK(table::reconcile(blind, *g.process, g.modules).address == old_place);
+}
+
+TEST_CASE("reconcile changes nothing on a close vote or when nothing resolves") {
+    PermanentFixture f(1); // one real chain against the decoy: 1 vote each after the restart
+    auto entry = permanent_entry(f);
+    entry.context.clear(); // a table made before contexts existed: only the vote is left
+    const auto before = entry.alternatives.size();
+
+    f.restart();
+    const auto close = table::reconcile(entry, *f.process, f.modules);
+    CHECK(close.ambiguous);
+    CHECK_FALSE(close.changed);
+    CHECK(entry.alternatives.size() == before);
+
+    // Another program: no module of the paths is loaded
+    const auto none = table::reconcile(entry, *f.process, {});
+    CHECK(none.resolved == 0);
+    CHECK_FALSE(none.changed);
+    CHECK(entry.alternatives.size() == before);
+}
+
+TEST_CASE("pointer alternatives and the context survive a JSON round trip") {
+    PermanentFixture f;
+    auto entry = permanent_entry(f);
+
+    table::CheatTable t;
+    t.entries.push_back(entry);
+    auto loaded = table::from_json(table::to_json(t));
+    REQUIRE(loaded.has_value());
+    const auto& e = loaded->entries.front();
+    CHECK(e.context == entry.context);
+    REQUIRE(e.alternatives.size() == entry.alternatives.size());
+    for (size_t i = 0; i < e.alternatives.size(); ++i) {
+        CHECK(e.alternatives[i].module_name == entry.alternatives[i].module_name);
+        CHECK(e.alternatives[i].base_offset == entry.alternatives[i].base_offset);
+        CHECK(e.alternatives[i].offsets == entry.alternatives[i].offsets);
+    }
+
+    // An alternative must be a pointer path (with a module); the context must be hex
+    CHECK_FALSE(table::from_json(R"({"format": "nce-table", "version": 1, "entries": [)"
+                                 R"({"type": "i32", "offset": "0x10", "alternatives": [{"offset": "0x20"}]}]})").has_value());
+    CHECK_FALSE(table::from_json(R"({"format": "nce-table", "version": 1, "entries": [)"
+                                 R"({"type": "i32", "offset": "0x10", "context": "XYZ"}]})").has_value());
+}
+
 TEST_CASE("from_json rejects malformed tables") {
     CHECK_FALSE(table::from_json("not json").has_value());
     CHECK_FALSE(table::from_json(R"({"format": "something-else", "version": 1, "entries": []})").has_value());
