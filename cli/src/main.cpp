@@ -31,6 +31,7 @@
 #include "utils/hex_utils.hpp"
 #include "utils/text_encoding.hpp"
 #include "table/cheat_table.hpp"
+#include "scanner/value_tracker.hpp"
 
 using namespace nce;
 
@@ -563,9 +564,28 @@ std::string trim(const std::string& s) {
     return s.substr(first, last - first + 1);
 }
 
-// Guided unknown-value search. Each round has a quiet phase (the user leaves the value alone while
-// 'unchanged' runs in the background to remove addresses that change on their own) and a change
-// step (the user changes the value in the target and says how it changed).
+std::string describe_tracker(const scanner::ValueTracker& tracker) {
+    std::ostringstream ss;
+    ss << tracker.candidate_count() << " candidates";
+    if (tracker.is_ranked()) ss << " (ranked)";
+    else ss << " (snapshot, " << format_size(tracker.memory_bytes()) << ")";
+    return ss.str();
+}
+
+void print_ranked(const scanner::ValueTracker& tracker, size_t count) {
+    const auto ranked = tracker.top(count);
+    std::cout << "        Best candidates:\n";
+    for (size_t i = 0; i < ranked.size(); ++i) {
+        std::cout << "        [" << i << "] " << utils::format_address(ranked[i].address) << " = " << std::left
+                  << std::setw(12) << ranked[i].value.to_string() << std::right << " score " << std::setw(3)
+                  << ranked[i].score << "  " << ranked[i].reason << "\n";
+    }
+}
+
+// Guided unknown-value search with smart ranking. Each round has a quiet phase (the user leaves the
+// value alone while values that change on their own lose points) and a change step (the user changes
+// the value and says how). Candidates are scored rather than cut on every answer, so one wrong answer
+// lowers the right address instead of losing it.
 void cmd_track(const std::string& type_str) {
     if (!g_process || !g_process->is_attached()) {
         std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
@@ -574,41 +594,31 @@ void cmd_track(const std::string& type_str) {
     auto type = parse_numeric_type(type_str);
     if (!type) return;
 
-    constexpr size_t FOUND_THRESHOLD = 10;
+    constexpr size_t SHOW_BEST = 5;
+    constexpr size_t MAX_HANDOVER = 5'000'000; // candidates turned into results when tracking stops
 
+    scanner::ValueTracker tracker(g_process, *type);
     std::cout << "[*] Tracking an unknown " << type_str << " value. Capturing snapshot ...\n";
     auto start = std::chrono::steady_clock::now();
-    push_history();
-    g_current_type = *type;
-    g_snapshot = std::make_shared<scanner::MemorySnapshot>(
-        g_scanner->first_scan_unknown(*type, scanner::get_data_type_size(*type)));
-    std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ".\n";
+    tracker.start();
+    std::cout << "[+] Snapshot captured in " << elapsed_ms(start) << " ms: " << describe_tracker(tracker) << ".\n";
 
     for (int round = 1;; ++round) {
-        std::cout << "\n[track] Round " << round << " - " << describe_scan_state() << ".\n"
-                  << "        Leave the value alone: addresses that change on their own are being removed.\n"
+        std::cout << "\n[track] Round " << round << " - " << describe_tracker(tracker) << ".\n"
+                  << "        Leave the value alone: values that change on their own lose points.\n"
                   << "        Press Enter when you are ready to change it (or type 'done').\n";
 
-        // Quiet phase. The main thread only waits for input here, so the noise thread owns the scan state.
-        push_history();
+        // Quiet phase. The main thread only waits for input here, so the noise thread owns the tracker.
         std::atomic<bool> stop{false};
         std::exception_ptr noise_error;
         std::thread noise([&] {
             try {
-                bool first_pass = true;
                 size_t last_count = SIZE_MAX;
                 do {
-                    if (first_pass) {
-                        filter_into_current(g_history.back(), scanner::ScanCondition::Unchanged, {}, {});
-                        first_pass = false;
-                    } else {
-                        const ScanState current{std::move(g_results), std::move(g_snapshot), g_current_type};
-                        filter_into_current(current, scanner::ScanCondition::Unchanged, {}, {});
-                    }
-
-                    const size_t count = g_snapshot ? g_snapshot->candidate_count() : g_results.count();
+                    tracker.observe_quiet();
+                    const size_t count = tracker.candidate_count();
                     if (count != last_count) {
-                        std::cout << "        [noise filter] " << describe_scan_state() << "\n";
+                        std::cout << "        [noise filter] " << describe_tracker(tracker) << "\n";
                         last_count = count;
                     }
                     for (int i = 0; i < 5 && !stop; ++i) {
@@ -635,46 +645,36 @@ void cmd_track(const std::string& type_str) {
         line = trim(line);
         if (line == "done") break;
 
-        scanner::ScanCondition cond = scanner::ScanCondition::Changed;
-        scanner::ScanValue val;
-        scanner::ScanValue val2;
-        if (line == "+") {
-            cond = scanner::ScanCondition::Increased;
-        } else if (line == "-") {
-            cond = scanner::ScanCondition::Decreased;
-        } else if (line != "c") {
-            auto parsed = parse_value(*type, line);
-            if (!parsed) {
-                std::cout << "[track] Skipping this round.\n";
-                continue;
-            }
-            cond = scanner::ScanCondition::ExactValue;
-            val = *parsed;
-            if (auto range = float_exact_range(*type, line)) {
-                cond = scanner::ScanCondition::Between;
-                val = range->first;
-                val2 = range->second;
-            }
+        auto expected = scanner::parse_expectation(*type, line, g_float_mode);
+        if (!expected) {
+            std::cout << "[track] '" << line << "' is not +, -, c or a valid " << type_str
+                      << " value. Skipping this round.\n";
+            continue;
         }
 
         start = std::chrono::steady_clock::now();
-        push_history();
-        filter_into_current(g_history.back(), cond, val, val2);
-        std::cout << "[+] Filtered in " << elapsed_ms(start) << " ms: " << describe_scan_state() << ".\n";
+        tracker.observe_event(*expected);
+        std::cout << "[+] Checked in " << elapsed_ms(start) << " ms: " << describe_tracker(tracker) << ".\n";
 
-        const size_t remaining = g_snapshot ? g_snapshot->candidate_count() : g_results.count();
-        if (remaining == 0) {
-            std::cout << "[-] No candidates left. Use 'undo' to go back one step.\n";
+        if (tracker.candidate_count() == 0) {
+            std::cout << "[-] No candidates left: the value did not change when you said it did.\n";
             break;
         }
-        if (!g_snapshot && remaining <= FOUND_THRESHOLD) {
-            std::cout << "[+] Narrowed down to " << remaining << " address(es):\n";
-            cmd_list(FOUND_THRESHOLD);
-            break;
-        }
+        if (tracker.is_ranked()) print_ranked(tracker, SHOW_BEST);
+        if (tracker.candidate_count() == 1) break;
     }
 
-    std::cout << "[track] Stopped with " << describe_scan_state() << ". Continue with 'next', 'list' or 'undo'.\n";
+    // Hand the candidates over as normal results, best first
+    if (tracker.candidate_count() > MAX_HANDOVER) {
+        std::cout << "[track] Stopped with " << describe_tracker(tracker)
+                  << ": too many to list. Run 'track' again and change the value a few times.\n";
+        return;
+    }
+    push_history();
+    g_current_type = *type;
+    g_results = tracker.to_results();
+    std::cout << "[track] Stopped with " << g_results.count() << " result(s), best first. "
+              << "'list' shows them, 'add #0 <name>' adds the best one.\n";
 }
 
 void cmd_grouped_scan(const std::vector<std::string>& tokens) {

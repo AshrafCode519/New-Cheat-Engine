@@ -20,6 +20,7 @@
 #include "hal/process.hpp"
 #include "scanner/memory_scanner.hpp"
 #include "scanner/pointer_scanner.hpp"
+#include "scanner/value_tracker.hpp"
 #include "table/cheat_table.hpp"
 #include "utils/hex_utils.hpp"
 #include "utils/text_encoding.hpp"
@@ -193,6 +194,18 @@ struct App {
     int editing_row = -1;
     std::string table_path = "table.json";
 
+    // Smart track: guided unknown-value search that ranks candidates. The tracker is only touched by
+    // jobs; the UI draws the copy of the best candidates taken after each observation.
+    enum class TrackStage { Off, Quiet, Changing };
+    std::unique_ptr<scanner::ValueTracker> tracker;
+    TrackStage track_stage = TrackStage::Off;
+    bool track_stop_requested = false;
+    std::vector<scanner::RankedCandidate> track_best;
+    size_t track_events = 0;
+    std::string track_summary;
+    std::string track_value;
+    std::chrono::steady_clock::time_point last_quiet;
+
     std::string ptr_target;
     int ptr_depth = 4;
     uint32_t ptr_offset = 0x800;
@@ -317,6 +330,9 @@ void attach(App& app, const hal::ProcessInfo& info) {
 
     app.state = {};
     app.history.clear();
+    app.tracker.reset(); // attaching is disabled while a job runs, so no job is using it
+    app.track_stage = App::TrackStage::Off;
+    app.track_best.clear();
     app.scanner = ok ? std::make_unique<scanner::MemoryScanner>(app.process) : nullptr;
     if (ok) {
         app.attached_label = info.name + " (PID " + std::to_string(info.pid) + ", " +
@@ -471,6 +487,78 @@ void add_result_to_table(App& app, size_t row) {
     app.status = "Added " + e.location_string() + (e.is_absolute() ? " (heap address: valid until the target restarts)" : "") + ".";
 }
 
+// ---- Smart track ---------------------------------------------------------------------------------
+
+constexpr size_t TRACK_SHOWN = 50;
+constexpr size_t TRACK_MAX_HANDOVER = 5'000'000; // candidates turned into results when tracking stops
+
+// Runs on the UI thread after a tracker job finished
+void refresh_track(App& app) {
+    app.track_best = app.tracker->top(TRACK_SHOWN);
+    app.track_events = app.tracker->events();
+    app.track_summary = std::to_string(app.tracker->candidate_count()) + " candidates" +
+        (app.tracker->is_ranked() ? ", ranked" : " (snapshot, " + std::to_string(app.tracker->memory_bytes() / 1024) + " KB)");
+    app.last_quiet = std::chrono::steady_clock::now();
+}
+
+void start_tracking(App& app) {
+    app.tracker = std::make_unique<scanner::ValueTracker>(app.process, type_at(app.type_index));
+    app.track_best.clear();
+    app.track_stop_requested = false;
+    start_job(app, "Snapshot", [&app]() -> ApplyResult {
+        app.tracker->start();
+        return [&app]() {
+            refresh_track(app);
+            app.track_stage = App::TrackStage::Quiet;
+            app.status = "Smart track: " + app.track_summary + ". Leave the value alone, then press \"I'll change it now\".";
+        };
+    });
+}
+
+void track_event(App& app, const scanner::Expectation& expected) {
+    start_job(app, "Checking", [&app, expected]() -> ApplyResult {
+        app.tracker->observe_event(expected);
+        return [&app]() {
+            refresh_track(app);
+            app.track_stage = App::TrackStage::Quiet;
+            app.status = "Smart track: " + app.track_summary + ". Leave the value alone again.";
+        };
+    });
+}
+
+void stop_tracking(App& app) {
+    if (app.tracker->candidate_count() <= TRACK_MAX_HANDOVER) {
+        push_history(app);
+        app.state.type = app.tracker->type();
+        app.state.results = app.tracker->to_results();
+        app.status = "Smart track stopped: " + describe(app.state) + ", best first.";
+    } else {
+        app.status = "Smart track stopped with too many candidates to list; change the value a few times next time.";
+    }
+    app.tracker.reset();
+    app.track_stage = App::TrackStage::Off;
+    app.track_best.clear();
+    app.track_stop_requested = false;
+}
+
+// Every frame: while the user leaves the value alone, keep watching for values that change on their own
+void tick_tracking(App& app) {
+    if (app.track_stage == App::TrackStage::Off || job_running(app)) return;
+    if (app.track_stop_requested) {
+        stop_tracking(app);
+        return;
+    }
+    if (app.track_stage != App::TrackStage::Quiet || elapsed_ms(app.last_quiet) < 500) return;
+
+    start_job(app, "Watching", [&app]() -> ApplyResult {
+        app.tracker->observe_quiet();
+        return [&app]() {
+            refresh_track(app);
+            app.status = "Smart track: watching for values that change on their own - " + app.track_summary + ".";
+        };
+    });
+}
+
 void freeze_worker(App* app) {
     while (app->freeze_running) {
         {
@@ -526,7 +614,7 @@ void draw_process_bar(App& app) {
 }
 
 void draw_scan_controls(App& app) {
-    ImGui::BeginDisabled(!is_attached(app) || job_running(app));
+    ImGui::BeginDisabled(!is_attached(app) || job_running(app) || app.track_stage != App::TrackStage::Off);
 
     // Buttons share one width so the input fields line up in front of them
     const ImGuiStyle& style = ImGui::GetStyle();
@@ -578,7 +666,95 @@ void draw_scan_controls(App& app) {
     ImGui::EndDisabled();
 }
 
+void draw_tracking(App& app) {
+    using Stage = App::TrackStage;
+    using Kind = scanner::Expectation::Kind;
+
+    if (app.track_stage == Stage::Off) {
+        ImGui::BeginDisabled(!is_attached(app) || job_running(app) || !is_numeric(type_at(app.type_index)));
+        if (ImGui::Button("Smart track")) start_tracking(app);
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::TextDisabled("find a value you can change: ranks addresses by how they follow your changes");
+        return;
+    }
+
+    ImGui::Text("Smart track (%s): %s", utils::format_data_type(app.tracker->type()).c_str(), app.track_summary.c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Stop")) app.track_stop_requested = true; // applied when no job is running
+
+    if (app.track_stage == Stage::Quiet) {
+        ImGui::TextWrapped("Leave the value alone: values that change on their own lose points.");
+        // A watch job may still be running; it finishes and no new one starts
+        if (ImGui::Button("I'll change it now")) app.track_stage = Stage::Changing;
+    } else {
+        ImGui::TextWrapped("Change the value in the game, then say how it changed:");
+        ImGui::BeginDisabled(job_running(app));
+        if (ImGui::Button("Went up")) track_event(app, {Kind::Increased});
+        ImGui::SameLine();
+        if (ImGui::Button("Went down")) track_event(app, {Kind::Decreased});
+        ImGui::SameLine();
+        if (ImGui::Button("Changed")) track_event(app, {Kind::Changed});
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(em(6));
+        ImGui::InputTextWithHint("##track_value", "new value", &app.track_value);
+        ImGui::SameLine();
+        if (ImGui::Button("It's now")) {
+            const auto mode = static_cast<scanner::FloatMatchMode>(app.float_mode);
+            if (auto expected = scanner::parse_expectation(app.tracker->type(), app.track_value, mode)) {
+                track_event(app, *expected);
+            } else {
+                app.status = "'" + app.track_value + "' is not a valid " + utils::format_data_type(app.tracker->type()) + " value.";
+            }
+        }
+        ImGui::EndDisabled();
+    }
+
+    if (app.track_events == 0) {
+        ImGui::TextDisabled("The ranked candidates appear after your first change.");
+        return;
+    }
+    if (app.track_best.empty()) return;
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                  ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
+    if (!ImGui::BeginTable("track_best", 5, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, em(6));
+    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, em(3));
+    ImGui::TableSetupColumn("Why");
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(1.8f));
+    ImGui::TableHeadersRow();
+
+    std::optional<size_t> add_row;
+    for (size_t i = 0; i < app.track_best.size(); ++i) {
+        const auto& c = app.track_best[i];
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(utils::format_address(c.address).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(c.value.to_string().c_str());
+        ImGui::TableNextColumn();
+        ImGui::Text("%d", c.score);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(c.reason.c_str());
+        ImGui::TableNextColumn();
+        if (ImGui::SmallButton("+")) add_row = i;
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+
+    if (add_row) {
+        const auto& c = app.track_best[*add_row];
+        std::lock_guard<std::mutex> lock(app.table_mutex);
+        app.table.entries.push_back(table::make_entry(c.address, c.value.type, app.modules));
+        app.status = "Added " + app.table.entries.back().location_string() + " to the cheat table.";
+    }
+}
+
 void draw_results(App& app) {
+    if (app.track_stage != App::TrackStage::Off) return; // the smart track panel shows the candidates
     if (job_running(app)) {
         ImGui::Text("%s ... %.1f s", app.job_label.c_str(), elapsed_ms(app.job_start) / 1000.0);
         return;
@@ -848,6 +1024,8 @@ void draw_ui(App& app) {
         ImGui::TableNextColumn();
         draw_scan_controls(app);
         ImGui::Separator();
+        draw_tracking(app);
+        ImGui::Separator();
         draw_results(app);
 
         ImGui::TableNextColumn();
@@ -872,6 +1050,7 @@ struct LaunchOptions {
     std::string pid;
     std::string table;
     std::string screenshot; // render a few frames in a hidden window, save the last one as a BMP and exit
+    std::string track;      // start smart track for this type right away (with --pid)
 };
 
 // nce_gui.exe [--pid <pid>] [--table <file.json>] [--screenshot <file.bmp>]
@@ -887,6 +1066,7 @@ LaunchOptions parse_command_line() {
         if (option == L"--pid") options.pid = value;
         else if (option == L"--table") options.table = value;
         else if (option == L"--screenshot") options.screenshot = value;
+        else if (option == L"--track") options.track = value;
     }
     LocalFree(argv);
     return options;
@@ -904,6 +1084,12 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
         if (auto loaded = table::load_table(options.table)) {
             std::lock_guard<std::mutex> lock(app.table_mutex);
             app.table = std::move(*loaded);
+        }
+    }
+    if (!options.track.empty() && is_attached(app)) {
+        if (auto type = utils::parse_data_type(options.track); type && is_numeric(*type)) {
+            app.type_index = type_index_of(*type);
+            start_tracking(app);
         }
     }
 }
@@ -1035,6 +1221,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         }
 
         poll_job(app);
+        tick_tracking(app);
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
