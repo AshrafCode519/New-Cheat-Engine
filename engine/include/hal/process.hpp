@@ -40,6 +40,12 @@ public:
     // Size of a pointer in the target: 4 for 32-bit processes (WOW64 on 64-bit Windows), 8 otherwise
     [[nodiscard]] virtual size_t pointer_size() const noexcept { return sizeof(uintptr_t); }
 
+    // False when the attach only got read access (writes and freezing will fail)
+    [[nodiscard]] virtual bool can_write() const noexcept { return true; }
+
+    // The target's executable name ("game.exe"), used to find it again after it restarts
+    [[nodiscard]] virtual std::string name() const { return {}; }
+
     virtual bool suspend() = 0;
     virtual bool resume() = 0;
 

@@ -6,8 +6,21 @@
 #include <psapi.h>
 #include <iostream>
 #include <vector>
+#include <algorithm>
+#include <cwchar>
 
 namespace nce::hal {
+
+namespace {
+
+std::string to_utf8(const wchar_t* text) {
+    const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
+    std::string out(size > 0 ? size - 1 : 0, '\0');
+    if (size > 1) WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
+    return out;
+}
+
+} // anonymous namespace
 
 // Function pointers for NtSuspendProcess and NtResumeProcess
 using pfnNtSuspendProcess = LONG(NTAPI*)(HANDLE ProcessHandle);
@@ -36,17 +49,19 @@ public:
 
     bool attach(uint32_t pid) override {
         detach();
-        // Request comprehensive rights: PROCESS_ALL_ACCESS or VM_READ | VM_WRITE | VM_OPERATION | QUERY_INFORMATION | SUSPEND_RESUME
+        // SYNCHRONIZE lets is_attached notice when the target exits
         m_handle = OpenProcess(
-            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION | PROCESS_SUSPEND_RESUME,
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | PROCESS_VM_WRITE | PROCESS_VM_OPERATION |
+                PROCESS_SUSPEND_RESUME | SYNCHRONIZE,
             FALSE,
             pid
         );
+        m_can_write = (m_handle != nullptr);
 
         if (!m_handle) {
-            // Fallback to read/query if full access is denied
+            // Fall back to read-only access; callers can tell through can_write()
             m_handle = OpenProcess(
-                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ | SYNCHRONIZE,
                 FALSE,
                 pid
             );
@@ -59,9 +74,18 @@ public:
             if (IsWow64Process(m_handle, &is_wow64) && is_wow64) {
                 m_pointer_size = 4; // 32-bit process on 64-bit Windows
             }
+
+            m_name.clear();
+            wchar_t path[MAX_PATH];
+            DWORD length = MAX_PATH;
+            if (QueryFullProcessImageNameW(m_handle, 0, path, &length)) {
+                const wchar_t* file = wcsrchr(path, L'\\');
+                m_name = to_utf8(file ? file + 1 : path);
+            }
             return true;
         }
 
+        m_can_write = false;
         return false;
     }
 
@@ -76,8 +100,17 @@ public:
         }
     }
 
+    // False once the target has exited, even though the handle is still open
     [[nodiscard]] bool is_attached() const noexcept override {
-        return m_handle != nullptr;
+        return m_handle != nullptr && WaitForSingleObject(m_handle, 0) == WAIT_TIMEOUT;
+    }
+
+    [[nodiscard]] bool can_write() const noexcept override {
+        return m_handle != nullptr && m_can_write;
+    }
+
+    [[nodiscard]] std::string name() const override {
+        return m_name;
     }
 
     [[nodiscard]] uint32_t get_pid() const noexcept override {
@@ -94,43 +127,50 @@ public:
         return ReadProcessMemory(m_handle, reinterpret_cast<LPCVOID>(address), buffer, size, &bytes_read) && bytes_read == size;
     }
 
+    // Writes without touching page protection when it can (the usual case). Only if that fails and
+    // force_protection is set, each region the write touches is made writable on its own (keeping its
+    // execute bit) and restored right after, so a write over two regions can't give one the other's
+    // protection and nothing is left RWX.
     bool write_raw(uintptr_t address, const void* buffer, size_t size, bool force_protection = true) const override {
         if (!m_handle || !buffer || size == 0) return false;
 
-        DWORD old_protect = 0;
-        bool protection_changed = false;
-
-        if (force_protection) {
-            protection_changed = VirtualProtectEx(
-                m_handle,
-                reinterpret_cast<LPVOID>(address),
-                size,
-                PAGE_EXECUTE_READWRITE,
-                &old_protect
-            ) != FALSE;
-        }
-
         SIZE_T bytes_written = 0;
-        BOOL result = WriteProcessMemory(
-            m_handle,
-            reinterpret_cast<LPVOID>(address),
-            buffer,
-            size,
-            &bytes_written
-        );
-
-        if (protection_changed) {
-            DWORD temp = 0;
-            VirtualProtectEx(
-                m_handle,
-                reinterpret_cast<LPVOID>(address),
-                size,
-                old_protect,
-                &temp
-            );
+        if (WriteProcessMemory(m_handle, reinterpret_cast<LPVOID>(address), buffer, size, &bytes_written) &&
+            bytes_written == size) {
+            return true;
         }
+        if (!force_protection) return false;
 
-        return result && bytes_written == size;
+        uintptr_t current = address;
+        const auto* source = static_cast<const uint8_t*>(buffer);
+        size_t remaining = size;
+        while (remaining > 0) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (VirtualQueryEx(m_handle, reinterpret_cast<LPCVOID>(current), &mbi, sizeof(mbi)) != sizeof(mbi) ||
+                mbi.State != MEM_COMMIT) {
+                return false;
+            }
+            const uintptr_t region_end = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            const size_t chunk = std::min<size_t>(remaining, region_end - current);
+            const bool executable = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                                    PAGE_EXECUTE_WRITECOPY)) != 0;
+
+            DWORD old_protect = 0;
+            if (!VirtualProtectEx(m_handle, reinterpret_cast<LPVOID>(current), chunk,
+                                  executable ? PAGE_EXECUTE_READWRITE : PAGE_READWRITE, &old_protect)) {
+                return false;
+            }
+            const bool ok = WriteProcessMemory(m_handle, reinterpret_cast<LPVOID>(current), source, chunk,
+                                               &bytes_written) && bytes_written == chunk;
+            DWORD ignored = 0;
+            VirtualProtectEx(m_handle, reinterpret_cast<LPVOID>(current), chunk, old_protect, &ignored);
+            if (!ok) return false;
+
+            current += chunk;
+            source += chunk;
+            remaining -= chunk;
+        }
+        return true;
     }
 
     [[nodiscard]] std::vector<MemoryRegion> query_regions(uint32_t filter_flags = FilterFlags::DefaultScanFilter) const override {
@@ -252,6 +292,8 @@ private:
     uint32_t m_pid{0};
     size_t m_pointer_size{sizeof(uintptr_t)};
     bool m_is_suspended{false};
+    bool m_can_write{false};
+    std::string m_name;
     pfnNtSuspendProcess m_ntSuspend{nullptr};
     pfnNtResumeProcess  m_ntResume{nullptr};
 };

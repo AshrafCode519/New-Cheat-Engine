@@ -90,6 +90,16 @@ TEST_CASE("parse_scan_value rejects bad input instead of turning it into 0") {
     CHECK_FALSE(utils::parse_scan_value(DataType::AOB, "90").has_value());
 }
 
+TEST_CASE("parse_address takes hex with or without 0x, and nothing else") {
+    CHECK(utils::parse_address("0x7FF63E80A078") == 0x7FF63E80A078);
+    CHECK(utils::parse_address("7ff63e80a078") == 0x7FF63E80A078);
+    CHECK(utils::parse_address("0X1A") == 0x1A);
+    CHECK(utils::parse_address("12zz") == 0); // used to read as 0x12
+    CHECK(utils::parse_address("0x") == 0);
+    CHECK(utils::parse_address("") == 0);
+    CHECK(utils::parse_address("-1") == 0);
+}
+
 TEST_CASE("parse_aob_pattern marks wildcards as don't-care") {
     auto pattern = utils::parse_aob_pattern("48 8B ? ?? 89");
     REQUIRE(pattern.has_value());

@@ -250,6 +250,12 @@ struct App {
     std::shared_ptr<scanner::NoiseMap> noise;
     bool track_pending = false; // --track: start once the noise is learned
 
+    // When the target exits, wait for the same program to start again and attach to it
+    bool auto_reattach = true;
+    std::chrono::steady_clock::time_point next_reattach_check;
+    uint32_t restart_pid = 0;                              // the new process, once seen
+    std::chrono::steady_clock::time_point restart_seen_at; // attach a few seconds later, once it has set up
+
     std::atomic<bool> freeze_running{true};
 };
 
@@ -362,14 +368,15 @@ std::string describe_noise(const App& app) {
     return text;
 }
 
-void learn_noise(App& app) {
-    start_job(app, "Learning noise (leave the target alone)", [&app]() -> ApplyResult {
+// prefix: status text to keep in front of the result (e.g. what attach reported)
+void learn_noise(App& app, const std::string& prefix = "") {
+    start_job(app, "Learning noise (leave the target alone)", [&app, prefix]() -> ApplyResult {
         auto noise = std::make_shared<scanner::NoiseMap>();
         noise->learn(*app.process);
-        return [&app, noise]() {
+        return [&app, noise, prefix]() {
             app.noise = noise;
             app.scanner->set_noise_map(noise);
-            app.status = "Noise: " + describe_noise(app) + ".";
+            app.status = prefix + "Noise: " + describe_noise(app) + ".";
         };
     });
 }
@@ -416,7 +423,7 @@ void make_entry_permanent(App& app, size_t index) {
     });
 }
 
-void attach(App& app, const hal::ProcessInfo& info) {
+void attach(App& app, const hal::ProcessInfo& info, const std::string& note = "") {
     bool ok = false;
     {
         std::lock_guard<std::mutex> lock(app.table_mutex);
@@ -433,18 +440,60 @@ void attach(App& app, const hal::ProcessInfo& info) {
     app.history.clear();
     app.tracker.reset(); // attaching is disabled while a job runs, so no job is using it
     app.track_stage = App::TrackStage::Off;
+    unregister_hotkeys();
     app.track_best.clear();
     app.scanner = ok ? std::make_unique<scanner::MemoryScanner>(app.process) : nullptr;
     app.noise.reset(); // learned for the previous process
     if (ok) {
         app.attached_label = info.name + " (PID " + std::to_string(info.pid) + ", " +
                              std::to_string(app.process->pointer_size() * 8) + "-bit)";
-        app.status = "Attached to " + app.attached_label + ".";
-        learn_noise(app);
+        app.status = note + "Attached to " + app.attached_label + ".";
+        if (!app.process->can_write()) {
+            app.status += " Only read access was granted: writing and freezing won't work (run as Administrator).";
+        }
+        learn_noise(app, app.status + " ");
     } else {
         app.attached_label.clear();
         app.status = "Could not attach to " + info.name + ". Try running as Administrator.";
     }
+}
+
+// Every frame: once the target has exited, look for the same program once a second, and attach to a
+// new instance a few seconds after it appears (so it has set up the objects the table's pointers use).
+// Attaching re-finds permanent entries and the freeze thread resumes on its own.
+void tick_reattach(App& app) {
+    if (!app.auto_reattach || job_running(app) || app.process->get_pid() == 0 || app.process->is_attached() ||
+        app.process->name().empty()) {
+        app.restart_pid = 0;
+        return;
+    }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (app.restart_pid != 0) {
+        if (now - app.restart_seen_at < std::chrono::seconds(3)) return;
+        const uint32_t pid = app.restart_pid;
+        app.restart_pid = 0;
+        for (const auto& p : hal::IProcess::list_processes()) {
+            if (p.pid == pid) {
+                attach(app, p, "Re-attached after a restart. ");
+                return;
+            }
+        }
+        return; // it went away again; keep looking
+    }
+
+    if (now < app.next_reattach_check) return;
+    app.next_reattach_check = now + std::chrono::seconds(1);
+    const std::string name = app.process->name();
+    for (const auto& p : hal::IProcess::list_processes()) {
+        if (p.pid != app.process->get_pid() && _stricmp(p.name.c_str(), name.c_str()) == 0) {
+            app.restart_pid = p.pid;
+            app.restart_seen_at = now;
+            app.status = name + " started again (PID " + std::to_string(p.pid) + "); attaching in a moment.";
+            return;
+        }
+    }
+    app.status = name + " exited. Waiting for it to start again.";
 }
 
 void first_scan(App& app) {
@@ -748,7 +797,10 @@ void draw_process_bar(App& app) {
     ImGui::EndDisabled();
 
     ImGui::SameLine();
+    ImGui::Checkbox("Auto re-attach", &app.auto_reattach);
+    ImGui::SameLine();
     if (is_attached(app)) ImGui::Text("Attached: %s", app.attached_label.c_str());
+    else if (app.process->get_pid() != 0) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s exited", app.process->name().c_str());
     else ImGui::TextDisabled("Not attached");
 }
 
@@ -1226,6 +1278,7 @@ struct LaunchOptions {
     std::string table;
     std::string screenshot; // render a few frames in a hidden window, save the last one as a BMP and exit
     std::string track;      // start smart track for this type right away (with --pid)
+    int wait_seconds = 0;   // with --screenshot: capture no earlier than this
 };
 
 // nce_gui.exe [--pid <pid>] [--table <file.json>] [--screenshot <file.bmp>]
@@ -1242,6 +1295,7 @@ LaunchOptions parse_command_line() {
         else if (option == L"--table") options.table = value;
         else if (option == L"--screenshot") options.screenshot = value;
         else if (option == L"--track") options.track = value;
+        else if (option == L"--wait") options.wait_seconds = std::atoi(value.c_str());
     }
     LocalFree(argv);
     return options;
@@ -1376,6 +1430,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
 
     constexpr int SCREENSHOT_FRAME = 10; // let tables settle their column widths first
     int frame = 0;
+    const auto started = std::chrono::steady_clock::now();
     int exit_code = 0;
     bool done = false;
     while (!done) {
@@ -1402,6 +1457,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         }
 
         poll_job(app);
+        tick_reattach(app);
         process_hotkeys(app);
         tick_tracking(app);
 
@@ -1417,7 +1473,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         // Capture once the startup work (attach, noise learning, --track snapshot) has finished
-        if (screenshot_mode && ++frame >= SCREENSHOT_FRAME && !job_running(app) && !app.track_pending) {
+        if (screenshot_mode && ++frame >= SCREENSHOT_FRAME && !job_running(app) && !app.track_pending &&
+            elapsed_ms(started) >= options.wait_seconds * 1000LL) {
             exit_code = save_back_buffer(options.screenshot) ? 0 : 1;
             done = true;
         }

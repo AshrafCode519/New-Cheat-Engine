@@ -26,7 +26,7 @@ public:
 
     std::vector<GroupedMatch> scan(
         const std::vector<GroupedEntry>& entries,
-        size_t window_size = 0x100, // Search within 256 bytes
+        size_t window_size = 0x100, // other members lie within this many bytes of the first, on either side
         uint32_t region_filter = hal::FilterFlags::DefaultScanFilter
     );
 

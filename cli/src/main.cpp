@@ -176,6 +176,7 @@ void print_help() {
     std::cout << "General Commands:\n"
               << "  ps [filter]                     - List running processes (with optional name filter)\n"
               << "  attach <pid>                    - Attach to process by PID\n"
+              << "  reattach [seconds]              - After the target exits: wait for it to start again and attach\n"
               << "  detach                          - Detach from target process\n"
               << "  modules                         - List loaded modules in target process\n"
               << "  regions                         - Display memory regions summary\n\n"
@@ -367,12 +368,46 @@ void cmd_attach(uint32_t pid) {
     g_noise.reset(); // learned for the previous process
     if (attached) {
         g_scanner = std::make_unique<scanner::MemoryScanner>(g_process);
-        std::cout << "[+] Successfully attached to PID: " << pid << "\n";
+        std::cout << "[+] Successfully attached to PID: " << pid << " (" << g_process->name() << ")\n";
+        if (!g_process->can_write()) {
+            std::cout << "[!] Only read access was granted: writing and freezing won't work. Run as Administrator.\n";
+        }
         learn_noise(4);
         reconcile_table();
     } else {
         std::cerr << "[-] Failed to attach to PID: " << pid << ". Run as Administrator or check PID.\n";
     }
+}
+
+// After the target exits: waits for the same program to start again, gives it a moment to set up,
+// then attaches (which relearns noise, re-finds permanent table entries and resumes freezing)
+void cmd_reattach(int seconds) {
+    if (!g_process || g_process->name().empty()) {
+        std::cerr << "[-] Attach to a program first; reattach waits for that program to restart.\n";
+        return;
+    }
+    if (g_process->is_attached()) {
+        std::cout << "[*] Still attached to " << g_process->name() << " (PID " << g_process->get_pid() << ").\n";
+        return;
+    }
+
+    const std::string name = g_process->name();
+    const uint32_t old_pid = g_process->get_pid();
+    std::cout << "[*] Waiting up to " << seconds << " s for " << name << " to start again ..." << std::flush;
+
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(seconds);
+    while (std::chrono::steady_clock::now() < deadline) {
+        for (const auto& p : hal::IProcess::list_processes()) {
+            if (p.pid != old_pid && _stricmp(p.name.c_str(), name.c_str()) == 0) {
+                std::cout << " found PID " << p.pid << ".\n";
+                std::this_thread::sleep_for(std::chrono::seconds(3)); // let it set up its objects
+                cmd_attach(p.pid);
+                return;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    std::cout << " not seen. Try 'reattach' again once it is running.\n";
 }
 
 void cmd_detach() {
@@ -1321,6 +1356,10 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: attach <pid>\n";
         }
+    } else if (cmd == "reattach") {
+        int seconds = 120;
+        iss >> seconds;
+        cmd_reattach(seconds);
     } else if (cmd == "detach") {
         cmd_detach();
     } else if (cmd == "modules") {
@@ -1514,6 +1553,8 @@ int main() {
     while (true) {
         if (g_process && g_process->is_attached()) {
             std::cout << "[NCE PID:" << g_process->get_pid() << " (" << describe_scan_state() << ")] > ";
+        } else if (g_process && g_process->get_pid() != 0) {
+            std::cout << "[NCE (" << g_process->name() << " exited - 'reattach' waits for it)] > ";
         } else {
             std::cout << "[NCE (Detached)] > ";
         }

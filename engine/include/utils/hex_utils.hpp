@@ -9,6 +9,7 @@
 
 namespace nce::utils {
 
+// Hex with or without "0x". 0 (never a valid address) for anything else, including trailing characters.
 uintptr_t parse_address(const std::string& str);
 std::string format_address(uintptr_t address);
 std::string format_hex_dump(uintptr_t base_address, const uint8_t* data, size_t size);

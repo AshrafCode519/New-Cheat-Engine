@@ -9,15 +9,13 @@
 namespace nce::utils {
 
 uintptr_t parse_address(const std::string& str) {
-    if (str.empty()) return 0;
-    try {
-        if (str.rfind("0x", 0) == 0 || str.rfind("0X", 0) == 0) {
-            return std::stoull(str, nullptr, 16);
-        }
-        return std::stoull(str, nullptr, 16);
-    } catch (...) {
-        return 0;
-    }
+    std::string_view digits(str);
+    if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) digits.remove_prefix(2);
+
+    uintptr_t address = 0;
+    auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), address, 16);
+    if (digits.empty() || ec != std::errc() || ptr != digits.data() + digits.size()) return 0;
+    return address;
 }
 
 std::string format_address(uintptr_t address) {

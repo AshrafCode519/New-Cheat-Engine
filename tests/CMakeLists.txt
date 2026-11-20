@@ -7,6 +7,7 @@ add_executable(engine_tests
     test_cheat_table.cpp
     test_value_tracker.cpp
     test_noise_map.cpp
+    test_grouped_scanner.cpp
     test_text_encoding.cpp
     test_results_io.cpp
     test_win32_process.cpp
