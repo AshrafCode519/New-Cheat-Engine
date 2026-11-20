@@ -136,7 +136,7 @@ TEST_CASE("an exact new value counts as a match only when it equals what the use
     tracker.start();
     process->put<int32_t>(kHealth, 900);
     process->put<int32_t>(kCounter, 60);
-    tracker.observe_event({Expectation::Kind::Equals, 900.0, 900.0});
+    tracker.observe_event({Expectation::Kind::Equals, 900.0, 900.0, 900.0});
 
     const auto ranked = tracker.top(10);
     REQUIRE(ranked.size() == 2); // the other one changed too, so it stays with a strike
@@ -163,4 +163,123 @@ TEST_CASE("float values: tiny or non-finite numbers rank below normal ones") {
 TEST_CASE("ValueTracker only takes numeric types") {
     auto process = std::make_shared<FakeProcess>(0x1000);
     CHECK_THROWS_AS(scanner::ValueTracker(process, DataType::String), std::invalid_argument);
+    CHECK_THROWS_AS(scanner::ValueTracker(process, std::vector<DataType>{}), std::invalid_argument);
+}
+
+namespace {
+
+// Follows one value with every auto type at once; `step` writes the value's next state
+template <typename T>
+scanner::ValueTracker track_auto(std::shared_ptr<FakeProcess> process, size_t offset, std::initializer_list<T> values,
+                                 size_t list_threshold = 2'000'000) {
+    auto it = values.begin();
+    process->put<T>(offset, *it++);
+    scanner::ValueTracker tracker(process, scanner::ValueTracker::auto_types(), list_threshold);
+    tracker.start();
+    for (; it != values.end(); ++it) {
+        process->put<T>(offset, *it);
+        tracker.observe_event(decreased());
+    }
+    return tracker;
+}
+
+} // anonymous namespace
+
+TEST_CASE("auto type: the type that reads plausibly wins") {
+    for (const size_t threshold : {size_t{2'000'000}, size_t{8}}) { // ranked from the start / snapshot first
+        CAPTURE(threshold);
+
+        SUBCASE("an int health") {
+            auto process = std::make_shared<FakeProcess>(0x10000);
+            auto tracker = track_auto<int32_t>(process, kHealth, {1000, 900, 800}, threshold);
+            REQUIRE(tracker.is_ranked());
+            const auto best = tracker.top(1);
+            REQUIRE(best.size() == 1);
+            CHECK(best[0].address == kBase + kHealth);
+            CHECK(best[0].value.type == DataType::Int32); // as f32 the same bytes are ~1e-42
+            CHECK(tracker.best_type() == DataType::Int32);
+        }
+        SUBCASE("a float health") {
+            auto process = std::make_shared<FakeProcess>(0x10000);
+            auto tracker = track_auto<float>(process, kHealth, {25.5f, 24.5f, 23.5f}, threshold);
+            const auto best = tracker.top(1);
+            REQUIRE(best.size() == 1);
+            CHECK(best[0].address == kBase + kHealth);
+            CHECK(best[0].value.type == DataType::Float); // as i32 the same bytes are ~1.1e9
+
+            const auto results = tracker.to_results(); // results carry the winning type only
+            CHECK(results.type() == DataType::Float);
+            REQUIRE_FALSE(results.empty());
+            CHECK(results.address(0) == kBase + kHealth);
+        }
+        SUBCASE("a double speed") {
+            auto process = std::make_shared<FakeProcess>(0x10000);
+            auto tracker = track_auto<double>(process, kHealth, {12.3456, 11.5, 10.25}, threshold);
+            const auto best = tracker.top(1);
+            REQUIRE(best.size() == 1);
+            CHECK(best[0].address == kBase + kHealth);
+            CHECK(best[0].value.type == DataType::Double);
+        }
+    }
+}
+
+TEST_CASE("auto type: a float value beats float bit noise that drops to 0") {
+    // Seen on target_dummy: mana 250.5 -> 225.5 -> 200.5 tied with denormals that decreased to 0
+    auto process = std::make_shared<FakeProcess>(0x10000);
+    process->put<float>(kHealth, 250.5f);
+    process->put<float>(kNoise, 3e-39f);
+    scanner::ValueTracker tracker(process, scanner::ValueTracker::auto_types());
+    tracker.start();
+
+    process->put<float>(kHealth, 225.5f);
+    process->put<float>(kNoise, 2e-39f);
+    tracker.observe_event(decreased());
+    process->put<float>(kHealth, 200.5f);
+    process->put<float>(kNoise, 0.0f);
+    tracker.observe_event(decreased());
+
+    const auto ranked = tracker.top(10);
+    REQUIRE_FALSE(ranked.empty());
+    CHECK(ranked[0].address == kBase + kHealth);
+    CHECK(ranked[0].value.type == DataType::Float);
+    CHECK(ranked[0].score > ranked[1].score); // a clear winner, not a tie
+    CHECK(tracker.best_type() == DataType::Float);
+    for (const auto& r : ranked) {
+        if (r.address == kBase + kNoise && r.value.type == DataType::Float) {
+            CHECK(r.reason.find("tiny steps") != std::string::npos);
+        }
+    }
+}
+
+TEST_CASE("parse_expectation reads +, -, c and typed values") {
+    using Kind = Expectation::Kind;
+    CHECK(scanner::parse_expectation("+", scanner::FloatMatchMode::Rounded)->kind == Kind::Increased);
+    CHECK(scanner::parse_expectation("-", scanner::FloatMatchMode::Rounded)->kind == Kind::Decreased);
+    CHECK(scanner::parse_expectation("c", scanner::FloatMatchMode::Rounded)->kind == Kind::Changed);
+
+    auto typed = scanner::parse_expectation("24.5", scanner::FloatMatchMode::Rounded);
+    REQUIRE(typed.has_value());
+    CHECK(typed->kind == Kind::Equals);
+    CHECK(typed->value == 24.5);
+    CHECK(typed->low == doctest::Approx(24.45));
+    CHECK(typed->high == doctest::Approx(24.55));
+
+    CHECK_FALSE(scanner::parse_expectation("abc", scanner::FloatMatchMode::Rounded).has_value());
+    CHECK_FALSE(scanner::parse_expectation("", scanner::FloatMatchMode::Rounded).has_value());
+}
+
+TEST_CASE("an exact typed value: integers must equal it, floats may round to it") {
+    auto process = std::make_shared<FakeProcess>(0x10000);
+    process->put<float>(kHealth, 25.5f);
+    scanner::ValueTracker tracker(process, scanner::ValueTracker::auto_types());
+    tracker.start();
+
+    process->put<float>(kHealth, 24.46f); // shows as 24.5 at one decimal
+    tracker.observe_event(*scanner::parse_expectation("24.5", scanner::FloatMatchMode::Rounded));
+
+    const auto best = tracker.top(1);
+    REQUIRE(best.size() == 1);
+    CHECK(best[0].address == kBase + kHealth);
+    CHECK(best[0].value.type == DataType::Float);
+    CHECK(best[0].reason.find("changed as expected 1/1") != std::string::npos);
 }

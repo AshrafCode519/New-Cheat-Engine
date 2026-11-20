@@ -185,8 +185,9 @@ void print_help() {
               << "                                    'scan aob 48 8B ? ? 89'\n"
               << "  next <cond> [val] [val2]        - Next scan (cond: exact, changed, unchanged, inc, dec,\n"
               << "                                    gt, lt, between, incby, decby). Example: 'next between 10 20'\n"
-              << "  track <type>                    - Guided search for a value you can change but don't know:\n"
-              << "                                    filters out noise while you wait, then asks how it changed\n"
+              << "  track <type|auto>               - Guided search for a value you can change but don't know:\n"
+              << "                                    ranks addresses by how they follow your changes;\n"
+              << "                                    'auto' tries i32, f32 and f64 and picks the type\n"
               << "  undo                            - Go back to the results before the last scan (up to 5 steps;\n"
               << "                                    only the newest unknown-value snapshot is kept)\n"
               << "  floatmode [rounded|truncated|exact] - How 'exact' float values match (default: rounded)\n"
@@ -576,7 +577,8 @@ void print_ranked(const scanner::ValueTracker& tracker, size_t count) {
     const auto ranked = tracker.top(count);
     std::cout << "        Best candidates:\n";
     for (size_t i = 0; i < ranked.size(); ++i) {
-        std::cout << "        [" << i << "] " << utils::format_address(ranked[i].address) << " = " << std::left
+        std::cout << "        [" << i << "] " << utils::format_address(ranked[i].address) << " "
+                  << std::left << std::setw(4) << utils::format_data_type(ranked[i].value.type) << "= "
                   << std::setw(12) << ranked[i].value.to_string() << std::right << " score " << std::setw(3)
                   << ranked[i].score << "  " << ranked[i].reason << "\n";
     }
@@ -591,13 +593,20 @@ void cmd_track(const std::string& type_str) {
         std::cerr << "[-] Please attach to a process first using 'attach <pid>'.\n";
         return;
     }
-    auto type = parse_numeric_type(type_str);
-    if (!type) return;
+    // 'auto' follows i32, f32 and f64 together and lets the scoring pick the type
+    std::vector<scanner::DataType> types;
+    if (type_str == "auto") {
+        types = scanner::ValueTracker::auto_types();
+    } else {
+        auto type = parse_numeric_type(type_str);
+        if (!type) return;
+        types = {*type};
+    }
 
     constexpr size_t SHOW_BEST = 5;
     constexpr size_t MAX_HANDOVER = 5'000'000; // candidates turned into results when tracking stops
 
-    scanner::ValueTracker tracker(g_process, *type);
+    scanner::ValueTracker tracker(g_process, types);
     std::cout << "[*] Tracking an unknown " << type_str << " value. Capturing snapshot ...\n";
     auto start = std::chrono::steady_clock::now();
     tracker.start();
@@ -645,10 +654,9 @@ void cmd_track(const std::string& type_str) {
         line = trim(line);
         if (line == "done") break;
 
-        auto expected = scanner::parse_expectation(*type, line, g_float_mode);
+        auto expected = scanner::parse_expectation(line, g_float_mode);
         if (!expected) {
-            std::cout << "[track] '" << line << "' is not +, -, c or a valid " << type_str
-                      << " value. Skipping this round.\n";
+            std::cout << "[track] '" << line << "' is not +, -, c or a number. Skipping this round.\n";
             continue;
         }
 
@@ -671,9 +679,10 @@ void cmd_track(const std::string& type_str) {
         return;
     }
     push_history();
-    g_current_type = *type;
+    g_current_type = tracker.best_type();
     g_results = tracker.to_results();
-    std::cout << "[track] Stopped with " << g_results.count() << " result(s), best first. "
+    std::cout << "[track] Stopped with " << g_results.count() << " " << utils::format_data_type(g_current_type)
+              << " result(s), best first" << (types.size() > 1 ? " (most likely type)" : "") << ". "
               << "'list' shows them, 'add #0 <name>' adds the best one.\n";
 }
 
@@ -1212,7 +1221,7 @@ bool handle_command(const std::string& line) {
         if (iss >> type) {
             cmd_track(type);
         } else {
-            std::cout << "Usage: track <type>   (e.g. 'track i32', 'track f32')\n";
+            std::cout << "Usage: track <type|auto>   (e.g. 'track auto', 'track i32', 'track f32')\n";
         }
     } else if (cmd == "floatmode") {
         std::string mode;

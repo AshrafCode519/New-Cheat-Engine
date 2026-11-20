@@ -200,6 +200,7 @@ struct App {
     std::unique_ptr<scanner::ValueTracker> tracker;
     TrackStage track_stage = TrackStage::Off;
     bool track_stop_requested = false;
+    bool track_auto_type = true;
     std::vector<scanner::RankedCandidate> track_best;
     size_t track_events = 0;
     std::string track_summary;
@@ -502,7 +503,10 @@ void refresh_track(App& app) {
 }
 
 void start_tracking(App& app) {
-    app.tracker = std::make_unique<scanner::ValueTracker>(app.process, type_at(app.type_index));
+    // Auto type follows i32, f32 and f64 together and lets the scoring pick the type
+    auto types = app.track_auto_type ? scanner::ValueTracker::auto_types()
+                                     : std::vector<scanner::DataType>{type_at(app.type_index)};
+    app.tracker = std::make_unique<scanner::ValueTracker>(app.process, std::move(types));
     app.track_best.clear();
     app.track_stop_requested = false;
     start_job(app, "Snapshot", [&app]() -> ApplyResult {
@@ -529,7 +533,7 @@ void track_event(App& app, const scanner::Expectation& expected) {
 void stop_tracking(App& app) {
     if (app.tracker->candidate_count() <= TRACK_MAX_HANDOVER) {
         push_history(app);
-        app.state.type = app.tracker->type();
+        app.state.type = app.tracker->best_type();
         app.state.results = app.tracker->to_results();
         app.status = "Smart track stopped: " + describe(app.state) + ", best first.";
     } else {
@@ -671,15 +675,20 @@ void draw_tracking(App& app) {
     using Kind = scanner::Expectation::Kind;
 
     if (app.track_stage == Stage::Off) {
-        ImGui::BeginDisabled(!is_attached(app) || job_running(app) || !is_numeric(type_at(app.type_index)));
+        const bool can_track = app.track_auto_type || is_numeric(type_at(app.type_index));
+        ImGui::BeginDisabled(!is_attached(app) || job_running(app) || !can_track);
         if (ImGui::Button("Smart track")) start_tracking(app);
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::TextDisabled("find a value you can change: ranks addresses by how they follow your changes");
+        ImGui::Checkbox("Auto type", &app.track_auto_type);
+        ImGui::SameLine();
+        ImGui::TextDisabled(app.track_auto_type ? "(i32 / f32 / f64)" : "(the type above)");
         return;
     }
 
-    ImGui::Text("Smart track (%s): %s", utils::format_data_type(app.tracker->type()).c_str(), app.track_summary.c_str());
+    const std::string tracked = app.tracker->types().size() > 1 ? "auto type"
+                                                                 : utils::format_data_type(app.tracker->types().front());
+    ImGui::Text("Smart track (%s): %s", tracked.c_str(), app.track_summary.c_str());
     ImGui::SameLine();
     if (ImGui::SmallButton("Stop")) app.track_stop_requested = true; // applied when no job is running
 
@@ -701,10 +710,10 @@ void draw_tracking(App& app) {
         ImGui::SameLine();
         if (ImGui::Button("It's now")) {
             const auto mode = static_cast<scanner::FloatMatchMode>(app.float_mode);
-            if (auto expected = scanner::parse_expectation(app.tracker->type(), app.track_value, mode)) {
+            if (auto expected = scanner::parse_expectation(app.track_value, mode)) {
                 track_event(app, *expected);
             } else {
-                app.status = "'" + app.track_value + "' is not a valid " + utils::format_data_type(app.tracker->type()) + " value.";
+                app.status = "'" + app.track_value + "' is not a number.";
             }
         }
         ImGui::EndDisabled();
@@ -717,9 +726,10 @@ void draw_tracking(App& app) {
     if (app.track_best.empty()) return;
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                   ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
-    if (!ImGui::BeginTable("track_best", 5, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
+    if (!ImGui::BeginTable("track_best", 6, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
     ImGui::TableSetupScrollFreeze(0, 1);
     ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, em(6));
     ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, em(3));
     ImGui::TableSetupColumn("Why");
@@ -733,6 +743,8 @@ void draw_tracking(App& app) {
         ImGui::PushID(static_cast<int>(i));
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(utils::format_address(c.address).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(utils::format_data_type(c.value.type).c_str());
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(c.value.to_string().c_str());
         ImGui::TableNextColumn();
@@ -1087,8 +1099,12 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
         }
     }
     if (!options.track.empty() && is_attached(app)) {
-        if (auto type = utils::parse_data_type(options.track); type && is_numeric(*type)) {
+        if (options.track == "auto") {
+            app.track_auto_type = true;
+            start_tracking(app);
+        } else if (auto type = utils::parse_data_type(options.track); type && is_numeric(*type)) {
             app.type_index = type_index_of(*type);
+            app.track_auto_type = false;
             start_tracking(app);
         }
     }

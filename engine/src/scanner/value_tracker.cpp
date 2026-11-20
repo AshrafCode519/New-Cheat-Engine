@@ -4,6 +4,7 @@
 #include "parallel.hpp"
 #include <algorithm>
 #include <bit>
+#include <charconv>
 #include <cmath>
 #include <cstring>
 #include <sstream>
@@ -37,45 +38,64 @@ void for_each_bit(const std::vector<uint64_t>& bits, Fn&& fn) {
     }
 }
 
+// Aligned slots (offset = slot * value_size) a value of value_size bytes fits at
+std::vector<uint64_t> all_slots(size_t bytes, size_t value_size) {
+    const size_t slots = bytes >= value_size ? (bytes - value_size) / value_size + 1 : 0;
+    std::vector<uint64_t> bits((slots + 63) / 64, ~uint64_t{0});
+    if (!bits.empty() && slots % 64 != 0) bits.back() = (uint64_t{1} << (slots % 64)) - 1;
+    return bits;
+}
+
 bool same_step(double a, double b) {
     return std::fabs(a - b) <= 1e-6 * std::max({1.0, std::fabs(a), std::fabs(b)});
 }
 
+bool is_float_type(DataType type) {
+    return type == DataType::Float || type == DataType::Double;
+}
+
 } // anonymous namespace
 
-std::optional<Expectation> parse_expectation(DataType type, const std::string& answer, FloatMatchMode float_mode) {
+std::optional<Expectation> parse_expectation(const std::string& answer, FloatMatchMode float_mode) {
     using Kind = Expectation::Kind;
     if (answer == "+") return Expectation{Kind::Increased};
     if (answer == "-") return Expectation{Kind::Decreased};
     if (answer == "c") return Expectation{Kind::Changed};
 
-    auto value = utils::parse_scan_value(type, answer);
-    if (!value) return std::nullopt;
-    double exact = 0.0;
-    dispatch_numeric(type, [&]<typename T>() { exact = static_cast<double>(std::get<T>(value->value)); });
+    double typed = 0.0;
+    const char* last = answer.data() + answer.size();
+    auto [ptr, ec] = std::from_chars(answer.data(), last, typed);
+    if (answer.empty() || ec != std::errc() || ptr != last) return std::nullopt;
 
-    Expectation expected{Kind::Equals, exact, exact};
-    if (type == DataType::Float || type == DataType::Double) {
-        if (auto range = utils::float_match_range(answer, float_mode)) {
-            expected.low = range->first;
-            expected.high = range->second;
-        } else {
-            expected.low = exact - 0.0001; // FloatMatchMode::Exact
-            expected.high = exact + 0.0001;
-        }
+    Expectation expected{Kind::Equals, typed, typed, typed};
+    if (auto range = utils::float_match_range(answer, float_mode)) {
+        expected.low = range->first;
+        expected.high = range->second;
+    } else {
+        expected.low = typed - 0.0001; // FloatMatchMode::Exact
+        expected.high = typed + 0.0001;
     }
     return expected;
 }
 
 ValueTracker::ValueTracker(std::shared_ptr<hal::IProcess> process, DataType type, size_t list_threshold)
+    : ValueTracker(std::move(process), std::vector<DataType>{type}, list_threshold)
+{}
+
+ValueTracker::ValueTracker(std::shared_ptr<hal::IProcess> process, std::vector<DataType> types, size_t list_threshold)
     : m_process(std::move(process))
-    , m_type(type)
-    , m_value_size(get_data_type_size(type))
+    , m_types(std::move(types))
     , m_list_threshold(list_threshold)
     , m_thread_count(detail::default_thread_count())
 {
-    if (!dispatch_numeric(type, []<typename T>() {})) {
-        throw std::invalid_argument("ValueTracker: only numeric types can be tracked");
+    if (m_types.empty() || m_types.size() > 8) {
+        throw std::invalid_argument("ValueTracker: track between 1 and 8 types");
+    }
+    for (const auto type : m_types) {
+        if (!dispatch_numeric(type, []<typename T>() {})) {
+            throw std::invalid_argument("ValueTracker: only numeric types can be tracked");
+        }
+        m_sizes.push_back(get_data_type_size(type));
     }
 }
 
@@ -87,15 +107,18 @@ void ValueTracker::start(uint32_t region_filter) {
     m_snapshot_phase = true;
     m_events = 0;
 
+    // One copy of memory for every type; each type gets its own candidate bitmaps
     MemoryScanner scanner(m_process);
-    auto snapshot = scanner.first_scan_unknown(m_type, m_value_size, region_filter);
+    auto snapshot = scanner.first_scan_unknown(m_types.front(), m_sizes.front(), region_filter);
     m_blocks.reserve(snapshot.blocks.size());
     for (auto& b : snapshot.blocks) {
         Block block;
         block.base_address = b.base_address;
         block.bytes = std::move(b.bytes);
-        block.alive = std::move(b.alive);
-        block.struck.assign(block.alive.size(), 0);
+        for (size_t lane = 0; lane < m_types.size(); ++lane) {
+            block.alive.push_back(all_slots(block.bytes.size(), m_sizes[lane]));
+            block.struck.emplace_back(block.alive.back().size(), 0);
+        }
         m_blocks.push_back(std::move(block));
     }
 
@@ -115,9 +138,9 @@ void ValueTracker::observe_event(const Expectation& expected) {
     else observe_list(&expected);
 }
 
-double ValueTracker::as_double(const uint8_t* bytes) const {
+double ValueTracker::as_double(size_t lane, const uint8_t* bytes) const {
     double out = 0.0;
-    dispatch_numeric(m_type, [&]<typename T>() {
+    dispatch_numeric(m_types[lane], [&]<typename T>() {
         T value;
         std::memcpy(&value, bytes, sizeof(T));
         out = static_cast<double>(value);
@@ -125,14 +148,15 @@ double ValueTracker::as_double(const uint8_t* bytes) const {
     return out;
 }
 
-bool ValueTracker::matches(const Expectation& expected, const uint8_t* current, const uint8_t* previous) const {
-    const double now = as_double(current);
-    const double before = as_double(previous);
+bool ValueTracker::matches(size_t lane, const Expectation& expected, const uint8_t* current, const uint8_t* previous) const {
+    const double now = as_double(lane, current);
+    const double before = as_double(lane, previous);
     switch (expected.kind) {
-        case Expectation::Kind::Changed:   return std::memcmp(current, previous, m_value_size) != 0;
+        case Expectation::Kind::Changed:   return std::memcmp(current, previous, value_size(lane)) != 0;
         case Expectation::Kind::Increased: return now > before;
         case Expectation::Kind::Decreased: return now < before;
-        case Expectation::Kind::Equals:    return now >= expected.low && now <= expected.high;
+        case Expectation::Kind::Equals:
+            return is_float_type(m_types[lane]) ? (now >= expected.low && now <= expected.high) : now == expected.value;
     }
     return false;
 }
@@ -155,37 +179,42 @@ void ValueTracker::observe_snapshot(const Expectation* expected) {
         out.struck = old.struck;
 
         size_t kept = 0;
-        for_each_bit(old.alive, [&](size_t slot) {
-            const size_t offset = slot * m_value_size;
-            const uint8_t* current = out.bytes.data() + offset;
-            const uint8_t* previous = old.bytes.data() + offset;
-            const bool changed = std::memcmp(current, previous, m_value_size) != 0;
+        for (size_t lane = 0; lane < m_types.size(); ++lane) {
+            const size_t size = value_size(lane);
+            for_each_bit(old.alive[lane], [&](size_t slot) {
+                const size_t offset = slot * size;
+                const uint8_t* current = out.bytes.data() + offset;
+                const uint8_t* previous = old.bytes.data() + offset;
+                const bool changed = std::memcmp(current, previous, size) != 0;
 
-            bool mistake = false;
-            if (!expected) {
-                mistake = changed;
-            } else if (!changed) {
-                clear_bit(out.alive, slot); // the user changed the value; this one didn't move
-                return;
-            } else {
-                mistake = !matches(*expected, current, previous);
-            }
-
-            if (mistake) {
-                if (test_bit(out.struck, slot)) {
-                    clear_bit(out.alive, slot);
+                bool mistake = false;
+                if (!expected) {
+                    mistake = changed;
+                } else if (!changed) {
+                    clear_bit(out.alive[lane], slot); // the user changed the value; this one didn't move
                     return;
+                } else {
+                    mistake = !matches(lane, *expected, current, previous);
                 }
-                set_bit(out.struck, slot);
-            }
-            ++kept;
-        });
+
+                if (mistake) {
+                    if (test_bit(out.struck[lane], slot)) {
+                        clear_bit(out.alive[lane], slot);
+                        return;
+                    }
+                    set_bit(out.struck[lane], slot);
+                }
+                ++kept;
+            });
+        }
 
         if (kept == 0) out = {};
     });
 
     size_t remaining = 0;
-    for (const auto& b : next) remaining += count_bits(b.alive);
+    for (const auto& b : next) {
+        for (const auto& lane_bits : b.alive) remaining += count_bits(lane_bits);
+    }
 
     if (remaining <= m_list_threshold) {
         switch_to_list(next, &m_blocks, expected);
@@ -206,35 +235,49 @@ void ValueTracker::switch_to_list(const std::vector<Block>& blocks, const std::v
                                   const Expectation* expected) {
     std::vector<Candidate> candidates;
     size_t total = 0;
-    for (const auto& b : blocks) total += count_bits(b.alive);
+    for (const auto& b : blocks) {
+        for (const auto& lane_bits : b.alive) total += count_bits(lane_bits);
+    }
     candidates.reserve(total);
 
     for (size_t i = 0; i < blocks.size(); ++i) {
         const Block& block = blocks[i];
         if (block.bytes.empty()) continue;
         const Block* before = previous ? &(*previous)[i] : nullptr; // `previous` is index-aligned with `blocks`
+        const size_t block_start = candidates.size();
 
-        for_each_bit(block.alive, [&](size_t slot) {
-            const size_t offset = slot * m_value_size;
-            const uint8_t* current = block.bytes.data() + offset;
+        for (size_t lane = 0; lane < m_types.size(); ++lane) {
+            const size_t size = value_size(lane);
+            for_each_bit(block.alive[lane], [&](size_t slot) {
+                const size_t offset = slot * size;
+                const uint8_t* current = block.bytes.data() + offset;
 
-            Candidate c;
-            c.address = block.base_address + offset;
-            std::memcpy(&c.raw, current, m_value_size);
+                Candidate c;
+                c.address = block.base_address + offset;
+                c.lane = static_cast<uint8_t>(lane);
+                std::memcpy(&c.raw, current, size);
 
-            const bool struck = test_bit(block.struck, slot);
-            if (m_events == 0) {
-                c.noise = struck ? 1 : 0;
-            } else {
-                c.wrong = struck ? 1 : 0;
-                c.matched = static_cast<int16_t>(std::max<int>(0, static_cast<int>(m_events) - c.wrong));
-                if (expected && before && matches(*expected, current, before->bytes.data() + offset)) {
-                    c.first_step = as_double(current) - as_double(before->bytes.data() + offset);
-                    c.same_step = 1;
+                const bool struck = test_bit(block.struck[lane], slot);
+                if (m_events == 0) {
+                    c.noise = struck ? 1 : 0;
+                } else {
+                    c.wrong = struck ? 1 : 0;
+                    c.matched = static_cast<int16_t>(std::max<int>(0, static_cast<int>(m_events) - c.wrong));
+                    const uint8_t* old_value = before ? before->bytes.data() + offset : nullptr;
+                    if (expected && old_value && matches(lane, *expected, current, old_value)) {
+                        c.first_step = as_double(lane, current) - as_double(lane, old_value);
+                        c.same_step = 1;
+                    }
                 }
-            }
-            candidates.push_back(c);
-        });
+                candidates.push_back(c);
+            });
+        }
+
+        // Keep address order across types within the block (blocks are already in address order)
+        std::sort(candidates.begin() + static_cast<std::ptrdiff_t>(block_start), candidates.end(),
+            [](const Candidate& a, const Candidate& b) {
+                return a.address != b.address ? a.address < b.address : a.lane < b.lane;
+            });
     }
 
     m_candidates = std::move(candidates);
@@ -255,17 +298,18 @@ void ValueTracker::observe_list(const Expectation* expected) {
             keep[k] = 0;
             return;
         }
+        const size_t size = value_size(c.lane);
         const auto* previous = reinterpret_cast<const uint8_t*>(&c.raw);
-        const bool changed = std::memcmp(live, previous, m_value_size) != 0;
+        const bool changed = std::memcmp(live, previous, size) != 0;
 
         if (!expected) {
             if (changed) ++c.noise;
         } else if (!changed) {
             keep[k] = 0; // the user changed the value; this one didn't move
             return;
-        } else if (matches(*expected, live, previous)) {
+        } else if (matches(c.lane, *expected, live, previous)) {
             ++c.matched;
-            const double step = as_double(live) - as_double(previous);
+            const double step = as_double(c.lane, live) - as_double(c.lane, previous);
             if (c.same_step == 0) {
                 c.first_step = step;
                 c.same_step = 1;
@@ -277,7 +321,7 @@ void ValueTracker::observe_list(const Expectation* expected) {
         }
 
         if (c.wrong + c.noise >= MAX_OFFENSES) keep[k] = 0;
-        std::memcpy(&c.raw, live, m_value_size);
+        std::memcpy(&c.raw, live, size);
     };
 
     detail::parallel_for(slices, m_thread_count,
@@ -290,15 +334,21 @@ void ValueTracker::observe_list(const Expectation* expected) {
             while (i < end) {
                 // Neighbouring candidates (address order) share one read
                 const uintptr_t window_start = m_candidates[i].address;
+                uintptr_t window_end = window_start + value_size(m_candidates[i].lane);
                 size_t j = i + 1;
-                while (j < end && m_candidates[j].address - window_start + m_value_size <= READ_WINDOW) ++j;
-                const size_t window_size = m_candidates[j - 1].address - window_start + m_value_size;
+                while (j < end) {
+                    const uintptr_t candidate_end = m_candidates[j].address + value_size(m_candidates[j].lane);
+                    if (candidate_end - window_start > READ_WINDOW) break;
+                    window_end = std::max(window_end, candidate_end);
+                    ++j;
+                }
 
-                if (m_process->read_raw(window_start, buffer.data(), window_size)) {
+                if (m_process->read_raw(window_start, buffer.data(), window_end - window_start)) {
                     for (size_t k = i; k < j; ++k) update(k, buffer.data() + (m_candidates[k].address - window_start));
                 } else {
                     for (size_t k = i; k < j; ++k) {
-                        const bool ok = m_process->read_raw(m_candidates[k].address, buffer.data(), m_value_size);
+                        const bool ok = m_process->read_raw(m_candidates[k].address, buffer.data(),
+                                                            value_size(m_candidates[k].lane));
                         update(k, ok ? buffer.data() : nullptr);
                     }
                 }
@@ -316,16 +366,23 @@ void ValueTracker::observe_list(const Expectation* expected) {
 int ValueTracker::score(const Candidate& c) const {
     int s = 10 * c.matched - 8 * c.wrong - 4 * c.noise + 3 * std::max(0, c.same_step - 1);
 
-    // Values a game would show the player rank above huge counters, addresses and float noise
-    const double v = as_double(reinterpret_cast<const uint8_t*>(&c.raw));
+    // Values a game would show the player rank above huge counters, addresses and float noise.
+    // This is also what picks the type: the same bytes read as the wrong type look implausible.
+    const double v = as_double(c.lane, reinterpret_cast<const uint8_t*>(&c.raw));
     const double magnitude = std::fabs(v);
-    const bool is_float = (m_type == DataType::Float || m_type == DataType::Double);
     if (!std::isfinite(v)) s -= 20;
     else if (magnitude > 1e9) s -= 10;
     else if (magnitude > 1e7) s -= 4;
-    else if (is_float && magnitude != 0.0 && magnitude < 1e-4) s -= 5;
+    else if (is_float_type(m_types[c.lane]) && magnitude != 0.0 && magnitude < 1e-4) s -= 5;
     else if (magnitude <= 1e6) s += 2;
+
+    // Floats that only ever move by ~1e-38 are bit noise (or another type's bytes), even if they read 0 now
+    if (tiny_float_step(c)) s -= 5;
     return s;
+}
+
+bool ValueTracker::tiny_float_step(const Candidate& c) const {
+    return is_float_type(m_types[c.lane]) && c.same_step > 0 && c.first_step != 0.0 && std::fabs(c.first_step) < 1e-4;
 }
 
 std::string ValueTracker::reason(const Candidate& c) const {
@@ -336,15 +393,54 @@ std::string ValueTracker::reason(const Candidate& c) const {
     if (c.wrong > 0) ss << ", changed differently " << c.wrong << "x";
     if (c.noise > 0) ss << ", changed on its own " << c.noise << "x";
 
-    const double v = as_double(reinterpret_cast<const uint8_t*>(&c.raw));
-    if (!std::isfinite(v) || std::fabs(v) > 1e7) ss << ", unusual value";
+    const double v = as_double(c.lane, reinterpret_cast<const uint8_t*>(&c.raw));
+    const double magnitude = std::fabs(v);
+    if (!std::isfinite(v) || magnitude > 1e7 ||
+        (is_float_type(m_types[c.lane]) && magnitude != 0.0 && magnitude < 1e-4)) {
+        ss << ", unusual value";
+    }
+    if (tiny_float_step(c)) ss << ", tiny steps";
     return ss.str();
+}
+
+std::vector<size_t> ValueTracker::ranked_order() const {
+    std::vector<std::pair<int, size_t>> scored;
+    scored.reserve(m_candidates.size());
+    for (size_t i = 0; i < m_candidates.size(); ++i) scored.emplace_back(score(m_candidates[i]), i);
+
+    std::sort(scored.begin(), scored.end(), [&](const auto& a, const auto& b) {
+        if (a.first != b.first) return a.first > b.first;
+        const Candidate& ca = m_candidates[a.second];
+        const Candidate& cb = m_candidates[b.second];
+        return ca.address != cb.address ? ca.address < cb.address : ca.lane < cb.lane;
+    });
+
+    std::vector<size_t> order;
+    order.reserve(scored.size());
+    for (const auto& s : scored) order.push_back(s.second);
+    return order;
+}
+
+DataType ValueTracker::best_type() const {
+    if (m_snapshot_phase || m_candidates.empty()) return m_types.front();
+    size_t best = 0;
+    int best_score = score(m_candidates[0]);
+    for (size_t i = 1; i < m_candidates.size(); ++i) {
+        const int s = score(m_candidates[i]);
+        if (s > best_score) {
+            best = i;
+            best_score = s;
+        }
+    }
+    return m_types[m_candidates[best].lane];
 }
 
 size_t ValueTracker::candidate_count() const {
     if (!m_snapshot_phase) return m_candidates.size();
     size_t total = 0;
-    for (const auto& b : m_blocks) total += count_bits(b.alive);
+    for (const auto& b : m_blocks) {
+        for (const auto& lane_bits : b.alive) total += count_bits(lane_bits);
+    }
     return total;
 }
 
@@ -352,7 +448,10 @@ size_t ValueTracker::memory_bytes() const {
     if (!m_snapshot_phase) return m_candidates.capacity() * sizeof(Candidate);
     size_t total = 0;
     for (const auto& b : m_blocks) {
-        total += b.bytes.size() + (b.alive.size() + b.struck.size()) * sizeof(uint64_t);
+        total += b.bytes.size();
+        for (size_t lane = 0; lane < b.alive.size(); ++lane) {
+            total += (b.alive[lane].size() + b.struck[lane].size()) * sizeof(uint64_t);
+        }
     }
     return total;
 }
@@ -361,24 +460,15 @@ std::vector<RankedCandidate> ValueTracker::top(size_t count) const {
     std::vector<RankedCandidate> best;
     if (m_snapshot_phase) return best;
 
-    std::vector<std::pair<int, size_t>> order; // (score, index)
-    order.reserve(m_candidates.size());
-    for (size_t i = 0; i < m_candidates.size(); ++i) order.emplace_back(score(m_candidates[i]), i);
-
+    const auto order = ranked_order();
     const size_t n = std::min(count, order.size());
-    std::partial_sort(order.begin(), order.begin() + static_cast<std::ptrdiff_t>(n), order.end(),
-        [&](const auto& a, const auto& b) {
-            if (a.first != b.first) return a.first > b.first;
-            return m_candidates[a.second].address < m_candidates[b.second].address;
-        });
-
     best.reserve(n);
     for (size_t k = 0; k < n; ++k) {
-        const Candidate& c = m_candidates[order[k].second];
+        const Candidate& c = m_candidates[order[k]];
         RankedCandidate r;
         r.address = c.address;
-        r.value = value_from_bytes(m_type, reinterpret_cast<const uint8_t*>(&c.raw), m_value_size).value();
-        r.score = order[k].first;
+        r.value = value_from_bytes(m_types[c.lane], reinterpret_cast<const uint8_t*>(&c.raw), value_size(c.lane)).value();
+        r.score = score(c);
         r.reason = reason(c);
         best.push_back(std::move(r));
     }
@@ -386,20 +476,27 @@ std::vector<RankedCandidate> ValueTracker::top(size_t count) const {
 }
 
 ScanResults ValueTracker::to_results() const {
-    ScanResults results(m_type, m_value_size);
+    // Results hold one type: the best candidate's, or the first type while still a snapshot
+    const DataType type = best_type();
+    const size_t lane = static_cast<size_t>(std::find(m_types.begin(), m_types.end(), type) - m_types.begin());
+    const size_t size = value_size(lane);
+    ScanResults results(type, size);
+
     if (m_snapshot_phase) {
         for (const auto& b : m_blocks) {
-            for_each_bit(b.alive, [&](size_t slot) {
-                const uint8_t* value = b.bytes.data() + slot * m_value_size;
-                results.add(b.base_address + slot * m_value_size, value, value);
+            for_each_bit(b.alive[lane], [&](size_t slot) {
+                const uint8_t* value = b.bytes.data() + slot * size;
+                results.add(b.base_address + slot * size, value, value);
             });
         }
         return results;
     }
 
-    for (const auto& r : top(m_candidates.size())) {
-        const auto bytes = value_to_bytes(r.value);
-        results.add(r.address, bytes.data(), bytes.data());
+    for (const size_t i : ranked_order()) {
+        const Candidate& c = m_candidates[i];
+        if (c.lane != lane) continue;
+        const auto* value = reinterpret_cast<const uint8_t*>(&c.raw);
+        results.add(c.address, value, value);
     }
     return results;
 }
