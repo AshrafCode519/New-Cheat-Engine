@@ -8,6 +8,7 @@ add_library(engine STATIC
     src/scanner/pointer_scanner.cpp
     src/scanner/grouped_scanner.cpp
     src/scanner/value_tracker.cpp
+    src/scanner/noise_map.cpp
     src/utils/hex_utils.cpp
     src/utils/text_encoding.cpp
     src/table/cheat_table.cpp

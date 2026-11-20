@@ -40,6 +40,7 @@ static std::unique_ptr<scanner::MemoryScanner> g_scanner;
 static scanner::ScanResults g_results;
 static scanner::DataType g_current_type = scanner::DataType::Int32;
 static std::shared_ptr<scanner::MemorySnapshot> g_snapshot; // set by an unknown-value first scan
+static std::shared_ptr<scanner::NoiseMap> g_noise;          // addresses that change on their own, learned on attach
 static scanner::FloatMatchMode g_float_mode = scanner::FloatMatchMode::Rounded;
 
 // Undo history: the scan state before each scan
@@ -188,6 +189,8 @@ void print_help() {
               << "  track <type|auto>               - Guided search for a value you can change but don't know:\n"
               << "                                    ranks addresses by how they follow your changes;\n"
               << "                                    'auto' tries i32, f32 and f64 and picks the type\n"
+              << "  noise [learn [seconds] | clear] - Addresses that change on their own (learned for 4 s on attach)\n"
+              << "                                    are ignored by every scan; show, relearn or stop ignoring them\n"
               << "  undo                            - Go back to the results before the last scan (up to 5 steps;\n"
               << "                                    only the newest unknown-value snapshot is kept)\n"
               << "  floatmode [rounded|truncated|exact] - How 'exact' float values match (default: rounded)\n"
@@ -280,6 +283,54 @@ void cmd_ps(const std::string& filter) {
     std::cout << " Found " << count << " process(es).\n\n";
 }
 
+std::string describe_noise() {
+    if (!g_noise || g_noise->empty()) return "no noise known";
+    std::ostringstream ss;
+    ss << "ignoring " << g_noise->noisy_slots() << " addresses that change on their own";
+    if (g_noise->skipped_bytes() > 0) ss << " (" << format_size(g_noise->skipped_bytes()) << " skipped whole)";
+    return ss.str();
+}
+
+// Samples the target 4 times a second; addresses that change in most samples are ignored by every scan
+void learn_noise(int seconds) {
+    if (!g_process || !g_process->is_attached()) {
+        std::cerr << "[-] Not attached to any process.\n";
+        return;
+    }
+    scanner::NoiseMap::Options options;
+    options.samples = static_cast<size_t>(std::max(3, seconds * 4));
+
+    std::cout << "[*] Learning noise for " << seconds << " s - leave the target alone ..." << std::flush;
+    const auto start = std::chrono::steady_clock::now();
+    auto noise = std::make_shared<scanner::NoiseMap>();
+    noise->learn(*g_process, options);
+    g_noise = noise;
+    g_scanner->set_noise_map(g_noise);
+    std::cout << " done in " << elapsed_ms(start) << " ms: " << describe_noise() << ".\n";
+}
+
+void cmd_noise(const std::string& action, const std::string& argument) {
+    if (action == "learn") {
+        int seconds = 4;
+        if (!argument.empty()) {
+            auto [ptr, ec] = std::from_chars(argument.data(), argument.data() + argument.size(), seconds);
+            if (ec != std::errc() || seconds < 1 || seconds > 60) {
+                std::cerr << "[!] Seconds must be between 1 and 60.\n";
+                return;
+            }
+        }
+        learn_noise(seconds);
+    } else if (action == "clear") {
+        g_noise.reset();
+        if (g_scanner) g_scanner->set_noise_map(nullptr);
+        std::cout << "[*] Noise cleared: scans look at every address again.\n";
+    } else if (action.empty()) {
+        std::cout << "[*] Noise: " << describe_noise() << ".\n";
+    } else {
+        std::cout << "Usage: noise [learn [seconds] | clear]\n";
+    }
+}
+
 void cmd_attach(uint32_t pid) {
     bool attached = false;
     size_t dropped_freezes = 0;
@@ -309,9 +360,11 @@ void cmd_attach(uint32_t pid) {
         std::cout << "[*] Unfroze " << dropped_freezes << " address(es) that belonged to the previous process.\n";
     }
 
+    g_noise.reset(); // learned for the previous process
     if (attached) {
         g_scanner = std::make_unique<scanner::MemoryScanner>(g_process);
         std::cout << "[+] Successfully attached to PID: " << pid << "\n";
+        learn_noise(4);
     } else {
         std::cerr << "[-] Failed to attach to PID: " << pid << ". Run as Administrator or check PID.\n";
     }
@@ -607,6 +660,7 @@ void cmd_track(const std::string& type_str) {
     constexpr size_t MAX_HANDOVER = 5'000'000; // candidates turned into results when tracking stops
 
     scanner::ValueTracker tracker(g_process, types);
+    tracker.set_noise_map(g_noise);
     std::cout << "[*] Tracking an unknown " << type_str << " value. Capturing snapshot ...\n";
     auto start = std::chrono::steady_clock::now();
     tracker.start();
@@ -1214,6 +1268,10 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: next <exact/changed/unchanged/inc/dec/gt/lt/between/incby/decby> [value] [value2]\n";
         }
+    } else if (cmd == "noise") {
+        std::string action, argument;
+        iss >> action >> argument;
+        cmd_noise(action, argument);
     } else if (cmd == "undo") {
         cmd_undo();
     } else if (cmd == "track") {

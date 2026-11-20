@@ -205,13 +205,17 @@ template <typename ChunkScanner>
 ScanResults scan_regions(
     const hal::IProcess& process,
     uint32_t region_filter,
+    const NoiseMap* noise,
     size_t thread_count,
     const ScanProgressCallback& progress,
     DataType type,
     size_t value_size,
     ChunkScanner&& scan_chunk
 ) {
-    const auto regions = process.query_regions(region_filter);
+    // Blocks that are all noise are not even read; noisy slots elsewhere are dropped from the results
+    const bool use_noise = noise && !noise->empty();
+    const auto regions = use_noise ? noise->filter_regions(process.query_regions(region_filter))
+                                   : process.query_regions(region_filter);
     if (regions.empty() || value_size == 0) return ScanResults(type, value_size);
 
     size_t total_bytes = 0;
@@ -256,7 +260,8 @@ ScanResults scan_regions(
             }
         });
 
-    return merge_parts(parts, type, value_size);
+    auto results = merge_parts(parts, type, value_size);
+    return use_noise ? noise->filter(results) : results;
 }
 
 // Keeps the previous results for which match(live_bytes, previous_bytes) holds. Neighbouring results
@@ -351,7 +356,7 @@ ScanResults MemoryScanner::first_scan(
         const T target1 = std::get<T>(val1.value);
         const T target2 = (condition == ScanCondition::Between) ? std::get<T>(val2.value) : T{};
 
-        results = scan_regions(*m_process, region_filter, m_thread_count, progress, type, sizeof(T),
+        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
             [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
                 scan_chunk_typed<T>(buffer, size, limit, base, condition, target1, target2, step, out);
             });
@@ -373,7 +378,7 @@ ScanResults MemoryScanner::first_scan_aob(
     const auto& pattern = *opt_pattern;
     const size_t step = std::max<size_t>(1, alignment);
 
-    return scan_regions(*m_process, region_filter, m_thread_count, progress, DataType::AOB, pattern.bytes.size(),
+    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, DataType::AOB, pattern.bytes.size(),
         [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
             scan_chunk_aob(buffer, size, limit, base, pattern, step, out);
         });
@@ -401,7 +406,7 @@ ScanResults MemoryScanner::first_scan_string(
     const DataType type = utf16 ? DataType::String16 : DataType::String;
     const size_t step = std::max<size_t>(1, alignment);
 
-    return scan_regions(*m_process, region_filter, m_thread_count, progress, type, pattern.bytes.size(),
+    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, pattern.bytes.size(),
         [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
             scan_chunk_aob(buffer, size, limit, base, pattern, step, out);
         });
@@ -423,12 +428,20 @@ MemorySnapshot MemoryScanner::first_scan_unknown(
 
     // Allocate every block up front on this thread, so running out of memory throws here.
     // Slots never cross a block, which is fine while alignment == value size (64 KB is a multiple).
-    for (const auto& reg : m_process->query_regions(region_filter)) {
+    // Known noise is left out: whole noisy blocks are not copied, noisy slots start as non-candidates.
+    const bool use_noise = m_noise && !m_noise->empty();
+    const auto regions = use_noise ? m_noise->filter_regions(m_process->query_regions(region_filter))
+                                   : m_process->query_regions(region_filter);
+    for (const auto& reg : regions) {
         for (size_t offset = 0; offset < reg.size; offset += SNAPSHOT_BLOCK_SIZE) {
             MemorySnapshot::Block block;
             block.base_address = reg.base_address + offset;
             block.bytes.resize(std::min(SNAPSHOT_BLOCK_SIZE, reg.size - offset));
             block.alive = all_slots_alive(slot_count(block.bytes.size(), value_size, snapshot.alignment));
+            if (use_noise) {
+                const auto noisy = m_noise->mask(block.base_address, block.bytes.size(), snapshot.alignment);
+                for (size_t w = 0; w < block.alive.size(); ++w) block.alive[w] &= ~noisy[w];
+            }
             snapshot.blocks.push_back(std::move(block));
         }
     }
@@ -491,7 +504,8 @@ ScanResults MemoryScanner::next_scan(
             });
     }
 
-    return results;
+    // Noise learned after the first scan applies from the next scan on
+    return (m_noise && !m_noise->empty()) ? m_noise->filter(results) : results;
 }
 
 ScanResults MemoryScanner::next_scan(

@@ -3,6 +3,7 @@
 #include "../hal/process.hpp"
 #include "scan_types.hpp"
 #include "scan_results.hpp"
+#include "noise_map.hpp"
 #include <memory>
 #include <functional>
 
@@ -84,8 +85,12 @@ public:
     void set_thread_count(size_t threads) { m_thread_count = threads; }
     [[nodiscard]] size_t get_thread_count() const noexcept { return m_thread_count; }
 
+    // Addresses that change on their own: first scans skip them, next scans drop them (nullptr = none)
+    void set_noise_map(std::shared_ptr<const NoiseMap> noise) { m_noise = std::move(noise); }
+
 private:
     std::shared_ptr<hal::IProcess> m_process;
+    std::shared_ptr<const NoiseMap> m_noise;
     size_t m_thread_count;
 };
 

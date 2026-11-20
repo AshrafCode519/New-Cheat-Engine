@@ -105,7 +105,43 @@ void print_addresses(uint32_t pid) {
     std::cout << "=======================================================\n";
 }
 
-int main() {
+// --noise: what a running game keeps changing on its own, to test the scanner's noise filtering
+struct Particle {
+    float x, y, vx, vy;
+};
+static volatile int32_t g_frame_counter = 0;
+static float g_animation[4096];
+
+std::thread start_noise_thread() {
+    return std::thread([]() {
+        std::vector<Particle> particles(10000, Particle{0, 0, 1.5f, -0.5f});
+        std::vector<int16_t> audio(512 * 1024); // 1 MB of samples, rewritten all the time
+        std::cout << " [Noise mode]    frame counter  @ 0x" << std::hex
+                  << reinterpret_cast<uintptr_t>(&g_frame_counter) << ", audio buffer @ 0x"
+                  << reinterpret_cast<uintptr_t>(audio.data()) << " (1 MB), particles @ 0x"
+                  << reinterpret_cast<uintptr_t>(particles.data()) << std::dec << std::endl;
+
+        uint32_t tick = 0;
+        while (g_running) {
+            ++tick;
+            g_frame_counter = g_frame_counter + 1;
+            for (size_t i = 0; i < 4096; ++i) {
+                g_animation[i] = static_cast<float>((i * 31 + tick * 7) % 1000) * 0.001f;
+            }
+            for (auto& p : particles) {
+                p.x += p.vx;
+                p.y += p.vy;
+            }
+            for (size_t i = 0; i < audio.size(); ++i) {
+                audio[i] = static_cast<int16_t>((i * 13 + tick * 101) & 0x7FFF);
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+    });
+}
+
+int main(int argc, char** argv) {
+    const bool noise_mode = (argc > 1 && std::string(argv[1]) == "--noise");
     uint32_t pid = 0;
 #ifdef _WIN32
     pid = static_cast<uint32_t>(GetCurrentProcessId());
@@ -122,6 +158,8 @@ int main() {
     g_pointer_base = l1;
 
     print_addresses(pid);
+    std::thread noise_thread;
+    if (noise_mode) noise_thread = start_noise_thread();
 
     // Background thread for optional auto-decay (simulate real-time gameplay changes)
     std::thread decay_thread([]() {
@@ -176,6 +214,9 @@ int main() {
     g_running = false;
     if (decay_thread.joinable()) {
         decay_thread.join();
+    }
+    if (noise_thread.joinable()) {
+        noise_thread.join();
     }
 
     delete l1;

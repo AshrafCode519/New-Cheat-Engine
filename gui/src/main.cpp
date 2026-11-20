@@ -214,6 +214,10 @@ struct App {
     int ptr_add_type = kDefaultType;
     std::vector<scanner::PointerPath> pointer_paths;
 
+    // Addresses that change on their own, learned for a few seconds after attaching; every scan ignores them
+    std::shared_ptr<scanner::NoiseMap> noise;
+    bool track_pending = false; // --track: start once the noise is learned
+
     std::atomic<bool> freeze_running{true};
 };
 
@@ -317,6 +321,27 @@ void refresh_processes(App& app) {
     app.selected_process = -1;
 }
 
+std::string describe_noise(const App& app) {
+    if (!app.noise || app.noise->empty()) return "none known";
+    std::string text = std::to_string(app.noise->noisy_slots()) + " addresses ignored";
+    if (app.noise->skipped_bytes() > 0) {
+        text += ", " + std::to_string(app.noise->skipped_bytes() / 1024) + " KB skipped";
+    }
+    return text;
+}
+
+void learn_noise(App& app) {
+    start_job(app, "Learning noise (leave the target alone)", [&app]() -> ApplyResult {
+        auto noise = std::make_shared<scanner::NoiseMap>();
+        noise->learn(*app.process);
+        return [&app, noise]() {
+            app.noise = noise;
+            app.scanner->set_noise_map(noise);
+            app.status = "Noise: " + describe_noise(app) + ".";
+        };
+    });
+}
+
 void attach(App& app, const hal::ProcessInfo& info) {
     bool ok = false;
     {
@@ -335,10 +360,12 @@ void attach(App& app, const hal::ProcessInfo& info) {
     app.track_stage = App::TrackStage::Off;
     app.track_best.clear();
     app.scanner = ok ? std::make_unique<scanner::MemoryScanner>(app.process) : nullptr;
+    app.noise.reset(); // learned for the previous process
     if (ok) {
         app.attached_label = info.name + " (PID " + std::to_string(info.pid) + ", " +
                              std::to_string(app.process->pointer_size() * 8) + "-bit)";
         app.status = "Attached to " + app.attached_label + ".";
+        learn_noise(app);
     } else {
         app.attached_label.clear();
         app.status = "Could not attach to " + info.name + ". Try running as Administrator.";
@@ -507,6 +534,7 @@ void start_tracking(App& app) {
     auto types = app.track_auto_type ? scanner::ValueTracker::auto_types()
                                      : std::vector<scanner::DataType>{type_at(app.type_index)};
     app.tracker = std::make_unique<scanner::ValueTracker>(app.process, std::move(types));
+    app.tracker->set_noise_map(app.noise);
     app.track_best.clear();
     app.track_stop_requested = false;
     start_job(app, "Snapshot", [&app]() -> ApplyResult {
@@ -547,6 +575,11 @@ void stop_tracking(App& app) {
 
 // Every frame: while the user leaves the value alone, keep watching for values that change on their own
 void tick_tracking(App& app) {
+    if (app.track_pending && !job_running(app)) {
+        app.track_pending = false;
+        start_tracking(app);
+        return;
+    }
     if (app.track_stage == App::TrackStage::Off || job_running(app)) return;
     if (app.track_stop_requested) {
         stop_tracking(app);
@@ -665,6 +698,20 @@ void draw_scan_controls(App& app) {
     ImGui::SameLine();
     ImGui::BeginDisabled(app.history.empty());
     if (ImGui::Button("Undo")) undo(app);
+    ImGui::EndDisabled();
+
+    // Noise: learned after attaching; relearn while leaving the target alone, or stop ignoring it
+    ImGui::AlignTextToFramePadding();
+    ImGui::TextDisabled("Noise: %s", describe_noise(app).c_str());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Relearn")) learn_noise(app);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!app.noise);
+    if (ImGui::SmallButton("Clear")) {
+        app.noise.reset();
+        app.scanner->set_noise_map(nullptr);
+        app.status = "Noise cleared: scans look at every address again.";
+    }
     ImGui::EndDisabled();
 
     ImGui::EndDisabled();
@@ -1101,11 +1148,11 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
     if (!options.track.empty() && is_attached(app)) {
         if (options.track == "auto") {
             app.track_auto_type = true;
-            start_tracking(app);
+            app.track_pending = true;
         } else if (auto type = utils::parse_data_type(options.track); type && is_numeric(*type)) {
             app.type_index = type_index_of(*type);
             app.track_auto_type = false;
-            start_tracking(app);
+            app.track_pending = true;
         }
     }
 }
@@ -1250,7 +1297,8 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         g_device_context->ClearRenderTargetView(g_render_target, clear_color);
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
-        if (screenshot_mode && ++frame == SCREENSHOT_FRAME) {
+        // Capture once the startup work (attach, noise learning, --track snapshot) has finished
+        if (screenshot_mode && ++frame >= SCREENSHOT_FRAME && !job_running(app) && !app.track_pending) {
             exit_code = save_back_buffer(options.screenshot) ? 0 : 1;
             done = true;
         }

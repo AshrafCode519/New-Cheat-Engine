@@ -3,6 +3,7 @@
 #include "../hal/process.hpp"
 #include "scan_types.hpp"
 #include "scan_results.hpp"
+#include "noise_map.hpp"
 #include <memory>
 #include <optional>
 #include <string>
@@ -52,6 +53,9 @@ public:
     ValueTracker(std::shared_ptr<hal::IProcess> process, DataType type, size_t list_threshold = 2'000'000);
     ValueTracker(std::shared_ptr<hal::IProcess> process, std::vector<DataType> types, size_t list_threshold = 2'000'000);
     ~ValueTracker();
+
+    // Addresses known to change on their own are never candidates (call before start)
+    void set_noise_map(std::shared_ptr<const NoiseMap> noise) { m_noise = std::move(noise); }
 
     // Snapshot of every slot in the matching regions. Numeric types only.
     void start(uint32_t region_filter = hal::FilterFlags::DefaultScanFilter);
@@ -109,6 +113,7 @@ private:
     [[nodiscard]] std::vector<size_t> ranked_order() const; // candidate indices, best first
 
     std::shared_ptr<hal::IProcess> m_process;
+    std::shared_ptr<const NoiseMap> m_noise;
     std::vector<DataType> m_types;
     std::vector<size_t> m_sizes;
     size_t m_list_threshold;

@@ -107,8 +107,11 @@ void ValueTracker::start(uint32_t region_filter) {
     m_snapshot_phase = true;
     m_events = 0;
 
-    // One copy of memory for every type; each type gets its own candidate bitmaps
+    // One copy of memory for every type; each type gets its own candidate bitmaps.
+    // Known noise: the scanner skips whole noisy blocks, and noisy slots are cleared here per type.
     MemoryScanner scanner(m_process);
+    scanner.set_noise_map(m_noise);
+    const bool use_noise = m_noise && !m_noise->empty();
     auto snapshot = scanner.first_scan_unknown(m_types.front(), m_sizes.front(), region_filter);
     m_blocks.reserve(snapshot.blocks.size());
     for (auto& b : snapshot.blocks) {
@@ -116,8 +119,13 @@ void ValueTracker::start(uint32_t region_filter) {
         block.base_address = b.base_address;
         block.bytes = std::move(b.bytes);
         for (size_t lane = 0; lane < m_types.size(); ++lane) {
-            block.alive.push_back(all_slots(block.bytes.size(), m_sizes[lane]));
-            block.struck.emplace_back(block.alive.back().size(), 0);
+            auto alive = all_slots(block.bytes.size(), m_sizes[lane]);
+            if (use_noise) {
+                const auto noisy = m_noise->mask(block.base_address, block.bytes.size(), m_sizes[lane]);
+                for (size_t w = 0; w < alive.size(); ++w) alive[w] &= ~noisy[w];
+            }
+            block.struck.emplace_back(alive.size(), 0);
+            block.alive.push_back(std::move(alive));
         }
         m_blocks.push_back(std::move(block));
     }
