@@ -171,3 +171,18 @@ TEST_CASE("the memory view copes with unreadable memory and the start of the add
     CHECK(v.refreshes() == 1);
     CHECK(v.slots()[0].value_text() == "100");
 }
+
+TEST_CASE("review: on a 32-bit target doubles and 64-bit integers are found too") {
+    ViewFixture f;
+    f.process->set_pointer_size(4);
+    f.process->put<double>(0x2040, 100.0);
+    view::MemoryView v;
+    v.set_address(kBase + 0x2018, 0, 12);
+    v.refresh(*f.process, f.modules);
+    auto at = [&](size_t offset) -> const view::Slot& { return v.slots()[(offset - 0x2018) / 4]; };
+    CHECK(at(0x2018).guess == Guess::Double); // 12.3456
+    CHECK(at(0x2020).guess == Guess::Int64);  // 5000000000
+    CHECK(at(0x2040).guess == Guess::Double);
+    CHECK(at(0x2040).value_text() == "100");
+    CHECK(at(0x2044).guess == Guess::Continued);
+}

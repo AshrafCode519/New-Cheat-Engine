@@ -216,12 +216,10 @@ void MemoryView::refresh(const hal::IProcess& process, const std::vector<hal::Mo
     for (size_t i = 0; i < n; ++i) {
         auto& s = m_slots[i];
         if (!s.readable) continue;
-        if (pointer_size == 4) {
-            if (user_address(s.raw, 4) && readable_at(process, s.raw)) {
-                s.guess = Guess::Pointer;
-                s.wide = s.raw;
-                s.target = pointer_target(s.raw, modules);
-            }
+        if (pointer_size == 4 && user_address(s.raw, 4) && readable_at(process, s.raw)) {
+            s.guess = Guess::Pointer; // on a 32-bit target any 4-aligned slot can hold one
+            s.wide = s.raw;
+            s.target = pointer_target(s.raw, modules);
             continue;
         }
         if (s.address % 8 != 0 || i + 1 >= n || !m_slots[i + 1].readable) continue;
@@ -230,7 +228,7 @@ void MemoryView::refresh(const hal::IProcess& process, const std::vector<hal::Mo
         const uint64_t wide = s.raw | (static_cast<uint64_t>(high.raw) << 32);
         const bool low_alone_odd = s.guess == Guess::Zero || s.guess == Guess::Other;
         Guess whole = Guess::Unreadable;
-        if (user_address(wide, 8) && readable_at(process, wide)) {
+        if (pointer_size == 8 && user_address(wide, 8) && readable_at(process, wide)) {
             whole = Guess::Pointer;
         } else if (low_alone_odd && high.guess != Guess::Int && high.guess != Guess::Zero && plausible_double(wide)) {
             whole = Guess::Double;

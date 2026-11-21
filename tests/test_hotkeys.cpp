@@ -282,3 +282,55 @@ TEST_CASE("a table hotkey registered with Windows changes the value when pressed
     REQUIRE(s.table().remove(0).ok); // its hotkey goes with it
     CHECK_FALSE(hotkeys->deliver("Ctrl+Alt+Shift+F24"));
 }
+
+TEST_CASE("review: a huge F number is no key (it used to throw), in a combo or a table file") {
+    std::string why;
+    CHECK_FALSE(hal::parse_hotkey("F99999999999", &why));
+    CHECK(why.find("not a key") != std::string::npos);
+    CHECK_FALSE(hal::parse_hotkey("Ctrl+F100"));
+    CHECK(hal::normalize_hotkey("F09") == "F9");
+
+    table::CheatTable t;
+    t.entries.push_back(table::make_entry(kBase + 0x200, DataType::Int32, {}, "Gold"));
+    t.entries[0].hotkeys.push_back({"F1", Action::ToggleFreeze, ""});
+    auto text = table::to_json(t);
+    text.replace(text.find("\"F1\""), 4, "\"F99999999999\"");
+    CHECK_FALSE(table::from_json(text));
+}
+
+TEST_CASE("review: adding to 64-bit integers is exact and stops at the type's limits") {
+    HotkeyFixture f;
+    auto& table = f.s->table();
+    f.process->put<int64_t>(0x400, 9007199254740993LL); // 2^53 + 1: a double can't hold it
+    f.process->put<uint64_t>(0x408, UINT64_MAX - 1);
+    f.process->put<int64_t>(0x410, INT64_MIN + 5);
+    REQUIRE(table.add_address(kBase + 0x400, DataType::Int64, "Big").ok);
+    REQUIRE(table.add_address(kBase + 0x408, DataType::UInt64, "Huge").ok);
+    REQUIRE(table.add_address(kBase + 0x410, DataType::Int64, "Low").ok);
+    REQUIRE(table.add_hotkey(3, "F13", Action::Add, "1").ok);
+    REQUIRE(table.add_hotkey(4, "F14", Action::Add, "10").ok);
+    REQUIRE(table.add_hotkey(5, "F15", Action::Add, "-10").ok);
+    REQUIRE(table.add_hotkey(3, "F16", Action::Add, "1e30").ok);
+
+    CHECK(table.press("F13").message == "Big: 9007199254740993 -> 9007199254740994");
+    CHECK(value_at<int64_t>(*f.s, *f.process, 0x400) == 9007199254740994LL);
+    CHECK(table.press("F14").ok);
+    CHECK(value_at<uint64_t>(*f.s, *f.process, 0x408) == UINT64_MAX);
+    CHECK(table.press("F15").ok);
+    CHECK(value_at<int64_t>(*f.s, *f.process, 0x410) == INT64_MIN);
+    const auto huge = table.press("F16");
+    CHECK_FALSE(huge.ok);
+    CHECK(value_at<int64_t>(*f.s, *f.process, 0x400) == 9007199254740994LL); // nothing written
+}
+
+TEST_CASE("review: a toggle unfreezes even without the game") {
+    HotkeyFixture f;
+    auto& table = f.s->table();
+    REQUIRE(table.add_hotkey(0, "F1", Action::ToggleFreeze, "").ok);
+    REQUIRE(table.press("F1").ok); // frozen at 100
+    f.s->detach();
+    const auto unfrozen = table.press("F1");
+    CHECK(unfrozen.ok);
+    CHECK(unfrozen.message == "Health: unfrozen");
+    CHECK_FALSE(table.press("F1").ok); // freezing again does need the game
+}

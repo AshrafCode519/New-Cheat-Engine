@@ -44,6 +44,16 @@ std::string summary(const table::CheatTable& t) {
     return text;
 }
 
+// Keeps <file>.bak as a copy of the file. The old copy is removed first: MinGW's copy_file fails when the
+// target exists, even with overwrite_existing.
+bool keep_copy(const std::filesystem::path& file) {
+    const std::filesystem::path copy = file.string() + ".bak";
+    std::error_code ec;
+    std::filesystem::remove(copy, ec);
+    std::filesystem::copy_file(file, copy, ec);
+    return !ec;
+}
+
 bool write_text(const std::filesystem::path& file, const std::string& text) {
     std::error_code ec;
     std::filesystem::create_directories(file.parent_path(), ec);
@@ -58,19 +68,20 @@ bool write_text(const std::filesystem::path& file, const std::string& text) {
 
 TableKeeper::TableKeeper(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IHotkeys> hotkeys)
     : m_process(std::move(process))
-    , m_freeze_thread([this] { freeze_loop(); })
     , m_hotkeys(std::move(hotkeys))
 {
-    if (!m_hotkeys) return;
-    m_hotkeys->on_press([this](const std::string& combo) {
-        const Outcome outcome = press(combo);
-        std::function<void(const std::string&, const Outcome&)> listener;
-        {
-            std::lock_guard<std::mutex> lock(m_listener_mutex);
-            listener = m_listener;
-        }
-        if (listener) listener(combo, outcome);
-    });
+    if (m_hotkeys) {
+        m_hotkeys->on_press([this](const std::string& combo) {
+            const Outcome outcome = press(combo);
+            std::function<void(const std::string&, const Outcome&)> listener;
+            {
+                std::lock_guard<std::mutex> lock(m_listener_mutex);
+                listener = m_listener;
+            }
+            if (listener) listener(combo, outcome);
+        });
+    }
+    m_freeze_thread = std::thread([this] { freeze_loop(); });
 }
 
 TableKeeper::~TableKeeper() {
@@ -114,6 +125,8 @@ TableKeeper::AttachResult TableKeeper::attach(uint32_t pid) {
                 ++result.unfrozen;
             }
         }
+        // Permanent entries find their value now, before the freeze thread writes through last run's path
+        if (result.attached) result.reconciled = reconcile_locked();
     }
     if (table_changed) rebind(); // the hotkeys of the table now open
     return result;
@@ -135,10 +148,16 @@ std::string TableKeeper::switch_table_locked(const std::string& program, bool& c
     if (owner.empty()) {
         if (!m_table.entries.empty() || !in_library) {
             m_table.process_name = program;
-            return {};
+            m_saved_text.clear(); // the first save keeps the library's own table as .bak
+            return in_library ? "This table is " + program + "'s now; the library's earlier table of it will be kept as " +
+                                    library_file_locked(program).filename().string() + ".bak."
+                              : std::string();
         }
     } else if (!m_table.entries.empty()) {
         const auto saved_to = library_file_locked(owner);
+        if (m_saved_text.empty() && std::filesystem::exists(saved_to, ec)) { // not opened from there: keep that one
+            keep_copy(saved_to);
+        }
         note = write_text(saved_to, table::to_json(m_table))
             ? "Kept the table of " + owner + " (" + summary(m_table) + ") in the library. "
             : "Could not save the table of " + owner + " to " + saved_to.string() + "! ";
@@ -168,6 +187,10 @@ void TableKeeper::detach() {
 
 std::vector<TableKeeper::ReconcileLine> TableKeeper::reconcile() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    return reconcile_locked();
+}
+
+std::vector<TableKeeper::ReconcileLine> TableKeeper::reconcile_locked() {
     std::vector<ReconcileLine> lines;
     if (!m_process->is_attached()) return lines;
     for (size_t i = 0; i < m_table.entries.size(); ++i) {
@@ -269,13 +292,18 @@ Outcome TableKeeper::save(const std::string& path) {
     return Outcome::success("Saved " + std::to_string(m_table.entries.size()) + " entries to " + path + ".");
 }
 
-Outcome TableKeeper::load(const std::string& path) {
+Outcome TableKeeper::load(const std::string& path, std::vector<ReconcileLine>* reconciled) {
     auto loaded = table::load_table(path);
     if (!loaded) return Outcome::fail("Could not read a table from " + path + ".");
     std::string message;
     {
+        std::lock_guard<std::mutex> saving(m_save_mutex);
+        autosave_saving(false); // the open table's latest changes
         std::lock_guard<std::mutex> lock(m_mutex);
         m_table = std::move(*loaded);
+        m_saved_text.clear(); // not from the library: the first save keeps the library's own table as .bak
+        const std::string program = m_process->is_attached() ? m_process->name() : std::string();
+        if (!m_library.empty() && !program.empty()) m_table.process_name = program;
         size_t frozen = 0;
         size_t hotkeys = 0;
         for (const auto& e : m_table.entries) {
@@ -286,6 +314,8 @@ Outcome TableKeeper::load(const std::string& path) {
         if (frozen) message += ", " + std::to_string(frozen) + " frozen";
         if (hotkeys) message += ", " + std::to_string(hotkeys) + " hotkeys";
         message += ".";
+        auto lines = m_process->is_attached() ? reconcile_locked() : std::vector<ReconcileLine>{};
+        if (reconciled) *reconciled = std::move(lines);
     }
     rebind();
     return Outcome::success(message);
@@ -361,9 +391,28 @@ std::optional<std::string> add_amount(const scanner::ScanValue& current, const s
         if constexpr (std::is_floating_point_v<T>) {
             sum = static_cast<T>(value + *amount);
         } else {
-            const long double total = static_cast<long double>(value) + static_cast<long double>(std::llround(*amount));
-            sum = static_cast<T>(std::clamp(total, static_cast<long double>(std::numeric_limits<T>::lowest()),
-                                            static_cast<long double>(std::numeric_limits<T>::max())));
+            // Exact integer arithmetic that stops at the type's limits (a double can't hold every 64-bit value)
+            if (!(std::fabs(*amount) < 9.0e18)) return;
+            const long long delta = std::llround(*amount);
+            if constexpr (std::is_signed_v<T>) {
+                long long total = 0;
+                if (__builtin_add_overflow(static_cast<long long>(value), delta, &total)) {
+                    total = delta > 0 ? std::numeric_limits<long long>::max() : std::numeric_limits<long long>::min();
+                }
+                sum = static_cast<T>(std::clamp<long long>(total, std::numeric_limits<T>::lowest(), std::numeric_limits<T>::max()));
+            } else {
+                const unsigned long long v = value;
+                unsigned long long total = 0;
+                if (delta >= 0) {
+                    if (__builtin_add_overflow(v, static_cast<unsigned long long>(delta), &total)) {
+                        total = std::numeric_limits<unsigned long long>::max();
+                    }
+                } else {
+                    const unsigned long long down = 0ULL - static_cast<unsigned long long>(delta);
+                    total = v < down ? 0 : v - down;
+                }
+                sum = static_cast<T>(std::min<unsigned long long>(total, std::numeric_limits<T>::max()));
+            }
         }
         char text[64];
         const auto [end, ec] = std::to_chars(text, text + sizeof text, sum);
@@ -453,13 +502,13 @@ Outcome TableKeeper::press(const std::string& keys) {
 
 Outcome TableKeeper::apply_hotkey(table::TableEntry& e, const table::Hotkey& h) {
     using Action = table::Hotkey::Action;
+    if (h.action == Action::ToggleFreeze && e.frozen_value) { // unfreezing needs no game
+        e.frozen_value.reset();
+        return Outcome::success("unfrozen");
+    }
     if (!m_process->is_attached()) return Outcome::fail("not attached to the game");
 
     if (h.action == Action::ToggleFreeze) {
-        if (e.frozen_value) {
-            e.frozen_value.reset();
-            return Outcome::success("unfrozen");
-        }
         const auto current = table::read_entry(e, *m_process, m_modules);
         if (!current) return Outcome::fail("can't read it to freeze it");
         e.frozen_value = value_text(*current);
@@ -540,8 +589,13 @@ Outcome TableKeeper::save_to_library() {
 // file: attaching to a program and adding nothing leaves nothing behind.
 Outcome TableKeeper::autosave(bool force) {
     std::lock_guard<std::mutex> saving(m_save_mutex);
+    return autosave_saving(force);
+}
+
+Outcome TableKeeper::autosave_saving(bool force) {
     std::filesystem::path file;
     std::string text;
+    bool keep_old = false; // the file holds a table this run never opened from the library
     {
         std::lock_guard<std::mutex> lock(m_mutex);
         file = library_file_locked(m_table.process_name);
@@ -552,7 +606,12 @@ Outcome TableKeeper::autosave(bool force) {
         text = table::to_json(m_table);
         if (!force && text == m_saved_text) return Outcome::success();
         std::error_code ec;
-        if (m_table.entries.empty() && !std::filesystem::exists(file, ec)) return Outcome::fail("The table is empty.");
+        const bool exists = std::filesystem::exists(file, ec);
+        if (m_table.entries.empty() && !exists) return Outcome::fail("The table is empty.");
+        keep_old = exists && m_saved_text.empty();
+    }
+    if (keep_old && !keep_copy(file)) {
+        return Outcome::fail("Could not keep a copy of " + file.string() + "; nothing was written over it.");
     }
     if (!write_text(file, text)) return Outcome::fail("Could not write " + file.string() + ".");
     std::lock_guard<std::mutex> lock(m_mutex);
@@ -625,7 +684,7 @@ Session::AttachReport Session::attach(uint32_t pid) {
     m_scanner = std::make_shared<scanner::MemoryScanner>(m_process);
     m_scans.set_scanner(m_scanner, m_process);
     report.read_only = !m_process->can_write();
-    report.reconciled = m_table->reconcile();
+    report.reconciled = attached.reconciled;
     return report;
 }
 

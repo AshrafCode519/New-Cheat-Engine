@@ -847,7 +847,8 @@ void cmd_library(const std::string& argument) {
 }
 
 void cmd_table_load(const std::string& path) {
-    if (report(ses().table().load(path))) print_reconciled(ses().table().reconcile());
+    std::vector<session::TableKeeper::ReconcileLine> reconciled;
+    if (report(ses().table().load(path, &reconciled))) print_reconciled(reconciled);
 }
 
 // tperm <#>: turns an entry into pointer paths that survive restarts
@@ -1196,7 +1197,7 @@ bool handle_command(const std::string& line) {
     } else if (cmd == "thotkey") {
         std::string index, keys, action, value;
         if (iss >> index >> keys >> action) {
-            iss >> value;
+            std::getline(iss >> std::ws, value);
             cmd_table_hotkey(index, keys, action, value);
         } else {
             std::cout << "Usage: thotkey <#> <keys> toggle | set <value> | add <amount> | remove\n";

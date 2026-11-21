@@ -530,6 +530,7 @@ void stop_tracking(App& app) {
     app.track_best.clear();
     app.track_stop_requested = false;
     unregister_hotkeys();
+    app.session.table().refresh_hotkeys(); // table keys smart track was holding can fire again
 }
 
 // Hotkeys pressed while the game was in front: Num0 "I'll change it", then Num- / Num+ / Num* once changed
@@ -892,7 +893,6 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
 
 void draw_cheat_table(App& app) {
     auto& keeper = app.session.table();
-    const bool attached = is_attached(app);
 
     ImGui::SetNextItemWidth(-em(8));
     ImGui::InputTextWithHint("##table_path", "table.json", &app.table_path);
@@ -900,11 +900,12 @@ void draw_cheat_table(App& app) {
     if (ImGui::Button("Save")) show(app, keeper.save(app.table_path));
     ImGui::SameLine();
     if (ImGui::Button("Load")) {
-        const auto loaded = keeper.load(app.table_path);
+        std::vector<session::TableKeeper::ReconcileLine> reconciled;
+        const auto loaded = keeper.load(app.table_path, &reconciled);
         show(app, loaded);
         if (loaded.ok) {
             app.editing_row = -1;
-            app.table_note = attached ? describe_reconciled(keeper.reconcile()) : std::string();
+            app.table_note = describe_reconciled(reconciled);
         }
     }
     // Where the table lives between runs (the file above is for sharing or keeping a copy)
@@ -1458,9 +1459,10 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
     }
     if (!options.table.empty()) {
         app.table_path = options.table;
-        const auto loaded = app.session.table().load(options.table);
+        std::vector<session::TableKeeper::ReconcileLine> reconciled;
+        const auto loaded = app.session.table().load(options.table, &reconciled);
         if (!loaded.ok) app.status = loaded.message;
-        else if (is_attached(app)) app.table_note = describe_reconciled(app.session.table().reconcile());
+        else app.table_note = describe_reconciled(reconciled);
     }
     if (!options.view.empty() && is_attached(app)) open_memory(app, utils::parse_address(options.view), false);
     if (options.tab == "pointers") app.select_tab = Tab::PointerScanner;

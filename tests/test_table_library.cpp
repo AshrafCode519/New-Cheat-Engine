@@ -1,3 +1,4 @@
+#include <cstdint>
 #include <doctest/doctest.h>
 #include "test_helpers.hpp"
 #include "session/session.hpp"
@@ -144,4 +145,95 @@ TEST_CASE("a table made before attaching is adopted, and without a library the t
 
     CHECK_FALSE(session::default_library_folder().empty());
     CHECK(session::default_library_folder().filename() == "tables");
+}
+
+TEST_CASE("review: a table from elsewhere never silently replaces the library's table") {
+    LibraryFixture f;
+    {
+        auto s = f.session();
+        REQUIRE(s->attach(1).ok);
+        REQUIRE(s->table().add_address(kBase + 0x200, DataType::Int32, "Saved").ok);
+        REQUIRE(s->table().save_to_library().ok);
+    }
+
+    // A table naming no program, loaded before attaching, is adopted: the library's one is kept as .bak
+    table::CheatTable shared;
+    shared.entries.push_back(table::make_entry(kBase + 0x300, DataType::Int32, {}, "Shared"));
+    const auto file = (fs::temp_directory_path() / "nce_library_shared.json").string();
+    REQUIRE(table::save_table(file, shared));
+    {
+        auto s = f.session();
+        f.process->detach(); // not attached yet
+        REQUIRE(s->table().load(file).ok);
+        const auto attached = s->attach(1);
+        CHECK(attached.table_note == "This table is game.exe's now; the library's earlier table of it will be kept as "
+                                     "game.exe.json.bak.");
+        REQUIRE(s->table().save_to_library().ok);
+        const auto kept = table::load_table((f.folder / "game.exe.json.bak").string());
+        REQUIRE(kept);
+        CHECK(kept->entries.at(0).description == "Saved");
+
+        // tload while attached: the open table's latest changes are saved first, and kept as .bak
+        REQUIRE(s->table().add_address(kBase + 0x204, DataType::Int32, "Unsaved").ok);
+        REQUIRE(s->table().load(file).ok);
+        CHECK(s->table().library_file() == f.folder / "game.exe.json"); // the loaded table is the attached program's
+        const auto second = s->table().save_to_library();
+        INFO(second.message);
+        REQUIRE(second.ok);
+        const auto before = table::load_table((f.folder / "game.exe.json.bak").string());
+        REQUIRE(before);
+        REQUIRE(before->entries.size() == 2);
+        CHECK(before->entries[1].description == "Unsaved");
+    }
+    fs::remove(file);
+}
+
+TEST_CASE("review: a frozen permanent entry is found before the freeze thread writes it") {
+    // [game.exe + 0x100] -> A, [A + 8] -> B, value at B + 0x10 between 0x1111 and 0x2222
+    LibraryFixture f;
+    uintptr_t b = kBase + 0x6000;
+    auto write_struct = [&](uintptr_t at) {
+        f.process->put<uint32_t>(at - kBase + 0x0C, 0x1111);
+        f.process->put<int32_t>(at - kBase + 0x10, 1337);
+        f.process->put<uint32_t>(at - kBase + 0x14, 0x2222);
+    };
+    f.process->put_pointer(0x100, kBase + 0x4000);
+    f.process->put_pointer(0x180, kBase + 0x4000);
+    f.process->put_pointer(0x4008, b);
+    write_struct(b);
+    {
+        auto s = f.session();
+        REQUIRE(s->attach(1).ok);
+        REQUIRE(s->table().add_address(b + 0x10, DataType::Int32, "Score").ok);
+        const auto entry = s->table().entry(0);
+        REQUIRE(s->table().make_permanent(0, *entry, s->find_permanent_paths(*entry)).ok);
+        REQUIRE(s->table().freeze(0, "4242").ok);
+        s->detach(); // the game exits; the table goes to the library when the session ends
+    }
+
+    // The next run: the object moved, and its old place holds something else that last run's path still reaches
+    const uintptr_t old = b;
+    b += 0x2000;
+    f.process->put_pointer(0x4008, b);
+    write_struct(b);
+    f.process->put<int32_t>(old - kBase + 0x10, 2228282);
+    f.process->put_pointer(0x100, old - 0x8); // the first-ranked path now leads to the old place
+
+    auto s = f.session();
+    const auto attached = s->attach(2);
+    REQUIRE(attached.reconciled.size() == 1);
+    CHECK(attached.reconciled[0].result.address == b + 0x10);
+    CHECK(eventually([&] {
+        return s->table().with([&](const auto&, const auto&) {
+            int32_t v = 0;
+            f.process->read_raw(b + 0x10, &v, sizeof v);
+            return v == 4242;
+        });
+    }));
+    const int32_t at_old_place = s->table().with([&](const auto&, const auto&) {
+        int32_t v = 0;
+        f.process->read_raw(old + 0x10, &v, sizeof v);
+        return v;
+    });
+    CHECK(at_old_place == 2228282); // never written
 }

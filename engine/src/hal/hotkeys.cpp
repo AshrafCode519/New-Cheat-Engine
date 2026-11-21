@@ -20,11 +20,12 @@ std::string canonical_key(const std::string& name) {
     const std::string k = lower(name);
     if (k.size() == 1 && std::isalpha(static_cast<unsigned char>(k[0]))) return std::string(1, static_cast<char>(std::toupper(k[0])));
     if (k.size() == 1 && std::isdigit(static_cast<unsigned char>(k[0]))) return k;
-    if (k.size() >= 2 && k[0] == 'f' && all_digits(k.substr(1))) {
+    if (k.size() >= 2 && k.size() <= 3 && k[0] == 'f' && all_digits(k.substr(1))) { // F1..F24: 1-2 digits
         const int n = std::stoi(k.substr(1));
         if (n >= 1 && n <= 24) return "F" + std::to_string(n);
         return {};
     }
+    if (k.size() > 3 && k[0] == 'f' && all_digits(k.substr(1))) return {};
     for (const char* prefix : {"numpad", "num"}) {
         const std::string p = prefix;
         if (k.size() == p.size() + 1 && k.compare(0, p.size(), p) == 0) {
