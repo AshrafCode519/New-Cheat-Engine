@@ -298,6 +298,10 @@ std::string Session::describe_noise() const {
     return text;
 }
 
+void Session::refresh(view::MemoryView& view) {
+    if (attached()) view.refresh(*m_process, m_table->modules(), m_noise.get());
+}
+
 std::unique_ptr<scanner::ValueTracker> Session::new_tracker(std::vector<scanner::DataType> types) const {
     auto tracker = std::make_unique<scanner::ValueTracker>(m_process, std::move(types));
     tracker->set_noise_map(m_noise);

@@ -12,6 +12,7 @@ add_executable(engine_tests
     test_results_io.cpp
     test_win32_process.cpp
     test_session.cpp
+    test_memory_view.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

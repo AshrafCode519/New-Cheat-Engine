@@ -120,6 +120,9 @@ void print_help() {
               << "  write <addr> <type> <val>       - Write value to memory address\n"
               << "  read <addr> <type>              - Read value from memory address\n"
               << "  dump <addr> [bytes]             - Hex dump memory (default: 64 bytes)\n"
+              << "  view <addr|#result|t#> [before] [after] - The memory around a value, each 4 bytes read as what\n"
+              << "                                    they most likely are (int, float, double, pointer, text).\n"
+              << "                                    'view' again marks what changed (default: 8 slots before, 24 after)\n"
               << "  freeze <addr> <type> <val>      - Add an address to the table, frozen at a value\n"
               << "  frozen                          - List the frozen table entries\n"
               << "  unfreeze [#|all]                - Stop freezing a table entry (default: all)\n\n"
@@ -230,7 +233,13 @@ void print_reconciled(const std::vector<session::TableKeeper::ReconcileLine>& li
     }
 }
 
+// The window of the last 'view' (addresses of the attached process)
+static view::MemoryView g_view;
+static size_t g_view_before = 8;
+static size_t g_view_after = 24;
+
 void cmd_attach(uint32_t pid) {
+    g_view.clear();
     const auto attached = ses().attach(pid);
     if (attached.unfrozen > 0) {
         std::cout << "[*] Unfroze " << attached.unfrozen << " table entr(ies) at heap addresses of the previous process.\n";
@@ -276,6 +285,7 @@ void cmd_reattach(int seconds) {
 }
 
 void cmd_detach() {
+    g_view.clear();
     ses().detach();
     std::cout << "[*] Detached.\n";
 }
@@ -905,6 +915,75 @@ void cmd_dump(const std::string& addr_str, size_t size = 64) {
     }
 }
 
+// view <addr|#result|t#entry> [before] [after]: the memory around a value, like a structure dissector.
+// The same window again (or 'view' alone) reads it again and marks what changed in between.
+void cmd_view(const std::string& where, std::optional<size_t> before, std::optional<size_t> after) {
+    if (!require_attached()) return;
+
+    std::optional<uintptr_t> address;
+    if (where.empty()) {
+        if (g_view.empty()) {
+            std::cout << "Usage: view <addr|#result|t#> [slots before] [slots after]\n";
+            return;
+        }
+        address = g_view.address();
+    } else if (where[0] == '#') {
+        const auto& results = ses().scans().state().results;
+        auto index = parse_index(where.substr(1), results.count(), "result");
+        if (!index) return;
+        address = results.address(*index);
+    } else if (where[0] == 't' || where[0] == 'T') {
+        auto index = parse_table_index(where.substr(1));
+        if (!index) return;
+        address = ses().table().with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules) {
+            return t.entries[*index].address(ses().process(), modules);
+        });
+        if (*address == 0) {
+            std::cerr << "[-] Table entry #" << *index << " doesn't lead to an address in this process.\n";
+            return;
+        }
+    } else {
+        address = parse_address_arg(where);
+        if (!address) return;
+    }
+
+    const size_t want_before = std::min<size_t>(before.value_or(g_view_before), 256);
+    const size_t want_after = std::clamp<size_t>(after.value_or(g_view_after), 1, 1024);
+    if (*address != g_view.address() || want_before != g_view_before || want_after != g_view_after) {
+        g_view_before = want_before;
+        g_view_after = want_after;
+        g_view.set_address(*address, g_view_before, g_view_after);
+    }
+    ses().refresh(g_view);
+    const bool again = g_view.refreshes() > 1;
+
+    std::cout << "\n  Offset  Address             Bytes        Type  Value\n";
+    std::cout << "------------------------------------------------------------------------------------\n";
+    const auto& slots = g_view.slots();
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const auto& s = slots[i];
+        std::string value = s.value_text();
+        if (s.guess == view::Guess::Pointer && s.target != utils::format_address(static_cast<uintptr_t>(s.wide))) {
+            value += " (" + utils::format_address(static_cast<uintptr_t>(s.wide)) + ")";
+        }
+        std::cout << (i == g_view.focus() ? ">" : " ") << std::right << std::setw(7) << view::format_offset(s.offset) << "  "
+                  << utils::format_address(s.address) << "  " << s.bytes_text() << "  " << std::left << std::setw(4)
+                  << s.type_name() << "  " << value;
+        const size_t changes = std::max(s.changes, i + 1 < slots.size() && slots[i + 1].guess == view::Guess::Continued
+                                                       ? slots[i + 1].changes : size_t{0});
+        if (s.noisy) {
+            std::cout << "   (changes on its own)"; // a '*' on every view would only hide the real changes
+        } else {
+            if (again && g_view.value_age(i) == 0) std::cout << "   * changed";
+            if (changes > 1) std::cout << " (" << changes << "x)";
+        }
+        std::cout << std::right << "\n";
+    }
+    std::cout << "------------------------------------------------------------------------------------\n";
+    std::cout << (again ? " '*': changed since the last 'view'." : " Change something in the target, then 'view' again to see what changed.")
+              << " 'add <addr> <type>' puts a value in the table.\n\n";
+}
+
 // Runs one command line. Returns false when the user asked to quit.
 bool handle_command(const std::string& line) {
     std::istringstream iss(line);
@@ -1102,6 +1181,14 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: dump <addr> [size]\n";
         }
+    } else if (cmd == "view") {
+        std::string where;
+        std::optional<size_t> before, after;
+        size_t number = 0;
+        iss >> where;
+        if (iss >> number) before = number;
+        if (iss >> number) after = number;
+        cmd_view(where, before, after);
     } else {
         std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";
     }

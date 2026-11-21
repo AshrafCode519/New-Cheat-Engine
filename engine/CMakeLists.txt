@@ -14,6 +14,7 @@ add_library(engine STATIC
     src/table/cheat_table.cpp
     src/session/scan_session.cpp
     src/session/session.cpp
+    src/view/memory_view.cpp
 )
 
 target_include_directories(engine PUBLIC

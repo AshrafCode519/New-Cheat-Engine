@@ -6,6 +6,7 @@
 #include "../scanner/pointer_scanner.hpp"
 #include "../scanner/value_tracker.hpp"
 #include "../table/cheat_table.hpp"
+#include "../view/memory_view.hpp"
 #include <atomic>
 #include <memory>
 #include <mutex>
@@ -108,6 +109,9 @@ public:
     void set_noise(std::shared_ptr<scanner::NoiseMap> noise); // nullptr: stop ignoring noise
     [[nodiscard]] std::string describe_noise() const;
     [[nodiscard]] const std::shared_ptr<scanner::NoiseMap>& noise() const { return m_noise; }
+
+    // Reads the view again, with the target's modules and noise (keeps the last values when not attached)
+    void refresh(view::MemoryView& view);
 
     [[nodiscard]] std::unique_ptr<scanner::ValueTracker> new_tracker(std::vector<scanner::DataType> types) const;
     [[nodiscard]] std::vector<scanner::PointerPath> find_permanent_paths(const table::TableEntry& entry);

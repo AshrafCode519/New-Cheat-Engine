@@ -215,6 +215,14 @@ struct App {
     std::string ptr_module;
     int ptr_add_type = kDefaultType;
 
+    // Memory tab: the memory around an address, each 4 bytes read as what they most likely are
+    view::MemoryView memory;
+    std::vector<uintptr_t> memory_back; // where Back returns to after following pointers
+    std::string memory_input;
+    std::chrono::steady_clock::time_point memory_refreshed;
+    bool select_memory_tab = false;     // show the Memory tab on this frame
+    bool memory_scroll = false;         // scroll the opened address into view when its row is drawn
+
     bool track_pending = false; // --track: start once the noise is learned
 
     // When the target exits, wait for the same program to start again and attach to it
@@ -337,6 +345,8 @@ void attach(App& app, const hal::ProcessInfo& info, const std::string& note = ""
     unregister_hotkeys();
     app.track_best.clear();
     app.editing_row = -1;
+    app.memory.clear(); // addresses of the previous process
+    app.memory_back.clear();
 
     const auto report = app.session.attach(info.pid);
     app.table_note = describe_reconciled(report.reconciled);
@@ -428,6 +438,19 @@ void undo(App& app) {
 
 void add_result_to_table(App& app, size_t row) {
     show(app, app.session.table().add_result(app.session.scans().state().results, row, ""));
+}
+
+// Shows the memory around an address in the Memory tab; remember: Back returns to the one shown now.
+// Reads the target's modules under the table lock, so never call it while drawing the table.
+void open_memory(App& app, uintptr_t address, bool remember = true) {
+    if (address == 0) return;
+    if (remember && !app.memory.empty() && app.memory.address() != address) app.memory_back.push_back(app.memory.address());
+    app.memory.set_address(address, 16, 48);
+    app.memory_input = utils::format_address(address);
+    app.session.refresh(app.memory);
+    app.memory_refreshed = std::chrono::steady_clock::now();
+    app.select_memory_tab = true;
+    app.memory_scroll = true;
 }
 
 // ---- Smart track ---------------------------------------------------------------------------------
@@ -715,12 +738,13 @@ void draw_tracking(App& app) {
     ImGui::TableHeadersRow();
 
     std::optional<size_t> add_row;
+    std::optional<size_t> view_row;
     for (size_t i = 0; i < app.track_best.size(); ++i) {
         const auto& c = app.track_best[i];
         ImGui::TableNextRow();
         ImGui::PushID(static_cast<int>(i));
         ImGui::TableNextColumn();
-        ImGui::TextUnformatted(utils::format_address(c.address).c_str());
+        if (ImGui::Selectable(utils::format_address(c.address).c_str())) view_row = i; // the memory around it
         ImGui::TableNextColumn();
         ImGui::TextUnformatted(utils::format_data_type(c.value.type).c_str());
         ImGui::TableNextColumn();
@@ -739,6 +763,7 @@ void draw_tracking(App& app) {
         const auto& c = app.track_best[*add_row];
         show(app, app.session.table().add_address(c.address, c.value.type, ""));
     }
+    if (view_row) open_memory(app, app.track_best[*view_row].address);
 }
 
 void draw_results(App& app) {
@@ -755,7 +780,7 @@ void draw_results(App& app) {
     }
 
     const auto& results = scans.state().results;
-    ImGui::Text("%zu results  (double-click or + to add to the cheat table)", results.count());
+    ImGui::Text("%zu results  (click: the memory around it, double-click or +: add to the cheat table)", results.count());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                   ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
@@ -768,6 +793,7 @@ void draw_results(App& app) {
     ImGui::TableHeadersRow();
 
     std::optional<size_t> add_row;
+    std::optional<size_t> view_row;
     std::vector<uint8_t> live(results.value_size());
     ImGuiListClipper clipper; // only the visible rows are drawn (and read from the target)
     clipper.Begin(static_cast<int>(results.count()));
@@ -779,9 +805,9 @@ void draw_results(App& app) {
 
             ImGui::TableNextColumn();
             const std::string address = utils::format_address(results.address(i));
-            if (ImGui::Selectable(address.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap) &&
-                ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) {
-                add_row = i;
+            if (ImGui::Selectable(address.c_str(), false, ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                if (ImGui::IsMouseDoubleClicked(ImGuiMouseButton_Left)) add_row = i;
+                else view_row = i;
             }
 
             ImGui::TableNextColumn();
@@ -804,13 +830,15 @@ void draw_results(App& app) {
     ImGui::EndTable();
 
     if (add_row) add_result_to_table(app, *add_row);
+    if (view_row) open_memory(app, results.address(*view_row));
 }
 
 // A click in the table, applied once the table lock is released (the operations take the lock themselves)
 struct TableAction {
-    enum class Kind { None, Freeze, Unfreeze, Write, Remove, Keep } kind = Kind::None;
+    enum class Kind { None, Freeze, Unfreeze, Write, Remove, Keep, View } kind = Kind::None;
     size_t row = 0;
-    std::string value;
+    std::string value;    // Write
+    uintptr_t address{0}; // View: where the entry leads now
 };
 
 void apply_table_action(App& app, const TableAction& action) {
@@ -829,6 +857,10 @@ void apply_table_action(App& app, const TableAction& action) {
             app.editing_row = -1;
             break;
         case Kind::Keep: make_entry_permanent(app, action.row); break;
+        case Kind::View:
+            if (action.address) open_memory(app, action.address);
+            else app.status = "This entry doesn't lead to an address in the target now.";
+            break;
     }
 }
 
@@ -881,20 +913,23 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
     ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(13.5f));
     ImGui::TableHeadersRow();
 
     for (size_t i = 0; i < entries.size(); ++i) {
         auto& e = entries[i];
         const auto row = static_cast<int>(i);
         const auto current = attached ? table::read_entry(e, process, modules) : std::nullopt;
+        auto act = [&action, i](Kind kind, std::string value = {}, uintptr_t address = 0) {
+            action = TableAction{kind, i, std::move(value), address};
+        };
 
         ImGui::TableNextRow();
         ImGui::PushID(row);
 
         ImGui::TableNextColumn();
         bool frozen = e.frozen_value.has_value();
-        if (ImGui::Checkbox("##freeze", &frozen)) action = {frozen ? Kind::Freeze : Kind::Unfreeze, i, {}};
+        if (ImGui::Checkbox("##freeze", &frozen)) act(frozen ? Kind::Freeze : Kind::Unfreeze);
 
         ImGui::TableNextColumn();
         ImGui::SetNextItemWidth(-FLT_MIN);
@@ -908,7 +943,7 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
         if (app.editing_row != row) app.edit_buffers[i] = current ? session::value_text(*current) : "??";
         ImGui::SetNextItemWidth(-FLT_MIN);
         if (ImGui::InputText("##value", &app.edit_buffers[i], ImGuiInputTextFlags_EnterReturnsTrue)) {
-            action = {Kind::Write, i, app.edit_buffers[i]};
+            act(Kind::Write, app.edit_buffers[i]);
         }
         if (ImGui::IsItemActive()) app.editing_row = row;
         else if (app.editing_row == row) app.editing_row = -1;
@@ -920,12 +955,15 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
         // Keep: pointer paths that find a heap value again after a restart (static addresses already do)
         const bool is_static = !e.is_absolute() && e.location.offsets.empty();
         ImGui::BeginDisabled(!attached || job_running(app) || is_static || !e.alternatives.empty());
-        if (ImGui::SmallButton(e.alternatives.empty() ? "Keep" : "Kept")) action = {Kind::Keep, i, {}};
+        if (ImGui::SmallButton(e.alternatives.empty() ? "Keep" : "Kept")) act(Kind::Keep);
         ImGui::EndDisabled();
         if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
             ImGui::SetTooltip(is_static ? "A static address: it already survives restarts."
                                         : "Find pointer paths so this value is found again after the game restarts.");
         }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("View")) act(Kind::View, {}, attached ? e.address(process, modules) : 0);
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("The memory around it: neighbouring values of the same object.");
         ImGui::SameLine();
         if (ImGui::SmallButton("Pointers")) {
             const uintptr_t address = attached ? e.address(process, modules) : 0;
@@ -936,7 +974,7 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
             }
         }
         ImGui::SameLine();
-        if (ImGui::SmallButton("X")) action = {Kind::Remove, i, {}};
+        if (ImGui::SmallButton("X")) act(Kind::Remove);
         ImGui::PopID();
     }
     ImGui::EndTable();
@@ -1023,6 +1061,111 @@ void draw_pointer_scanner(App& app) {
     if (add_row) show(app, app.session.table().add_pointer(paths[*add_row], type_at(app.ptr_add_type), ""));
 }
 
+// The Memory tab: a live view of the memory around an address, each 4 bytes read as what they most likely
+// are. Neighbouring values of the found one (max health, ammo, position) usually sit right next to it.
+void draw_memory(App& app) {
+    auto& memory = app.memory;
+    ImGui::BeginDisabled(!is_attached(app));
+    ImGui::SetNextItemWidth(em(11));
+    const bool entered = ImGui::InputTextWithHint("##memory_address", "0x...", &app.memory_input,
+                                                  ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if (ImGui::Button("Go") || entered) {
+        const uintptr_t address = utils::parse_address(app.memory_input);
+        if (address) open_memory(app, address);
+        else app.status = "Enter the address to look at.";
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(app.memory_back.empty());
+    if (ImGui::Button("Back")) {
+        const uintptr_t previous = app.memory_back.back();
+        app.memory_back.pop_back();
+        open_memory(app, previous, false);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("yellow: changed, grey: noise");
+
+    if (memory.empty()) {
+        ImGui::TextWrapped("Click a result's address, a smart track candidate, or View in the cheat table to see the "
+                           "memory around it. Values of the same object (max health, ammo, position) usually sit "
+                           "right next to the one you found.");
+        return;
+    }
+
+    // Live: read again 5 times a second
+    const auto now = std::chrono::steady_clock::now();
+    if (now - app.memory_refreshed >= std::chrono::milliseconds(200)) {
+        app.session.refresh(memory);
+        app.memory_refreshed = now;
+    }
+
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                  ImGuiTableFlags_BordersV;
+    if (!ImGui::BeginTable("memory", 6, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, em(4));
+    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, em(10.5f));
+    ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, em(7));
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(2.4f));
+    ImGui::TableSetupColumn("Value");
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(2.2f));
+    ImGui::TableHeadersRow();
+
+    const ImVec4 changed_color(1.0f, 0.85f, 0.25f, 1.0f);
+    const ImVec4 noise_color = ImGui::GetStyleColorVec4(ImGuiCol_TextDisabled);
+    std::optional<size_t> add_row;
+    std::optional<uintptr_t> follow;
+    const auto& slots = memory.slots();
+    for (size_t i = 0; i < slots.size(); ++i) {
+        const auto& s = slots[i];
+        ImGui::TableNextRow();
+        if (i == memory.focus()) {
+            ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, ImGui::GetColorU32(ImVec4(0.26f, 0.40f, 0.70f, 0.45f)));
+        }
+        ImGui::PushID(static_cast<int>(i));
+
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(view::format_offset(s.offset).c_str());
+        if (i == memory.focus() && app.memory_scroll) {
+            ImGui::SetScrollHereY(0.3f); // the opened address a third of the way down
+            app.memory_scroll = false;
+        }
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(utils::format_address(s.address).c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextDisabled("%s", s.bytes_text().c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(s.type_name());
+
+        ImGui::TableNextColumn();
+        // Noise changes all the time, so it would always look just changed: grey wins
+        const bool just_changed = memory.value_age(i) < 5; // within the last second
+        if (s.noisy) ImGui::PushStyleColor(ImGuiCol_Text, noise_color);
+        else if (just_changed) ImGui::PushStyleColor(ImGuiCol_Text, changed_color);
+        ImGui::TextUnformatted(s.value_text().c_str());
+        if (just_changed || s.noisy) ImGui::PopStyleColor();
+        if (s.noisy && ImGui::IsItemHovered()) ImGui::SetTooltip("Changes on its own (learned noise): scans ignore it.");
+
+        ImGui::TableNextColumn();
+        if (s.guess == view::Guess::Pointer) {
+            if (ImGui::SmallButton("Go")) follow = static_cast<uintptr_t>(s.wide);
+            if (ImGui::IsItemHovered()) ImGui::SetTooltip("Follow the pointer (Back returns here).");
+        } else if (s.readable && s.guess != view::Guess::Continued && s.guess != view::Guess::Text) {
+            if (ImGui::SmallButton("+")) add_row = i;
+            if (ImGui::IsItemHovered()) {
+                ImGui::SetTooltip("Add to the cheat table as %s.", utils::format_data_type(s.data_type()).c_str());
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+
+    if (add_row) show(app, app.session.table().add_address(slots[*add_row].address, slots[*add_row].data_type(), ""));
+    if (follow) open_memory(app, *follow);
+}
+
 void draw_ui(App& app) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -1051,8 +1194,19 @@ void draw_ui(App& app) {
         ImGui::TableNextColumn();
         ImGui::SeparatorText("Cheat table");
         draw_cheat_table(app);
-        ImGui::SeparatorText("Pointer scanner");
-        draw_pointer_scanner(app);
+        if (ImGui::BeginTabBar("tools")) {
+            if (ImGui::BeginTabItem("Pointer scanner")) {
+                draw_pointer_scanner(app);
+                ImGui::EndTabItem();
+            }
+            const ImGuiTabItemFlags memory_flags = app.select_memory_tab ? ImGuiTabItemFlags_SetSelected : 0;
+            app.select_memory_tab = false;
+            if (ImGui::BeginTabItem("Memory", nullptr, memory_flags)) {
+                draw_memory(app);
+                ImGui::EndTabItem();
+            }
+            ImGui::EndTabBar();
+        }
 
         ImGui::EndTable();
     }
@@ -1072,9 +1226,11 @@ struct LaunchOptions {
     std::string screenshot; // render a few frames in a hidden window, save the last one as a BMP and exit
     std::string track;      // start smart track for this type right away (with --pid)
     int wait_seconds = 0;   // with --screenshot: capture no earlier than this
+    std::string view;       // open the Memory tab at this address (with --pid)
 };
 
-// nce_gui.exe [--pid <pid>] [--table <file.json>] [--screenshot <file.bmp>]
+// nce_gui.exe [--pid <pid>] [--table <file.json>] [--track <type|auto>] [--view <address>]
+//             [--screenshot <file.bmp> [--wait <seconds>]]
 LaunchOptions parse_command_line() {
     LaunchOptions options;
     int argc = 0;
@@ -1089,6 +1245,7 @@ LaunchOptions parse_command_line() {
         else if (option == L"--screenshot") options.screenshot = value;
         else if (option == L"--track") options.track = value;
         else if (option == L"--wait") options.wait_seconds = std::atoi(value.c_str());
+        else if (option == L"--view") options.view = value;
     }
     LocalFree(argv);
     return options;
@@ -1107,6 +1264,7 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
         if (!loaded.ok) app.status = loaded.message;
         else if (is_attached(app)) app.table_note = describe_reconciled(app.session.table().reconcile());
     }
+    if (!options.view.empty() && is_attached(app)) open_memory(app, utils::parse_address(options.view), false);
     if (!options.track.empty() && is_attached(app)) {
         if (options.track == "auto") {
             app.track_auto_type = true;
