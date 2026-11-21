@@ -1,4 +1,5 @@
 #include "../../include/table/cheat_table.hpp"
+#include "../../include/hal/hotkeys.hpp"
 #include "../../include/scanner/scan_results.hpp"
 #include "../../include/utils/hex_utils.hpp"
 #include "../../include/utils/text_encoding.hpp"
@@ -340,6 +341,35 @@ bool write_entry(const TableEntry& entry, const std::string& value_text, const h
     return address != 0 && process.write_raw(address, bytes.data(), bytes.size());
 }
 
+std::string Hotkey::to_string() const {
+    switch (action) {
+        case Action::ToggleFreeze: return keys + ": toggle freeze";
+        case Action::Set: return keys + ": set to " + value;
+        case Action::Add: return keys + ": add " + value;
+    }
+    return keys;
+}
+
+namespace {
+
+const char* action_name(Hotkey::Action action) {
+    switch (action) {
+        case Hotkey::Action::ToggleFreeze: return "toggle";
+        case Hotkey::Action::Set: return "set";
+        case Hotkey::Action::Add: return "add";
+    }
+    return "toggle";
+}
+
+std::optional<Hotkey::Action> parse_action(const std::string& name) {
+    if (name == "toggle") return Hotkey::Action::ToggleFreeze;
+    if (name == "set") return Hotkey::Action::Set;
+    if (name == "add") return Hotkey::Action::Add;
+    return std::nullopt;
+}
+
+} // anonymous namespace
+
 std::string to_json(const CheatTable& table) {
     json entries = json::array();
     for (const auto& e : table.entries) {
@@ -359,6 +389,15 @@ std::string to_json(const CheatTable& table) {
                 alternatives.push_back(alternative);
             }
             item["alternatives"] = alternatives;
+        }
+        if (!e.hotkeys.empty()) {
+            json hotkeys = json::array();
+            for (const auto& h : e.hotkeys) {
+                json hotkey = {{"keys", h.keys}, {"action", action_name(h.action)}};
+                if (h.action != Hotkey::Action::ToggleFreeze) hotkey["value"] = h.value;
+                hotkeys.push_back(hotkey);
+            }
+            item["hotkeys"] = hotkeys;
         }
         entries.push_back(item);
     }
@@ -422,6 +461,20 @@ std::optional<CheatTable> from_json(const std::string& text) {
                 auto path = alternative.is_object() ? read_path(alternative) : std::nullopt;
                 if (!path || path->module_name.empty()) return std::nullopt; // alternatives are pointer paths
                 e.alternatives.push_back(std::move(*path));
+            }
+        }
+
+        if (const auto hotkeys = item.find("hotkeys"); hotkeys != item.end()) {
+            if (!hotkeys->is_array()) return std::nullopt;
+            for (const auto& hotkey : *hotkeys) {
+                if (!hotkey.is_object()) return std::nullopt;
+                Hotkey h;
+                h.keys = hal::normalize_hotkey(hotkey.value("keys", ""));
+                const auto action = parse_action(hotkey.value("action", ""));
+                if (h.keys.empty() || !action) return std::nullopt;
+                h.action = *action;
+                h.value = hotkey.value("value", "");
+                e.hotkeys.push_back(std::move(h));
             }
         }
 

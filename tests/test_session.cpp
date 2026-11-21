@@ -286,7 +286,7 @@ TEST_CASE("a session's table survives a save and a load") {
     const auto loaded = s.table().load(file);
     std::filesystem::remove(file);
     REQUIRE(loaded.ok);
-    CHECK(loaded.message == "Loaded 2 entries for 'game.exe' (1 frozen).");
+    CHECK(loaded.message == "Loaded 2 entries for 'game.exe', 1 frozen.");
     CHECK(s.table().entry(1)->description == "Speed");
     CHECK_FALSE(s.find_restart()); // the fake process has no name
 }

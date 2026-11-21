@@ -27,6 +27,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <string>
 #include <thread>
@@ -168,9 +169,18 @@ const char* const kFloatModes[] = {"rounded", "truncated", "exact"}; // in Float
 // A finished job hands back the step that applies its result on the UI thread
 using ApplyResult = std::function<void()>;
 
+enum class Tab { Keep, PointerScanner, Memory, Hotkeys }; // Keep: leave the tab the user chose
+
+const char* const kHotkeyActions[] = {"Toggle freeze", "Set to", "Add"}; // in table::Hotkey::Action order
+
 struct App {
-    // The target, its search, noise map, cheat table (with the freeze thread) and pointer paths. Scans run
-    // as jobs on a worker thread, and the UI doesn't touch the search while one runs.
+    // Presses of the table's hotkeys arrive on the hotkey thread and are shown by the UI each frame.
+    // Declared before the session, so they outlive its hotkey thread.
+    std::mutex hotkey_mutex;
+    std::vector<std::pair<std::string, session::Outcome>> hotkey_events;
+
+    // The target, its search, noise map, cheat table (with the freeze and hotkey threads) and pointer
+    // paths. Scans run as jobs on a worker thread, and the UI doesn't touch the search while one runs.
     session::Session session;
     std::vector<hal::ProcessInfo> processes;
     std::string process_filter;
@@ -220,7 +230,15 @@ struct App {
     std::vector<uintptr_t> memory_back; // where Back returns to after following pointers
     std::string memory_input;
     std::chrono::steady_clock::time_point memory_refreshed;
-    bool select_memory_tab = false;     // show the Memory tab on this frame
+    Tab select_tab = Tab::Keep;         // switch to this tab on this frame
+
+    // Hotkeys tab: the hotkey being made
+    int hotkey_row = 0;
+    std::string hotkey_keys;
+    int hotkey_action = 0;
+    std::string hotkey_value;
+    bool hotkey_recording = false; // the next key pressed in this window becomes hotkey_keys
+    std::string hotkey_note;
     bool memory_scroll = false;         // scroll the opened address into view when its row is drawn
 
     bool track_pending = false; // --track: start once the noise is learned
@@ -449,7 +467,7 @@ void open_memory(App& app, uintptr_t address, bool remember = true) {
     app.memory_input = utils::format_address(address);
     app.session.refresh(app.memory);
     app.memory_refreshed = std::chrono::steady_clock::now();
-    app.select_memory_tab = true;
+    app.select_tab = Tab::Memory;
     app.memory_scroll = true;
 }
 
@@ -835,7 +853,7 @@ void draw_results(App& app) {
 
 // A click in the table, applied once the table lock is released (the operations take the lock themselves)
 struct TableAction {
-    enum class Kind { None, Freeze, Unfreeze, Write, Remove, Keep, View } kind = Kind::None;
+    enum class Kind { None, Freeze, Unfreeze, Write, Remove, Keep, View, Keys } kind = Kind::None;
     size_t row = 0;
     std::string value;    // Write
     uintptr_t address{0}; // View: where the entry leads now
@@ -860,6 +878,10 @@ void apply_table_action(App& app, const TableAction& action) {
         case Kind::View:
             if (action.address) open_memory(app, action.address);
             else app.status = "This entry doesn't lead to an address in the target now.";
+            break;
+        case Kind::Keys:
+            app.hotkey_row = static_cast<int>(action.row);
+            app.select_tab = Tab::Hotkeys;
             break;
     }
 }
@@ -913,7 +935,11 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
     ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(2.6f));
     ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthStretch, 1.0f);
     ImGui::TableSetupColumn("Location", ImGuiTableColumnFlags_WidthStretch, 2.0f);
-    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(13.5f));
+    // Wide enough for its five small buttons: Keep, View, Ptr, Keys n, X
+    const ImGuiStyle& style = ImGui::GetStyle();
+    const float actions_width = ImGui::CalcTextSize("KeepViewPtrKeys 9X").x + 5 * 2 * style.FramePadding.x +
+                                4 * style.ItemSpacing.x;
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, actions_width);
     ImGui::TableHeadersRow();
 
     for (size_t i = 0; i < entries.size(); ++i) {
@@ -965,13 +991,23 @@ TableAction draw_table_rows(App& app, table::CheatTable& t, const std::vector<ha
         if (ImGui::SmallButton("View")) act(Kind::View, {}, attached ? e.address(process, modules) : 0);
         if (ImGui::IsItemHovered()) ImGui::SetTooltip("The memory around it: neighbouring values of the same object.");
         ImGui::SameLine();
-        if (ImGui::SmallButton("Pointers")) {
+        if (ImGui::SmallButton("Ptr")) {
             const uintptr_t address = attached ? e.address(process, modules) : 0;
             if (address) {
                 app.ptr_target = utils::format_address(address);
                 if (is_numeric(e.type)) app.ptr_add_type = type_index_of(e.type);
-                app.status = "Pointer scanner target set to " + app.ptr_target + ". Open 'Pointer scanner' and press Scan.";
+                app.select_tab = Tab::PointerScanner;
+                app.status = "Pointer scanner target set to " + app.ptr_target + ": press Scan.";
             }
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("Find pointer paths that lead to it (Pointer scanner tab).");
+        ImGui::SameLine();
+        const std::string keys_label = e.hotkeys.empty() ? "Keys" : "Keys " + std::to_string(e.hotkeys.size());
+        if (ImGui::SmallButton(keys_label.c_str())) act(Kind::Keys);
+        if (ImGui::IsItemHovered()) {
+            std::string tip = "Keys that work while the game is in front.";
+            for (const auto& h : e.hotkeys) tip += "\n" + h.to_string();
+            ImGui::SetTooltip("%s", tip.c_str());
         }
         ImGui::SameLine();
         if (ImGui::SmallButton("X")) act(Kind::Remove);
@@ -1166,6 +1202,147 @@ void draw_memory(App& app) {
     if (follow) open_memory(app, *follow);
 }
 
+// The key pressed in this window right now, with its modifiers ("Ctrl+F1"), or empty
+std::string pressed_combo() {
+    static const std::vector<std::pair<ImGuiKey, std::string>> keys = [] {
+        std::vector<std::pair<ImGuiKey, std::string>> list;
+        for (int i = 0; i < 24; ++i) list.emplace_back(static_cast<ImGuiKey>(ImGuiKey_F1 + i), "F" + std::to_string(i + 1));
+        for (int i = 0; i < 26; ++i) list.emplace_back(static_cast<ImGuiKey>(ImGuiKey_A + i), std::string(1, static_cast<char>('A' + i)));
+        for (int i = 0; i < 10; ++i) {
+            list.emplace_back(static_cast<ImGuiKey>(ImGuiKey_0 + i), std::to_string(i));
+            list.emplace_back(static_cast<ImGuiKey>(ImGuiKey_Keypad0 + i), "Num" + std::to_string(i));
+        }
+        const std::pair<ImGuiKey, const char*> named[] = {
+            {ImGuiKey_KeypadAdd, "Num+"}, {ImGuiKey_KeypadSubtract, "Num-"}, {ImGuiKey_KeypadMultiply, "Num*"},
+            {ImGuiKey_KeypadDivide, "Num/"}, {ImGuiKey_KeypadDecimal, "Num."}, {ImGuiKey_Insert, "Insert"},
+            {ImGuiKey_Delete, "Delete"}, {ImGuiKey_Home, "Home"}, {ImGuiKey_End, "End"}, {ImGuiKey_PageUp, "PageUp"},
+            {ImGuiKey_PageDown, "PageDown"}, {ImGuiKey_UpArrow, "Up"}, {ImGuiKey_DownArrow, "Down"},
+            {ImGuiKey_LeftArrow, "Left"}, {ImGuiKey_RightArrow, "Right"}, {ImGuiKey_Space, "Space"}, {ImGuiKey_Pause, "Pause"},
+        };
+        for (const auto& [key, name] : named) list.emplace_back(key, name);
+        return list;
+    }();
+
+    const ImGuiIO& io = ImGui::GetIO();
+    for (const auto& [key, name] : keys) {
+        if (!ImGui::IsKeyPressed(key, false)) continue;
+        std::string combo;
+        if (io.KeyCtrl) combo += "Ctrl+";
+        if (io.KeyAlt) combo += "Alt+";
+        if (io.KeyShift) combo += "Shift+";
+        if (io.KeySuper) combo += "Win+";
+        return combo + name;
+    }
+    return {};
+}
+
+// Presses of the table's hotkeys (made while the game is in front): show what they did, and beep
+void show_table_hotkeys(App& app) {
+    std::vector<std::pair<std::string, session::Outcome>> events;
+    {
+        std::lock_guard<std::mutex> lock(app.hotkey_mutex);
+        events.swap(app.hotkey_events);
+    }
+    for (const auto& [combo, outcome] : events) {
+        app.status = "Hotkey " + combo + ": " + outcome.message;
+        beep(outcome.ok ? 1320 : 220, outcome.ok ? 90 : 200);
+    }
+}
+
+// The Hotkeys tab: every hotkey of the table, and a row to make a new one
+void draw_hotkeys(App& app) {
+    auto& keeper = app.session.table();
+    struct Bound {
+        size_t row;
+        std::string entry;
+        table::Hotkey hotkey;
+    };
+    std::vector<std::string> names;
+    std::vector<Bound> bound;
+    keeper.with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>&) {
+        for (size_t i = 0; i < t.entries.size(); ++i) {
+            const auto& e = t.entries[i];
+            names.push_back("#" + std::to_string(i) + " " + (e.description.empty() ? e.location_string() : e.description));
+            for (const auto& h : e.hotkeys) bound.push_back({i, names.back(), h});
+        }
+    });
+    if (names.empty()) {
+        ImGui::TextWrapped("Add values to the cheat table first, then give them keys that work while the game is in "
+                           "front: freeze and unfreeze, set a value, or add to it.");
+        return;
+    }
+    app.hotkey_row = std::clamp(app.hotkey_row, 0, static_cast<int>(names.size()) - 1);
+
+    ImGui::SetNextItemWidth(em(8));
+    if (ImGui::BeginCombo("##hotkey_entry", names[app.hotkey_row].c_str())) {
+        for (int i = 0; i < static_cast<int>(names.size()); ++i) {
+            if (ImGui::Selectable(names[i].c_str(), i == app.hotkey_row)) app.hotkey_row = i;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(em(7));
+    ImGui::InputTextWithHint("##hotkey_keys", "F1, Ctrl+F2", &app.hotkey_keys);
+    ImGui::SameLine();
+    if (ImGui::Button(app.hotkey_recording ? "Press a key..." : "Record")) app.hotkey_recording = !app.hotkey_recording;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Click, then press the key (with Ctrl / Alt / Shift if you like). Esc cancels.");
+    if (app.hotkey_recording) {
+        if (ImGui::IsKeyPressed(ImGuiKey_Escape, false)) {
+            app.hotkey_recording = false;
+        } else if (const std::string combo = pressed_combo(); !combo.empty()) {
+            app.hotkey_keys = combo;
+            app.hotkey_recording = false;
+        }
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(em(6.5f));
+    ImGui::Combo("##hotkey_action", &app.hotkey_action, kHotkeyActions, IM_ARRAYSIZE(kHotkeyActions));
+    if (app.hotkey_action != 0) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(em(5));
+        ImGui::InputTextWithHint("##hotkey_value", app.hotkey_action == 1 ? "value" : "100 / -10", &app.hotkey_value);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add##hotkey")) {
+        const auto outcome = keeper.add_hotkey(static_cast<size_t>(app.hotkey_row), app.hotkey_keys,
+                                               static_cast<table::Hotkey::Action>(app.hotkey_action), app.hotkey_value);
+        show(app, outcome);
+        app.hotkey_note = outcome.message;
+    }
+    if (!app.hotkey_note.empty()) ImGui::TextWrapped("%s", app.hotkey_note.c_str());
+    ImGui::TextDisabled("They work while the game is in front: a high beep means done, a low one failed. Saved with the table.");
+
+    const auto taken = keeper.hotkeys_taken();
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                  ImGuiTableFlags_BordersV;
+    if (!ImGui::BeginTable("hotkeys", 3, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Entry", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+    ImGui::TableSetupColumn("Hotkey", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+    ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(1.8f));
+    ImGui::TableHeadersRow();
+
+    std::optional<size_t> remove;
+    for (size_t i = 0; i < bound.size(); ++i) {
+        const auto& b = bound[i];
+        ImGui::TableNextRow();
+        ImGui::PushID(static_cast<int>(i));
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(b.entry.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(b.hotkey.to_string().c_str());
+        if (std::find(taken.begin(), taken.end(), b.hotkey.keys) != taken.end()) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1.0f, 0.6f, 0.2f, 1.0f), "another program holds it: it won't fire");
+        }
+        ImGui::TableNextColumn();
+        if (ImGui::SmallButton("X")) remove = i;
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+    if (remove) show(app, keeper.remove_hotkey(bound[*remove].row, bound[*remove].hotkey.keys));
+}
+
 void draw_ui(App& app) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -1195,14 +1372,21 @@ void draw_ui(App& app) {
         ImGui::SeparatorText("Cheat table");
         draw_cheat_table(app);
         if (ImGui::BeginTabBar("tools")) {
-            if (ImGui::BeginTabItem("Pointer scanner")) {
+            auto flags_for = [&](Tab tab) { return app.select_tab == tab ? ImGuiTabItemFlags_SetSelected : 0; };
+            const ImGuiTabItemFlags pointer_flags = flags_for(Tab::PointerScanner);
+            const ImGuiTabItemFlags memory_flags = flags_for(Tab::Memory);
+            const ImGuiTabItemFlags hotkey_flags = flags_for(Tab::Hotkeys);
+            app.select_tab = Tab::Keep;
+            if (ImGui::BeginTabItem("Pointer scanner", nullptr, pointer_flags)) {
                 draw_pointer_scanner(app);
                 ImGui::EndTabItem();
             }
-            const ImGuiTabItemFlags memory_flags = app.select_memory_tab ? ImGuiTabItemFlags_SetSelected : 0;
-            app.select_memory_tab = false;
             if (ImGui::BeginTabItem("Memory", nullptr, memory_flags)) {
                 draw_memory(app);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Hotkeys", nullptr, hotkey_flags)) {
+                draw_hotkeys(app);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -1227,9 +1411,11 @@ struct LaunchOptions {
     std::string track;      // start smart track for this type right away (with --pid)
     int wait_seconds = 0;   // with --screenshot: capture no earlier than this
     std::string view;       // open the Memory tab at this address (with --pid)
+    std::string tab;        // start on this tab: pointers, memory or hotkeys
 };
 
 // nce_gui.exe [--pid <pid>] [--table <file.json>] [--track <type|auto>] [--view <address>]
+//             [--tab pointers|memory|hotkeys]
 //             [--screenshot <file.bmp> [--wait <seconds>]]
 LaunchOptions parse_command_line() {
     LaunchOptions options;
@@ -1246,6 +1432,7 @@ LaunchOptions parse_command_line() {
         else if (option == L"--track") options.track = value;
         else if (option == L"--wait") options.wait_seconds = std::atoi(value.c_str());
         else if (option == L"--view") options.view = value;
+        else if (option == L"--tab") options.tab = value;
     }
     LocalFree(argv);
     return options;
@@ -1265,6 +1452,9 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
         else if (is_attached(app)) app.table_note = describe_reconciled(app.session.table().reconcile());
     }
     if (!options.view.empty() && is_attached(app)) open_memory(app, utils::parse_address(options.view), false);
+    if (options.tab == "pointers") app.select_tab = Tab::PointerScanner;
+    else if (options.tab == "memory") app.select_tab = Tab::Memory;
+    else if (options.tab == "hotkeys") app.select_tab = Tab::Hotkeys;
     if (!options.track.empty() && is_attached(app)) {
         if (options.track == "auto") {
             app.track_auto_type = true;
@@ -1374,6 +1564,10 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     ImGui_ImplDX11_Init(g_device, g_device_context);
 
     App app;
+    app.session.table().on_hotkey([&app](const std::string& combo, const session::Outcome& outcome) {
+        std::lock_guard<std::mutex> lock(app.hotkey_mutex); // on the hotkey thread: the UI shows it next frame
+        app.hotkey_events.emplace_back(combo, outcome);
+    });
     apply_launch_options(app, options);
 
     constexpr int SCREENSHOT_FRAME = 10; // let tables settle their column widths first
@@ -1407,6 +1601,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         poll_job(app);
         tick_reattach(app);
         process_hotkeys(app);
+        show_table_hotkeys(app);
         tick_tracking(app);
 
         ImGui_ImplDX11_NewFrame();

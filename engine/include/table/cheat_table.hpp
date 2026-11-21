@@ -10,6 +10,21 @@
 
 namespace nce::table {
 
+// A system-wide key that acts on a table entry while the game is in front
+struct Hotkey {
+    enum class Action {
+        ToggleFreeze, // freeze at the current value, or unfreeze
+        Set,          // write `value` (a frozen entry stays frozen, at it)
+        Add,          // add `value` to the current value (negative takes away); numbers only
+    };
+    std::string keys; // canonical combo text (hal::format_hotkey): "F1", "Ctrl+Num5"
+    Action action{Action::ToggleFreeze};
+    std::string value;
+
+    // "F1: toggle freeze", "Ctrl+F2: set to 999", "F3: add -10"
+    [[nodiscard]] std::string to_string() const;
+};
+
 // One remembered value. Its location is kept in a form that survives a restart of the target when
 // possible: a static address (module + offset) or a pointer path (module + offset + offsets).
 // Memory that belongs to no module is stored as an absolute address, valid only in the current run.
@@ -29,6 +44,8 @@ struct TableEntry {
     // move together), so reconcile prefers the address whose surroundings still look like this.
     std::vector<uint8_t> context;
     static constexpr size_t CONTEXT_RADIUS = 64;
+
+    std::vector<Hotkey> hotkeys; // at most one per combo
 
     [[nodiscard]] bool is_absolute() const noexcept { return location.module_name.empty(); }
 

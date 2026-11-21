@@ -1,6 +1,7 @@
 #pragma once
 
 #include "scan_session.hpp"
+#include "../hal/hotkeys.hpp"
 #include "../hal/process.hpp"
 #include "../scanner/noise_map.hpp"
 #include "../scanner/pointer_scanner.hpp"
@@ -8,6 +9,7 @@
 #include "../table/cheat_table.hpp"
 #include "../view/memory_view.hpp"
 #include <atomic>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -17,11 +19,13 @@
 
 namespace nce::session {
 
-// The cheat table, shared with a thread that keeps frozen entries at their values. Every access goes
-// through this class, which holds the lock (with() for anything the operations below don't cover).
+// The cheat table, shared with a thread that keeps frozen entries at their values and with the thread
+// that waits for its hotkeys. Every access goes through this class, which holds the lock (with() for
+// anything the operations below don't cover; change hotkeys only through add_hotkey / remove_hotkey).
 class TableKeeper {
 public:
-    explicit TableKeeper(std::shared_ptr<hal::IProcess> process);
+    // hotkeys: where the table's hotkeys are registered (nullptr: none are; press() still works)
+    TableKeeper(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IHotkeys> hotkeys);
     ~TableKeeper();
     TableKeeper(const TableKeeper&) = delete;
     TableKeeper& operator=(const TableKeeper&) = delete;
@@ -66,8 +70,21 @@ public:
     [[nodiscard]] std::vector<hal::ModuleInfo> modules();
     void refresh_modules(); // the target loaded or unloaded modules since attach
 
+    // Hotkeys: system-wide keys that act on entries while the game is in front (see table::Hotkey).
+    // A combo can act on several entries. An entry has one action per combo: adding replaces it.
+    Outcome add_hotkey(size_t index, const std::string& keys, table::Hotkey::Action action, const std::string& value);
+    Outcome remove_hotkey(size_t index, const std::string& keys);
+    // Runs what a combo is bound to, as pressing it does: "Health: frozen at 100; Mana: set to 999"
+    Outcome press(const std::string& keys);
+    // Told about every press of a bound combo (on the hotkey thread), e.g. to beep or show the result
+    void on_hotkey(std::function<void(const std::string& combo, const Outcome& outcome)> listener);
+    // Bound combos that another program already holds: they don't fire
+    [[nodiscard]] std::vector<std::string> hotkeys_taken();
+
 private:
     void freeze_loop();
+    Outcome apply_hotkey(table::TableEntry& entry, const table::Hotkey& hotkey); // with the lock held
+    void rebind(); // registers the table's combos again; never with the lock held (see the .cpp)
     [[nodiscard]] bool valid(size_t index) const { return index < m_table.entries.size(); }
 
     std::shared_ptr<hal::IProcess> m_process;
@@ -76,6 +93,12 @@ private:
     std::vector<hal::ModuleInfo> m_modules;
     std::atomic<bool> m_running{true};
     std::thread m_freeze_thread;
+
+    std::unique_ptr<hal::IHotkeys> m_hotkeys;
+    std::mutex m_rebind_mutex;       // one rebind at a time, so the last table state wins
+    std::vector<std::string> m_taken; // guarded by m_mutex
+    std::mutex m_listener_mutex;
+    std::function<void(const std::string&, const Outcome&)> m_listener;
 };
 
 // "found at 0x... (3 of 4 paths lead there; ...)", "close vote (...)", "none of its 4 paths resolve here ..."
@@ -85,7 +108,8 @@ std::string describe_reconcile(const table::ReconcileResult& result);
 // the cheat table and pointer paths. The CLI and the GUI are views on it.
 class Session {
 public:
-    explicit Session(std::shared_ptr<hal::IProcess> process = hal::IProcess::create());
+    explicit Session(std::shared_ptr<hal::IProcess> process = hal::IProcess::create(),
+                     std::unique_ptr<hal::IHotkeys> hotkeys = hal::IHotkeys::create());
 
     struct AttachReport {
         bool ok{false};

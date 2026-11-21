@@ -13,6 +13,7 @@ add_executable(engine_tests
     test_win32_process.cpp
     test_session.cpp
     test_memory_view.cpp
+    test_hotkeys.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

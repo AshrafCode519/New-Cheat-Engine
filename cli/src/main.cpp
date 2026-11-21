@@ -115,7 +115,11 @@ void print_help() {
               << "  tfreeze <#> [value] / tunfreeze <#> - Lock an entry (default: its current value)\n"
               << "  tperm <#>                       - Make an entry permanent: keeps its best pointer paths, which\n"
               << "                                    vote on the value's new address after every restart\n"
-              << "  tsave <file.json> / tload <file.json> - Save or load the table\n\n"
+              << "  tsave <file.json> / tload <file.json> - Save or load the table\n"
+              << "  thotkey <#> <keys> toggle | set <value> | add <amount> | remove - A key that works while the game\n"
+              << "                                    is in front: 'thotkey 0 F1 toggle' freezes/unfreezes #0,\n"
+              << "                                    'thotkey 0 Ctrl+F2 set 999', 'thotkey 1 Num5 add -10'. Saved with the table\n"
+              << "  thotkeys / tpress <keys>        - List the hotkeys / do what a key does now, without the keyboard\n\n"
               << "Memory Operations:\n"
               << "  write <addr> <type> <val>       - Write value to memory address\n"
               << "  read <addr> <type>              - Read value from memory address\n"
@@ -727,7 +731,9 @@ void cmd_table_list() {
             if (e.frozen_value) value += " [frozen]";
             std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20) << e.description
                       << "  " << std::setw(4) << utils::format_data_type(e.type) << "  " << std::setw(17) << value
-                      << "  " << e.location_string() << "\n";
+                      << "  " << e.location_string();
+            for (size_t k = 0; k < e.hotkeys.size(); ++k) std::cout << (k == 0 ? "   keys: " : ", ") << e.hotkeys[k].keys;
+            std::cout << "\n";
         }
         std::cout << std::right << "--------------------------------------------------------------------------------\n";
     });
@@ -757,6 +763,44 @@ void cmd_table_delete(const std::string& index_text) {
 
 void cmd_table_save(const std::string& path) {
     report(ses().table().save(path));
+}
+
+// thotkey <#> <keys> toggle | set <value> | add <amount> | remove
+void cmd_table_hotkey(const std::string& index_text, const std::string& keys, const std::string& action,
+                      const std::string& value) {
+    auto index = parse_table_index(index_text);
+    if (!index) return;
+    using Action = table::Hotkey::Action;
+    if (action == "remove") report(ses().table().remove_hotkey(*index, keys));
+    else if (action == "toggle") report(ses().table().add_hotkey(*index, keys, Action::ToggleFreeze, ""));
+    else if (action == "set") report(ses().table().add_hotkey(*index, keys, Action::Set, value));
+    else if (action == "add") report(ses().table().add_hotkey(*index, keys, Action::Add, value));
+    else std::cout << "Usage: thotkey <#> <keys> toggle | set <value> | add <amount> | remove\n";
+}
+
+void cmd_table_hotkeys() {
+    const auto taken = ses().table().hotkeys_taken();
+    ses().table().with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>&) {
+        size_t count = 0;
+        for (size_t i = 0; i < t.entries.size(); ++i) {
+            for (const auto& h : t.entries[i].hotkeys) {
+                if (count++ == 0) {
+                    std::cout << "\n Index  Description           Hotkey\n"
+                              << "--------------------------------------------------------------------------------\n";
+                }
+                const bool is_taken = std::find(taken.begin(), taken.end(), h.keys) != taken.end();
+                std::cout << " [" << std::right << std::setw(3) << i << "]  " << std::left << std::setw(20)
+                          << t.entries[i].description << "  " << h.to_string()
+                          << (is_taken ? "   (another program holds it: it won't fire)" : "") << std::right << "\n";
+            }
+        }
+        if (count == 0) {
+            std::cout << "[-] No hotkeys. 'thotkey <#> F1 toggle' makes F1 freeze and unfreeze an entry while you play.\n";
+        } else {
+            std::cout << "--------------------------------------------------------------------------------\n"
+                      << " They work while the game is in front; a high beep means done, a low one failed.\n\n";
+        }
+    });
 }
 
 void cmd_table_load(const std::string& path) {
@@ -1106,6 +1150,20 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: " << cmd << " <#>" << (cmd == "tfreeze" ? " [value]" : "") << "\n";
         }
+    } else if (cmd == "thotkey") {
+        std::string index, keys, action, value;
+        if (iss >> index >> keys >> action) {
+            iss >> value;
+            cmd_table_hotkey(index, keys, action, value);
+        } else {
+            std::cout << "Usage: thotkey <#> <keys> toggle | set <value> | add <amount> | remove\n";
+        }
+    } else if (cmd == "thotkeys") {
+        cmd_table_hotkeys();
+    } else if (cmd == "tpress") {
+        std::string keys;
+        if (iss >> keys) report(ses().table().press(keys));
+        else std::cout << "Usage: tpress <keys>\n";
     } else if (cmd == "tperm") {
         std::string index;
         if (iss >> index) cmd_table_permanent(index);
@@ -1202,6 +1260,14 @@ int main() {
 #endif
     print_banner();
     print_help();
+
+    // Hotkeys fire while the game is in front: say what they did, and beep (the console may be hidden)
+    ses().table().on_hotkey([](const std::string& combo, const session::Outcome& outcome) {
+        std::cout << "\n[hotkey " << combo << "] " << outcome.message << "\n" << std::flush;
+#ifdef _WIN32
+        std::thread([ok = outcome.ok] { Beep(ok ? 1320 : 220, ok ? 90 : 200); }).detach();
+#endif
+    });
 
     std::string line;
     while (true) {

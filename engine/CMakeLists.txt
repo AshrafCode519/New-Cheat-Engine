@@ -3,6 +3,8 @@ project(engine LANGUAGES CXX)
 
 add_library(engine STATIC
     src/hal/process_win32.cpp
+    src/hal/hotkeys.cpp
+    src/hal/hotkeys_win32.cpp
     src/scanner/memory_scanner.cpp
     src/scanner/scan_results.cpp
     src/scanner/pointer_scanner.cpp
