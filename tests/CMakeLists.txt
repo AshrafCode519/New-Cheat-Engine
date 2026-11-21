@@ -14,6 +14,7 @@ add_executable(engine_tests
     test_session.cpp
     test_memory_view.cpp
     test_hotkeys.cpp
+    test_table_library.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

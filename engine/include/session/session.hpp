@@ -9,6 +9,7 @@
 #include "../table/cheat_table.hpp"
 #include "../view/memory_view.hpp"
 #include <atomic>
+#include <filesystem>
 #include <functional>
 #include <memory>
 #include <mutex>
@@ -37,9 +38,15 @@ public:
         return fn(m_table, std::as_const(m_modules));
     }
 
+    struct AttachResult {
+        bool attached{false};
+        size_t unfrozen{0};     // absolute entries that belonged to the previous process
+        std::string table_note; // what the table library did ("Opened the table of game.exe ..."), or empty
+    };
     // Swaps the process under the lock, so the freeze thread never writes into the new process with the
-    // old process' addresses: absolute entries are unfrozen first. Returns how many were unfrozen.
-    size_t attach(uint32_t pid, bool& attached);
+    // old process' addresses: absolute entries are unfrozen. With the table library on, attaching to
+    // another program saves the table and opens that program's (see set_library).
+    AttachResult attach(uint32_t pid);
     void detach();
 
     struct ReconcileLine {
@@ -81,10 +88,24 @@ public:
     // Bound combos that another program already holds: they don't fire
     [[nodiscard]] std::vector<std::string> hotkeys_taken();
 
+    // The table library: each program's table in <folder>/<program>.json. Attaching to a program opens its
+    // table (a restart of the same program keeps the table as it is), and the table is saved there every
+    // 2 s while it changes and when this object goes away. An empty folder turns it off: then the table
+    // stays as it is whatever you attach to.
+    void set_library(std::filesystem::path folder);
+    [[nodiscard]] std::filesystem::path library();
+    // Where the open table is kept ("" if the library is off or the table belongs to no program yet)
+    [[nodiscard]] std::filesystem::path library_file();
+    // Saves the open table to the library now, instead of at the next automatic save
+    Outcome save_to_library();
+
 private:
     void freeze_loop();
     Outcome apply_hotkey(table::TableEntry& entry, const table::Hotkey& hotkey); // with the lock held
     void rebind(); // registers the table's combos again; never with the lock held (see the .cpp)
+    [[nodiscard]] std::filesystem::path library_file_locked(const std::string& program) const;
+    std::string switch_table_locked(const std::string& program, bool& changed); // with both locks held
+    Outcome autosave(bool force);
     [[nodiscard]] bool valid(size_t index) const { return index < m_table.entries.size(); }
 
     std::shared_ptr<hal::IProcess> m_process;
@@ -99,7 +120,15 @@ private:
     std::vector<std::string> m_taken; // guarded by m_mutex
     std::mutex m_listener_mutex;
     std::function<void(const std::string&, const Outcome&)> m_listener;
+
+    // Taken before m_mutex by everything that writes library files, so two writes never meet
+    std::mutex m_save_mutex;
+    std::filesystem::path m_library; // guarded by m_mutex
+    std::string m_saved_text;        // the open table as last saved to the library (guarded by m_mutex)
 };
+
+// %APPDATA%\NewCheatEngine\tables on Windows (~/.config/new-cheat-engine/tables elsewhere)
+std::filesystem::path default_library_folder();
 
 // "found at 0x... (3 of 4 paths lead there; ...)", "close vote (...)", "none of its 4 paths resolve here ..."
 std::string describe_reconcile(const table::ReconcileResult& result);
@@ -115,6 +144,7 @@ public:
         bool ok{false};
         bool read_only{false};  // writing and freezing won't work
         size_t unfrozen{0};     // absolute table entries that belonged to the previous process
+        std::string table_note; // what the table library did, or empty
         std::vector<TableKeeper::ReconcileLine> reconciled;
     };
     // Attaches, starts a fresh search, drops the old noise map and re-finds permanent table entries.

@@ -5,6 +5,9 @@
 #include <charconv>
 #include <chrono>
 #include <cmath>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
 #include <limits>
 #include <type_traits>
 
@@ -20,6 +23,33 @@ bool equals_ignore_case(const std::string& a, const std::string& b) {
 
 std::string no_entry(size_t index, size_t size) {
     return "No table entry #" + std::to_string(index) + " (there are " + std::to_string(size) + ").";
+}
+
+std::string lower(std::string text) {
+    std::transform(text.begin(), text.end(), text.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return text;
+}
+
+// "2 entries, 1 frozen, 3 hotkeys"
+std::string summary(const table::CheatTable& t) {
+    size_t frozen = 0;
+    size_t hotkeys = 0;
+    for (const auto& e : t.entries) {
+        frozen += e.frozen_value ? 1 : 0;
+        hotkeys += e.hotkeys.size();
+    }
+    std::string text = std::to_string(t.entries.size()) + (t.entries.size() == 1 ? " entry" : " entries");
+    if (frozen) text += ", " + std::to_string(frozen) + " frozen";
+    if (hotkeys) text += ", " + std::to_string(hotkeys) + (hotkeys == 1 ? " hotkey" : " hotkeys");
+    return text;
+}
+
+bool write_text(const std::filesystem::path& file, const std::string& text) {
+    std::error_code ec;
+    std::filesystem::create_directories(file.parent_path(), ec);
+    std::ofstream out(file, std::ios::binary | std::ios::trunc);
+    out << text;
+    return static_cast<bool>(out);
 }
 
 } // anonymous namespace
@@ -47,10 +77,12 @@ TableKeeper::~TableKeeper() {
     m_hotkeys.reset(); // stops the hotkey thread first: its presses use this object
     m_running = false;
     if (m_freeze_thread.joinable()) m_freeze_thread.join();
+    autosave(false); // the changes since the last automatic save
 }
 
+// Every 100 ms: writes the frozen values. Every 2 s: saves the table to the library if it changed.
 void TableKeeper::freeze_loop() {
-    while (m_running) {
+    for (size_t tick = 1; m_running; ++tick) {
         {
             std::lock_guard<std::mutex> lock(m_mutex);
             if (m_process->is_attached() && m_process->can_write()) {
@@ -59,24 +91,73 @@ void TableKeeper::freeze_loop() {
                 }
             }
         }
+        if (tick % 20 == 0) autosave(false);
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 }
 
-size_t TableKeeper::attach(uint32_t pid, bool& attached) {
-    std::lock_guard<std::mutex> lock(m_mutex);
-    // Absolute addresses belong to the old process; module-relative entries only resolve if the new one
-    // has the same module, so they stay frozen
-    size_t unfrozen = 0;
-    for (auto& e : m_table.entries) {
-        if (e.is_absolute() && e.frozen_value) {
-            e.frozen_value.reset();
-            ++unfrozen;
+TableKeeper::AttachResult TableKeeper::attach(uint32_t pid) {
+    AttachResult result;
+    bool table_changed = false;
+    {
+        std::lock_guard<std::mutex> saving(m_save_mutex);
+        std::lock_guard<std::mutex> lock(m_mutex);
+        result.attached = m_process->attach(pid);
+        m_modules = result.attached ? m_process->get_modules() : std::vector<hal::ModuleInfo>{};
+        if (result.attached) result.table_note = switch_table_locked(m_process->name(), table_changed);
+
+        // Absolute addresses belong to an earlier process; module-relative entries only resolve if this one
+        // has the same module, so they stay frozen
+        for (auto& e : m_table.entries) {
+            if (e.is_absolute() && e.frozen_value) {
+                e.frozen_value.reset();
+                ++result.unfrozen;
+            }
         }
     }
-    attached = m_process->attach(pid);
-    m_modules = attached ? m_process->get_modules() : std::vector<hal::ModuleInfo>{};
-    return unfrozen;
+    if (table_changed) rebind(); // the hotkeys of the table now open
+    return result;
+}
+
+// The same program again (a restart) keeps the table. Another program: the table goes to the library
+// (if it has entries), and that program's table comes out of it, or a new one starts. A table that
+// belongs to no program yet (made or loaded before attaching) is adopted, unless it is empty and the
+// library has one for this program.
+std::string TableKeeper::switch_table_locked(const std::string& program, bool& changed) {
+    if (m_library.empty() || program.empty()) return {};
+    const std::string owner = m_table.process_name;
+    if (equals_ignore_case(owner, program)) return {};
+
+    const auto file = library_file_locked(program);
+    std::error_code ec;
+    const bool in_library = std::filesystem::exists(file, ec);
+    std::string note;
+    if (owner.empty()) {
+        if (!m_table.entries.empty() || !in_library) {
+            m_table.process_name = program;
+            return {};
+        }
+    } else if (!m_table.entries.empty()) {
+        const auto saved_to = library_file_locked(owner);
+        note = write_text(saved_to, table::to_json(m_table))
+            ? "Kept the table of " + owner + " (" + summary(m_table) + ") in the library. "
+            : "Could not save the table of " + owner + " to " + saved_to.string() + "! ";
+    }
+
+    changed = true;
+    if (in_library) {
+        if (auto loaded = table::load_table(file.string())) {
+            m_table = std::move(*loaded);
+            m_table.process_name = program;
+            m_saved_text = table::to_json(m_table);
+            return note + "Opened the table of " + program + " from the library: " + summary(m_table) + ".";
+        }
+        note += "Could not read " + file.string() + "; ";
+    }
+    m_table = {};
+    m_table.process_name = program;
+    m_saved_text.clear();
+    return note + "New table for " + program + ".";
 }
 
 void TableKeeper::detach() {
@@ -412,6 +493,73 @@ std::vector<std::string> TableKeeper::hotkeys_taken() {
     return m_taken;
 }
 
+// ---- Table library -------------------------------------------------------------------------------
+
+std::filesystem::path default_library_folder() {
+#ifdef _WIN32
+    if (const wchar_t* appdata = _wgetenv(L"APPDATA"); appdata && *appdata) {
+        return std::filesystem::path(appdata) / "NewCheatEngine" / "tables";
+    }
+#endif
+    if (const char* config = std::getenv("XDG_CONFIG_HOME"); config && *config) {
+        return std::filesystem::path(config) / "new-cheat-engine" / "tables";
+    }
+    if (const char* home = std::getenv("HOME"); home && *home) {
+        return std::filesystem::path(home) / ".config" / "new-cheat-engine" / "tables";
+    }
+    return "tables";
+}
+
+void TableKeeper::set_library(std::filesystem::path folder) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_library = std::move(folder);
+    m_saved_text.clear(); // the new folder doesn't have the table yet
+}
+
+std::filesystem::path TableKeeper::library() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_library;
+}
+
+std::filesystem::path TableKeeper::library_file() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return library_file_locked(m_table.process_name);
+}
+
+std::filesystem::path TableKeeper::library_file_locked(const std::string& program) const {
+    if (m_library.empty() || program.empty()) return {};
+    const std::string name = lower(program) + ".json";
+    return m_library / std::filesystem::path(std::u8string(name.begin(), name.end()));
+}
+
+Outcome TableKeeper::save_to_library() {
+    return autosave(true);
+}
+
+// Saves the open table to its library file if it changed since the last save. An empty table gets no new
+// file: attaching to a program and adding nothing leaves nothing behind.
+Outcome TableKeeper::autosave(bool force) {
+    std::lock_guard<std::mutex> saving(m_save_mutex);
+    std::filesystem::path file;
+    std::string text;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        file = library_file_locked(m_table.process_name);
+        if (file.empty()) {
+            return Outcome::fail(m_library.empty() ? "The table library is off."
+                                                   : "The table belongs to no program yet: attach first.");
+        }
+        text = table::to_json(m_table);
+        if (!force && text == m_saved_text) return Outcome::success();
+        std::error_code ec;
+        if (m_table.entries.empty() && !std::filesystem::exists(file, ec)) return Outcome::fail("The table is empty.");
+    }
+    if (!write_text(file, text)) return Outcome::fail("Could not write " + file.string() + ".");
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (library_file_locked(m_table.process_name) == file) m_saved_text = text;
+    return Outcome::success("Saved the table to " + file.string() + ".");
+}
+
 // The hotkey thread runs press(), which takes m_mutex, while set() waits for that thread to register the
 // keys. Calling set() with m_mutex held could deadlock, so the combos are collected under the lock and
 // registered after releasing it.
@@ -462,7 +610,10 @@ Session::Session(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IH
 
 Session::AttachReport Session::attach(uint32_t pid) {
     AttachReport report;
-    report.unfrozen = m_table->attach(pid, report.ok);
+    const auto attached = m_table->attach(pid);
+    report.ok = attached.attached;
+    report.unfrozen = attached.unfrozen;
+    report.table_note = attached.table_note;
     m_scans.clear();
     m_noise.reset();
     if (!report.ok) {

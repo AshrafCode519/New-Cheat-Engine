@@ -29,6 +29,10 @@ public:
 
     void set_pointer_size(size_t size) { m_pointer_size = size; }
 
+    // The program's name ("game.exe"); the table library keys on it. Changing it plays another program.
+    void set_name(std::string name) { m_name = std::move(name); }
+    [[nodiscard]] std::string name() const override { return m_name; }
+
     // Writes a pointer of the configured size
     void put_pointer(size_t offset, uintptr_t value) {
         if (m_pointer_size == 4) put<uint32_t>(offset, static_cast<uint32_t>(value));
@@ -105,6 +109,7 @@ private:
     std::vector<hal::ModuleInfo> m_modules;
     size_t m_pointer_size{sizeof(uintptr_t)};
     bool m_attached{true};
+    std::string m_name;
 };
 
 inline bool contains_address(const scanner::ScanResults& results, uintptr_t address) {

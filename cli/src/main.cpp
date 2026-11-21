@@ -12,6 +12,7 @@
 #include <exception>
 #include <utility>
 #include <charconv>
+#include <filesystem>
 #include <cctype>
 
 #ifdef _WIN32
@@ -119,7 +120,10 @@ void print_help() {
               << "  thotkey <#> <keys> toggle | set <value> | add <amount> | remove - A key that works while the game\n"
               << "                                    is in front: 'thotkey 0 F1 toggle' freezes/unfreezes #0,\n"
               << "                                    'thotkey 0 Ctrl+F2 set 999', 'thotkey 1 Num5 add -10'. Saved with the table\n"
-              << "  thotkeys / tpress <keys>        - List the hotkeys / do what a key does now, without the keyboard\n\n"
+              << "  thotkeys / tpress <keys>        - List the hotkeys / do what a key does now, without the keyboard\n"
+              << "  library [folder|off|save]       - Each program's table is kept in a library folder and opens by itself\n"
+              << "                                    when you attach to the program; show it, use another folder, turn it\n"
+              << "                                    off, or save now (it saves by itself every 2 s while it changes)\n\n"
               << "Memory Operations:\n"
               << "  write <addr> <type> <val>       - Write value to memory address\n"
               << "  read <addr> <type>              - Read value from memory address\n"
@@ -257,6 +261,7 @@ void cmd_attach(uint32_t pid) {
     if (attached.read_only) {
         std::cout << "[!] Only read access was granted: writing and freezing won't work. Run as Administrator.\n";
     }
+    if (!attached.table_note.empty()) std::cout << "[*] Table: " << attached.table_note << "\n";
     learn_noise(4);
     print_reconciled(attached.reconciled);
 }
@@ -803,6 +808,44 @@ void cmd_table_hotkeys() {
     });
 }
 
+// library [folder|off|save]
+void cmd_library(const std::string& argument) {
+    namespace fs = std::filesystem;
+    if (argument == "off") {
+        ses().table().set_library({});
+        std::cout << "[*] Table library off: tables are only saved with 'tsave'.\n";
+        return;
+    }
+    if (argument == "save") {
+        report(ses().table().save_to_library());
+        return;
+    }
+    if (!argument.empty()) {
+        ses().table().set_library(fs::path(std::u8string(argument.begin(), argument.end())));
+        std::cout << "[*] Table library: " << argument << "\n";
+    }
+
+    const fs::path folder = ses().table().library();
+    if (folder.empty()) {
+        std::cout << "[*] The table library is off. 'library <folder>' turns it on.\n";
+        return;
+    }
+    const fs::path open = ses().table().library_file();
+    std::cout << "[*] Each program's table is kept in " << folder.string() << "\n"
+              << "    (it opens when you attach to the program, and saves by itself while it changes):\n";
+    size_t count = 0;
+    std::error_code ec;
+    for (const auto& item : fs::directory_iterator(folder, ec)) {
+        if (item.path().extension() != ".json") continue;
+        const auto t = table::load_table(item.path().string());
+        std::cout << "    " << std::left << std::setw(32) << item.path().filename().string() << std::right
+                  << (t ? std::to_string(t->entries.size()) + " entries" : std::string("(can't be read)"))
+                  << (item.path() == open ? "   (open now)" : "") << "\n";
+        ++count;
+    }
+    if (count == 0) std::cout << "    (no tables yet)\n";
+}
+
 void cmd_table_load(const std::string& path) {
     if (report(ses().table().load(path))) print_reconciled(ses().table().reconcile());
 }
@@ -1158,6 +1201,10 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: thotkey <#> <keys> toggle | set <value> | add <amount> | remove\n";
         }
+    } else if (cmd == "library") {
+        std::string argument;
+        std::getline(iss >> std::ws, argument);
+        cmd_library(argument);
     } else if (cmd == "thotkeys") {
         cmd_table_hotkeys();
     } else if (cmd == "tpress") {
@@ -1262,6 +1309,9 @@ int main() {
     print_help();
 
     // Hotkeys fire while the game is in front: say what they did, and beep (the console may be hidden)
+    // Each program's table opens by itself on attach and is saved while it changes
+    ses().table().set_library(session::default_library_folder());
+
     ses().table().on_hotkey([](const std::string& combo, const session::Outcome& outcome) {
         std::cout << "\n[hotkey " << combo << "] " << outcome.message << "\n" << std::flush;
 #ifdef _WIN32

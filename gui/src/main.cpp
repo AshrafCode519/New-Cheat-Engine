@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <functional>
 #include <future>
@@ -378,6 +379,7 @@ void attach(App& app, const hal::ProcessInfo& info, const std::string& note = ""
         if (report.read_only) {
             app.status += " Only read access was granted: writing and freezing won't work (run as Administrator).";
         }
+        if (!report.table_note.empty()) app.status += " " + report.table_note;
         learn_noise(app, app.status + " ");
     } else {
         app.attached_label.clear();
@@ -905,6 +907,13 @@ void draw_cheat_table(App& app) {
             app.table_note = attached ? describe_reconciled(keeper.reconcile()) : std::string();
         }
     }
+    // Where the table lives between runs (the file above is for sharing or keeping a copy)
+    const auto library_file = keeper.library_file();
+    if (!library_file.empty()) {
+        ImGui::TextDisabled("Kept in the library, saved by itself: %s", library_file.string().c_str());
+    } else if (!keeper.library().empty()) {
+        ImGui::TextDisabled("Attach to a program and its table opens from the library: %s", keeper.library().string().c_str());
+    }
     if (!app.table_note.empty()) {
         ImGui::TextDisabled("After restart:");
         ImGui::TextWrapped("%s", app.table_note.c_str());
@@ -1412,10 +1421,11 @@ struct LaunchOptions {
     int wait_seconds = 0;   // with --screenshot: capture no earlier than this
     std::string view;       // open the Memory tab at this address (with --pid)
     std::string tab;        // start on this tab: pointers, memory or hotkeys
+    std::string library;    // the table library folder ("off": none); default: the user's application data
 };
 
 // nce_gui.exe [--pid <pid>] [--table <file.json>] [--track <type|auto>] [--view <address>]
-//             [--tab pointers|memory|hotkeys]
+//             [--tab pointers|memory|hotkeys] [--library <folder>|off]
 //             [--screenshot <file.bmp> [--wait <seconds>]]
 LaunchOptions parse_command_line() {
     LaunchOptions options;
@@ -1433,6 +1443,7 @@ LaunchOptions parse_command_line() {
         else if (option == L"--wait") options.wait_seconds = std::atoi(value.c_str());
         else if (option == L"--view") options.view = value;
         else if (option == L"--tab") options.tab = value;
+        else if (option == L"--library") options.library = value;
     }
     LocalFree(argv);
     return options;
@@ -1564,6 +1575,13 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     ImGui_ImplDX11_Init(g_device, g_device_context);
 
     App app;
+    // Each program's table opens by itself on attach and is saved while it changes
+    if (options.library == "off") app.session.table().set_library({});
+    else if (!options.library.empty()) {
+        app.session.table().set_library(std::filesystem::path(std::u8string(options.library.begin(), options.library.end())));
+    } else {
+        app.session.table().set_library(session::default_library_folder());
+    }
     app.session.table().on_hotkey([&app](const std::string& combo, const session::Outcome& outcome) {
         std::lock_guard<std::mutex> lock(app.hotkey_mutex); // on the hotkey thread: the UI shows it next frame
         app.hotkey_events.emplace_back(combo, outcome);
