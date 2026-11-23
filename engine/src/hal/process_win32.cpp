@@ -287,6 +287,34 @@ public:
         return false;
     }
 
+    uintptr_t allocate_memory(size_t size, uint32_t protection, uintptr_t near_addr) override {
+        if (!m_handle || size == 0) return 0;
+        // With a `near` hint, try to land within ±2GB of it so a 5-byte rel32 jmp can reach the cave: walk
+        // outward from the next 64KB-aligned address until VirtualAllocEx takes one.
+        if (near_addr != 0) {
+            constexpr uintptr_t k64k = 0x10000;
+            constexpr uintptr_t reach = 0x7FFF0000; // just under 2GB, leaving room for the cave + a jump
+            const uintptr_t anchor = (near_addr + k64k - 1) & ~(k64k - 1);
+            for (uintptr_t delta = 0; delta <= reach; delta += k64k) {
+                for (int dir : {1, -1}) {
+                    const uintptr_t probe = dir > 0 ? anchor + delta : anchor - delta;
+                    if (probe < k64k) continue;
+                    void* p = VirtualAllocEx(m_handle, reinterpret_cast<void*>(probe), size,
+                                             MEM_COMMIT | MEM_RESERVE, protection);
+                    if (p) return reinterpret_cast<uintptr_t>(p);
+                    if (delta == 0) break; // +0 and -0 are the same probe
+                }
+            }
+        }
+        void* p = VirtualAllocEx(m_handle, nullptr, size, MEM_COMMIT | MEM_RESERVE, protection);
+        return reinterpret_cast<uintptr_t>(p);
+    }
+
+    bool free_memory(uintptr_t address, size_t) override {
+        if (!m_handle || address == 0) return false;
+        return VirtualFreeEx(m_handle, reinterpret_cast<void*>(address), 0, MEM_RELEASE) != FALSE;
+    }
+
 private:
     HANDLE m_handle{nullptr};
     uint32_t m_pid{0};

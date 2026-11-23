@@ -15,6 +15,7 @@ add_executable(engine_tests
     test_memory_view.cpp
     test_hotkeys.cpp
     test_table_library.cpp
+    test_auto_assembler.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

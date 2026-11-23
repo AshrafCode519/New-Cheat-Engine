@@ -37,6 +37,20 @@ public:
     [[nodiscard]] virtual std::vector<MemoryRegion> query_regions(uint32_t filter_flags = FilterFlags::DefaultScanFilter) const = 0;
     [[nodiscard]] virtual std::vector<ModuleInfo> get_modules() const = 0;
 
+    // Reserves executable+writable memory in the target, for Auto-Assembler code caves. `near` (optional) asks
+    // for an address within ±2GB of it, so a rel32 jmp can reach it. Returns 0 on failure. The default refuses:
+    // a plain process can't allocate in another one.
+    virtual uintptr_t allocate_memory(size_t size, uint32_t protection = 0x40 /* PAGE_EXECUTE_READWRITE */,
+                                      uintptr_t near_addr = 0) {
+        (void)size; (void)protection; (void)near_addr;
+        return 0;
+    }
+    // Frees memory from allocate_memory. The default does nothing.
+    virtual bool free_memory(uintptr_t address, size_t size = 0) {
+        (void)address; (void)size;
+        return false;
+    }
+
     // Size of a pointer in the target: 4 for 32-bit processes (WOW64 on 64-bit Windows), 8 otherwise
     [[nodiscard]] virtual size_t pointer_size() const noexcept { return sizeof(uintptr_t); }
 

@@ -45,15 +45,38 @@ public:
     [[nodiscard]] uint32_t get_pid() const noexcept override { return 1; }
 
     bool read_raw(uintptr_t address, void* buffer, size_t size) const override {
+        if (auto* cave = cave_for(address, size)) {
+            std::memcpy(buffer, cave->second.data() + (address - cave->first), size);
+            return true;
+        }
         if (!contains(address, size)) return false;
         std::memcpy(buffer, m_memory.data() + (address - kBase), size);
         return true;
     }
 
     bool write_raw(uintptr_t address, const void* buffer, size_t size, bool = true) const override {
+        if (auto* cave = cave_for(address, size)) {
+            std::memcpy(cave->second.data() + (address - cave->first), buffer, size);
+            return true;
+        }
         if (!contains(address, size)) return false;
         std::memcpy(m_memory.data() + (address - kBase), buffer, size);
         return true;
+    }
+
+    // Caves live well above the main memory so their addresses never overlap it
+    uintptr_t allocate_memory(size_t size, uint32_t = 0x40, uintptr_t = 0) override {
+        const uintptr_t at = kCaveBase + m_cave_offset;
+        m_cave_offset += (size + 0xFFF) & ~uintptr_t{0xFFF}; // page-aligned, no two caves touch
+        m_caves.push_back({at, std::vector<uint8_t>(size, 0)});
+        return at;
+    }
+    bool free_memory(uintptr_t address, size_t = 0) override {
+        const auto before = m_caves.size();
+        m_caves.erase(std::remove_if(m_caves.begin(), m_caves.end(),
+                                     [&](const auto& c) { return c.first == address; }),
+                      m_caves.end());
+        return m_caves.size() < before;
     }
 
     [[nodiscard]] std::vector<hal::MemoryRegion> query_regions(uint32_t = hal::FilterFlags::DefaultScanFilter) const override {
@@ -95,6 +118,8 @@ public:
     }
 
 private:
+    static constexpr uintptr_t kCaveBase = 0x40000000; // where allocate_memory hands out addresses
+
     [[nodiscard]] bool contains(uintptr_t address, size_t size) const {
         if (address < kBase || address - kBase + size > m_memory.size()) return false;
         const size_t begin = address - kBase;
@@ -104,9 +129,18 @@ private:
         return true;
     }
 
+    std::pair<uintptr_t, std::vector<uint8_t>>* cave_for(uintptr_t address, size_t size) const {
+        for (auto& cave : m_caves) {
+            if (address >= cave.first && address + size <= cave.first + cave.second.size()) return &cave;
+        }
+        return nullptr;
+    }
+
     mutable std::vector<uint8_t> m_memory;
     std::vector<std::tuple<size_t, size_t, bool>> m_holes;
     std::vector<hal::ModuleInfo> m_modules;
+    mutable std::vector<std::pair<uintptr_t, std::vector<uint8_t>>> m_caves;
+    mutable uintptr_t m_cave_offset{0};
     size_t m_pointer_size{sizeof(uintptr_t)};
     bool m_attached{true};
     std::string m_name;
