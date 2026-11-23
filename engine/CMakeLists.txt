@@ -19,6 +19,7 @@ add_library(engine STATIC
     src/view/memory_view.cpp
     src/assembler/x86_assembler.cpp
     src/assembler/auto_assembler.cpp
+    src/view/structure_dissector.cpp
 )
 
 target_include_directories(engine PUBLIC
