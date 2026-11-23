@@ -56,9 +56,18 @@ struct TableEntry {
     [[nodiscard]] std::string location_string() const;
 };
 
+// An Auto-Assembler script saved in the table, turned on and off like an entry. `enabled` is the desired
+// state kept in the file; whether it is actually applied right now is runtime state the keeper holds.
+struct TableScript {
+    std::string name;
+    std::string body;        // the [ENABLE]/[DISABLE] script text
+    bool enabled{false};
+};
+
 struct CheatTable {
     std::string process_name;
     std::vector<TableEntry> entries;
+    std::vector<TableScript> scripts;
 };
 
 // Pointer paths that lead to the entry's current address, best first (scanned with small offsets

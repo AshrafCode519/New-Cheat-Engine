@@ -8,9 +8,11 @@
 #include "../scanner/value_tracker.hpp"
 #include "../table/cheat_table.hpp"
 #include "../view/memory_view.hpp"
+#include "../assembler/auto_assembler.hpp"
 #include <atomic>
 #include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -50,6 +52,7 @@ public:
         bool attached{false};
         size_t unfrozen{0};     // absolute entries that belonged to the previous process
         std::string table_note; // what the table library did ("Opened the table of game.exe ..."), or empty
+        std::string scripts_note; // which saved-on scripts were re-applied, and which failed
         std::vector<ReconcileLine> reconciled; // permanent entries, found before the freeze thread writes them
     };
     // Swaps the process under the lock, so the freeze thread never writes into the new process with the
@@ -106,6 +109,16 @@ public:
     // Saves the open table to the library now, instead of at the next automatic save
     Outcome save_to_library();
 
+    // Auto-Assembler scripts saved in the table and turned on/off like entries (see table::TableScript).
+    // Enabling runs the script's [ENABLE]; disabling runs [DISABLE] (or rolls back the recorded bytes).
+    // Script names are unique. Scripts marked enabled are re-applied on attach, like freezes resume.
+    Outcome add_script(const std::string& name, const std::string& body);
+    Outcome set_script_body(size_t index, const std::string& body); // disables it first if it was on
+    Outcome set_script_enabled(size_t index, bool on);
+    Outcome remove_script(size_t index); // disables it first if it was on
+    [[nodiscard]] std::optional<table::TableScript> script(size_t index);
+    [[nodiscard]] size_t script_count();
+
 private:
     void freeze_loop();
     Outcome apply_hotkey(table::TableEntry& entry, const table::Hotkey& hotkey); // with the lock held
@@ -115,7 +128,10 @@ private:
     std::vector<ReconcileLine> reconcile_locked();
     Outcome autosave(bool force);
     Outcome autosave_saving(bool force); // with m_save_mutex held
+    Outcome set_script_enabled_locked(size_t index, bool on); // with m_mutex held
+    std::string reapply_scripts_locked(); // on attach: re-enable the scripts marked enabled, report failures
     [[nodiscard]] bool valid(size_t index) const { return index < m_table.entries.size(); }
+    [[nodiscard]] bool valid_script(size_t index) const { return index < m_table.scripts.size(); }
 
     std::shared_ptr<hal::IProcess> m_process;
     std::mutex m_mutex;
@@ -133,6 +149,10 @@ private:
     std::mutex m_save_mutex;
     std::filesystem::path m_library; // guarded by m_mutex
     std::string m_saved_text;        // the open table as last saved to the library (guarded by m_mutex)
+
+    // Auto-Assembler scripts: the assembler (remade on attach) and what each running script changed, by name
+    std::unique_ptr<assembler::AutoAssembler> m_assembler; // guarded by m_mutex
+    std::map<std::string, assembler::ScriptEffect> m_active; // guarded by m_mutex
 
     std::thread m_freeze_thread; // last: it starts once every member above exists
 };
@@ -155,6 +175,7 @@ public:
         bool read_only{false};  // writing and freezing won't work
         size_t unfrozen{0};     // absolute table entries that belonged to the previous process
         std::string table_note; // what the table library did, or empty
+        std::string scripts_note; // which saved-on Auto-Assembler scripts were re-applied, or empty
         std::vector<TableKeeper::ReconcileLine> reconciled;
     };
     // Attaches, starts a fresh search, drops the old noise map and re-finds permanent table entries.

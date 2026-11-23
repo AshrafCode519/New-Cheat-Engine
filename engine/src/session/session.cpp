@@ -127,9 +127,36 @@ TableKeeper::AttachResult TableKeeper::attach(uint32_t pid) {
         }
         // Permanent entries find their value now, before the freeze thread writes through last run's path
         if (result.attached) result.reconciled = reconcile_locked();
+
+        // A fresh assembler for this process (its caves and symbols belong to the old one); then re-apply
+        // the scripts the table saved as on, like freezes resume
+        m_active.clear();
+        if (result.attached) {
+            m_assembler = std::make_unique<assembler::AutoAssembler>(m_process);
+            result.scripts_note = reapply_scripts_locked();
+        } else {
+            m_assembler.reset();
+        }
     }
     if (table_changed) rebind(); // the hotkeys of the table now open
     return result;
+}
+
+// On attach: re-enable the scripts the table saved as on. A script that fails (its pattern isn't found, a
+// line won't assemble) is turned off and named in the note, so the user knows it isn't applied.
+std::string TableKeeper::reapply_scripts_locked() {
+    size_t on = 0;
+    std::string failures;
+    for (size_t i = 0; i < m_table.scripts.size(); ++i) {
+        if (!m_table.scripts[i].enabled) continue;
+        const auto outcome = set_script_enabled_locked(i, true);
+        if (outcome.ok) ++on;
+        else failures += (failures.empty() ? "" : "; ") + m_table.scripts[i].name + " (" + outcome.message + ")";
+    }
+    std::string note;
+    if (on) note = "Re-applied " + std::to_string(on) + (on == 1 ? " script" : " scripts") + ".";
+    if (!failures.empty()) note += (note.empty() ? "" : " ") + std::string("Could not apply: ") + failures + ".";
+    return note;
 }
 
 // The same program again (a restart) keeps the table. Another program: the table goes to the library
@@ -181,6 +208,15 @@ std::string TableKeeper::switch_table_locked(const std::string& program, bool& c
 
 void TableKeeper::detach() {
     std::lock_guard<std::mutex> lock(m_mutex);
+    // Undo running scripts while the handle is still open, so the target isn't left patched. The enabled
+    // flags stay as they are, so the next attach re-applies them.
+    if (m_assembler) {
+        for (auto& s : m_table.scripts) {
+            if (const auto it = m_active.find(s.name); it != m_active.end()) m_assembler->disable(s.body, it->second);
+        }
+    }
+    m_active.clear();
+    m_assembler.reset();
     m_process->detach();
     m_modules.clear();
 }
@@ -300,6 +336,13 @@ Outcome TableKeeper::load(const std::string& path, std::vector<ReconcileLine>* r
         std::lock_guard<std::mutex> saving(m_save_mutex);
         autosave_saving(false); // the open table's latest changes
         std::lock_guard<std::mutex> lock(m_mutex);
+        // Undo the current table's running scripts before it is replaced, then forget them
+        if (m_assembler) {
+            for (size_t i = 0; i < m_table.scripts.size(); ++i) {
+                if (m_table.scripts[i].enabled) set_script_enabled_locked(i, false);
+            }
+        }
+        m_active.clear();
         m_table = std::move(*loaded);
         m_saved_text.clear(); // not from the library: the first save keeps the library's own table as .bak
         const std::string program = m_process->is_attached() ? m_process->name() : std::string();
@@ -313,9 +356,12 @@ Outcome TableKeeper::load(const std::string& path, std::vector<ReconcileLine>* r
         message = "Loaded " + std::to_string(m_table.entries.size()) + " entries for '" + m_table.process_name + "'";
         if (frozen) message += ", " + std::to_string(frozen) + " frozen";
         if (hotkeys) message += ", " + std::to_string(hotkeys) + " hotkeys";
+        if (!m_table.scripts.empty()) message += ", " + std::to_string(m_table.scripts.size()) + " scripts";
         message += ".";
         auto lines = m_process->is_attached() ? reconcile_locked() : std::vector<ReconcileLine>{};
         if (reconciled) *reconciled = std::move(lines);
+        const std::string scripts_note = (m_assembler ? reapply_scripts_locked() : std::string());
+        if (!scripts_note.empty()) message += " " + scripts_note;
     }
     rebind();
     return Outcome::success(message);
@@ -559,6 +605,75 @@ std::filesystem::path default_library_folder() {
     return "tables";
 }
 
+// ---- Auto-Assembler scripts ----------------------------------------------------------------------
+
+Outcome TableKeeper::add_script(const std::string& name, const std::string& body) {
+    const std::string clean = name.empty() ? "script" : name;
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (const auto& s : m_table.scripts) {
+        if (s.name == clean) return Outcome::fail("A script named '" + clean + "' already exists.");
+    }
+    m_table.scripts.push_back({clean, body, false});
+    return Outcome::success("Added script '" + clean + "' (off). Turn it on to apply it.");
+}
+
+Outcome TableKeeper::set_script_body(size_t index, const std::string& body) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!valid_script(index)) return Outcome::fail("No script #" + std::to_string(index) + ".");
+    if (m_table.scripts[index].enabled) set_script_enabled_locked(index, false); // its old patch is undone first
+    m_table.scripts[index].body = body;
+    return Outcome::success("Updated script '" + m_table.scripts[index].name + "' (off).");
+}
+
+Outcome TableKeeper::set_script_enabled(size_t index, bool on) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return set_script_enabled_locked(index, on);
+}
+
+// Enables or disables the script by running its [ENABLE] / [DISABLE] through the assembler. With m_mutex
+// held, so the freeze thread doesn't write while a script is patching.
+Outcome TableKeeper::set_script_enabled_locked(size_t index, bool on) {
+    if (!valid_script(index)) return Outcome::fail("No script #" + std::to_string(index) + ".");
+    auto& s = m_table.scripts[index];
+    if (!m_assembler) return Outcome::fail("Attach to the game first.");
+
+    if (on) {
+        if (m_active.count(s.name)) return Outcome::success("'" + s.name + "' is already on.");
+        auto result = m_assembler->enable(s.body);
+        if (!result.ok) { s.enabled = false; return Outcome::fail(result.message); }
+        m_active[s.name] = std::move(result.effect);
+        s.enabled = true;
+        return Outcome::success("'" + s.name + "' on: " + result.message);
+    }
+
+    const auto it = m_active.find(s.name);
+    if (it == m_active.end()) { s.enabled = false; return Outcome::success("'" + s.name + "' is already off."); }
+    auto result = m_assembler->disable(s.body, it->second);
+    m_active.erase(it);
+    s.enabled = false;
+    return Outcome::success("'" + s.name + "' off: " + result.message);
+}
+
+Outcome TableKeeper::remove_script(size_t index) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!valid_script(index)) return Outcome::fail("No script #" + std::to_string(index) + ".");
+    if (m_table.scripts[index].enabled) set_script_enabled_locked(index, false);
+    const std::string name = m_table.scripts[index].name;
+    m_table.scripts.erase(m_table.scripts.begin() + static_cast<std::ptrdiff_t>(index));
+    return Outcome::success("Removed script '" + name + "'.");
+}
+
+std::optional<table::TableScript> TableKeeper::script(size_t index) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    if (!valid_script(index)) return std::nullopt;
+    return m_table.scripts[index];
+}
+
+size_t TableKeeper::script_count() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_table.scripts.size();
+}
+
 void TableKeeper::set_library(std::filesystem::path folder) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_library = std::move(folder);
@@ -673,6 +788,7 @@ Session::AttachReport Session::attach(uint32_t pid) {
     report.ok = attached.attached;
     report.unfrozen = attached.unfrozen;
     report.table_note = attached.table_note;
+    report.scripts_note = attached.scripts_note;
     m_scans.clear();
     m_noise.reset();
     if (!report.ok) {

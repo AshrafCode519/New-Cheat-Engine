@@ -402,12 +402,19 @@ std::string to_json(const CheatTable& table) {
         entries.push_back(item);
     }
 
-    const json doc = {
+    json doc = {
         {"format", FORMAT_NAME},
         {"version", FORMAT_VERSION},
         {"process", table.process_name},
         {"entries", entries},
     };
+    if (!table.scripts.empty()) {
+        json scripts = json::array();
+        for (const auto& s : table.scripts) {
+            scripts.push_back({{"name", s.name}, {"body", s.body}, {"enabled", s.enabled}});
+        }
+        doc["scripts"] = scripts;
+    }
     return doc.dump(2) + "\n";
 }
 
@@ -479,6 +486,19 @@ std::optional<CheatTable> from_json(const std::string& text) {
         }
 
         table.entries.push_back(std::move(e));
+    }
+
+    if (const auto scripts = doc.find("scripts"); scripts != doc.end()) {
+        if (!scripts->is_array()) return std::nullopt;
+        for (const auto& item : *scripts) {
+            if (!item.is_object()) return std::nullopt;
+            TableScript s;
+            s.name = item.value("name", "");
+            s.body = item.value("body", "");
+            s.enabled = item.value("enabled", false);
+            if (s.name.empty()) return std::nullopt;
+            table.scripts.push_back(std::move(s));
+        }
     }
 
     return table;

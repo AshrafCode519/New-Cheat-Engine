@@ -17,6 +17,7 @@ add_executable(engine_tests
     test_table_library.cpp
     test_auto_assembler.cpp
     test_structure_dissector.cpp
+    test_table_scripts.cpp
 )
 
 target_include_directories(engine_tests PRIVATE
