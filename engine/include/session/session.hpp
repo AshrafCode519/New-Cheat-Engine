@@ -9,6 +9,7 @@
 #include "../table/cheat_table.hpp"
 #include "../view/memory_view.hpp"
 #include "../assembler/auto_assembler.hpp"
+#include "../debugger/access_watcher.hpp"
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -201,6 +202,14 @@ public:
     [[nodiscard]] std::unique_ptr<scanner::ValueTracker> new_tracker(std::vector<scanner::DataType> types) const;
     [[nodiscard]] std::vector<scanner::PointerPath> find_permanent_paths(const table::TableEntry& entry);
 
+    // "Find what writes/accesses this address": a hardware breakpoint reports the instructions that touch it
+    // (see debugger::AccessWatcher). Change the value in the game, then read the hits. Only one at a time.
+    bool watch(uintptr_t address, size_t size, debugger::WatchKind kind);
+    void stop_watch() { m_watcher.stop(); }
+    [[nodiscard]] bool watching() const { return m_watcher.watching(); }
+    [[nodiscard]] uintptr_t watched_address() const { return m_watcher.address(); }
+    [[nodiscard]] std::vector<debugger::AccessHit> watch_hits() const { return m_watcher.hits(); }
+
     [[nodiscard]] hal::IProcess& process() { return *m_process; }
     [[nodiscard]] const std::shared_ptr<hal::IProcess>& process_ptr() const { return m_process; }
     [[nodiscard]] ScanSession& scans() { return m_scans; }
@@ -214,6 +223,7 @@ private:
     ScanSession m_scans;
     std::unique_ptr<TableKeeper> m_table;
     std::vector<scanner::PointerPath> m_pointer_paths; // kept across attach: module-relative, meant for the next run
+    debugger::AccessWatcher m_watcher;
 };
 
 } // namespace nce::session

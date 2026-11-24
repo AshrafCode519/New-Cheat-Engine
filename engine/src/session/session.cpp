@@ -783,6 +783,7 @@ Session::Session(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IH
 {}
 
 Session::AttachReport Session::attach(uint32_t pid) {
+    m_watcher.stop(); // belonged to the previous process
     AttachReport report;
     const auto attached = m_table->attach(pid);
     report.ok = attached.attached;
@@ -805,11 +806,17 @@ Session::AttachReport Session::attach(uint32_t pid) {
 }
 
 void Session::detach() {
+    m_watcher.stop();
     m_table->detach();
     m_scans.clear();
     m_scans.set_scanner(nullptr, nullptr);
     m_scanner.reset();
     m_noise.reset();
+}
+
+bool Session::watch(uintptr_t address, size_t size, debugger::WatchKind kind) {
+    if (!attached()) return false;
+    return m_watcher.start(m_process, address, size, kind);
 }
 
 std::optional<hal::ProcessInfo> Session::find_restart() const {

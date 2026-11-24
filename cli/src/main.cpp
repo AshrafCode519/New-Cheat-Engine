@@ -28,6 +28,7 @@
 #include "session/session.hpp"
 #include "scanner/grouped_scanner.hpp"
 #include "view/structure_dissector.hpp"
+#include "debugger/access_watcher.hpp"
 #include <fstream>
 #include "utils/hex_utils.hpp"
 
@@ -135,6 +136,9 @@ void print_help() {
               << "                                    'view' again marks what changed (default: 8 slots before, 24 after)\n"
               << "  dissect <addr|#result|t#> [bytes] - Read an object as a C++ struct: finds the vtable and the class\n"
               << "                                    name from RTTI, and names each field by what it is (default 128 bytes)\n"
+              << "  findwrites <addr|#result|t#> [size] / findaccess ... - Watch what code writes/reads an address\n"
+              << "                                    (hardware breakpoint). Change the value in the game, then 'hits';\n"
+              << "                                    each hit shows the instruction and its base pointer. 'watchstop' ends it\n"
               << "  script list | add <name> <file> | on <#> | off <#> | show <#> | del <#> - Auto-Assembler scripts kept\n"
               << "                                    in the table (patch the game's code; offline games only). 'add' reads a\n"
               << "                                    script file with [ENABLE]/[DISABLE]; 'on'/'off' apply and undo it\n"
@@ -1119,6 +1123,40 @@ void cmd_dissect(const std::string& where, size_t bytes) {
     std::cout << "\n" << layout.to_cpp() << "\n";
 }
 
+// findwrites / findaccess <addr|#result|t#> [size]: watch what touches an address
+void cmd_find_access(const std::string& where, size_t size, debugger::WatchKind kind) {
+    if (!require_attached()) return;
+    auto address = resolve_target(where);
+    if (!address) return;
+    if (size != 1 && size != 2 && size != 4 && size != 8) size = 4;
+    if (!ses().watch(*address, size, kind)) {
+        std::cerr << "[-] Could not start the watch. Another debugger may be attached, or run as Administrator.\n";
+        return;
+    }
+    std::cout << "[*] Watching " << utils::format_address(*address) << " for "
+              << (kind == debugger::WatchKind::Access ? "reads/writes" : "writes") << ".\n"
+              << "    Change the value in the game, then run 'hits'. 'watchstop' ends it.\n";
+}
+
+void cmd_hits() {
+    if (!ses().watching()) {
+        std::cout << "[-] Not watching anything. 'findwrites <addr>' starts a watch.\n";
+        return;
+    }
+    const auto hits = ses().watch_hits();
+    std::cout << "\n[*] " << hits.size() << " instruction(s) touched " << utils::format_address(ses().watched_address())
+              << " so far (change the value again for more):\n";
+    for (const auto& h : hits) {
+        std::cout << "  " << std::left << std::setw(26) << h.location << "  " << std::setw(32) << h.disassembly
+                  << std::right << "  x" << h.count << "\n";
+        if (!h.base_register.empty() && h.base_pointer()) {
+            std::cout << "      base: " << h.base_register << " = " << utils::format_address(h.base_pointer())
+                      << " (+0x" << std::hex << h.base_offset << std::dec << ") - pointer-scan this for a stable path\n";
+        }
+    }
+    std::cout << "\n";
+}
+
 // script list | add <name> <file> | on <#> | off <#> | show <#> | del <#>
 void cmd_script(const std::string& sub, const std::string& arg1, const std::string& arg2) {
     auto& table = ses().table();
@@ -1383,6 +1421,20 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: dissect <addr|#result|t#> [bytes]\n";
         }
+    } else if (cmd == "findwrites" || cmd == "findaccess") {
+        std::string where;
+        size_t size = 4;
+        if (iss >> where) {
+            iss >> size;
+            cmd_find_access(where, size, cmd == "findaccess" ? debugger::WatchKind::Access : debugger::WatchKind::Write);
+        } else {
+            std::cout << "Usage: " << cmd << " <addr|#result|t#> [size=4]\n";
+        }
+    } else if (cmd == "hits") {
+        cmd_hits();
+    } else if (cmd == "watchstop") {
+        ses().stop_watch();
+        std::cout << "[*] Watch stopped.\n";
     } else if (cmd == "script") {
         std::string sub, arg1, arg2;
         iss >> sub >> arg1;
