@@ -20,6 +20,8 @@ add_library(engine STATIC
     src/assembler/x86_assembler.cpp
     src/assembler/auto_assembler.cpp
     src/view/structure_dissector.cpp
+    src/debugger/disassembler.cpp
+    src/debugger/access_watcher_win32.cpp
 )
 
 target_include_directories(engine PUBLIC
