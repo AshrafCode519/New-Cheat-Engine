@@ -27,6 +27,8 @@
 
 #include "session/session.hpp"
 #include "scanner/grouped_scanner.hpp"
+#include "view/structure_dissector.hpp"
+#include <fstream>
 #include "utils/hex_utils.hpp"
 
 using namespace nce;
@@ -131,6 +133,11 @@ void print_help() {
               << "  view <addr|#result|t#> [before] [after] - The memory around a value, each 4 bytes read as what\n"
               << "                                    they most likely are (int, float, double, pointer, text).\n"
               << "                                    'view' again marks what changed (default: 8 slots before, 24 after)\n"
+              << "  dissect <addr|#result|t#> [bytes] - Read an object as a C++ struct: finds the vtable and the class\n"
+              << "                                    name from RTTI, and names each field by what it is (default 128 bytes)\n"
+              << "  script list | add <name> <file> | on <#> | off <#> | show <#> | del <#> - Auto-Assembler scripts kept\n"
+              << "                                    in the table (patch the game's code; offline games only). 'add' reads a\n"
+              << "                                    script file with [ENABLE]/[DISABLE]; 'on'/'off' apply and undo it\n"
               << "  freeze <addr> <type> <val>      - Add an address to the table, frozen at a value\n"
               << "  frozen                          - List the frozen table entries\n"
               << "  unfreeze [#|all]                - Stop freezing a table entry (default: all)\n\n"
@@ -262,6 +269,7 @@ void cmd_attach(uint32_t pid) {
         std::cout << "[!] Only read access was granted: writing and freezing won't work. Run as Administrator.\n";
     }
     if (!attached.table_note.empty()) std::cout << "[*] Table: " << attached.table_note << "\n";
+    if (!attached.scripts_note.empty()) std::cout << "[*] Scripts: " << attached.scripts_note << "\n";
     learn_noise(4);
     print_reconciled(attached.reconciled);
 }
@@ -1072,6 +1080,85 @@ void cmd_view(const std::string& where, std::optional<size_t> before, std::optio
               << " 'add <addr> <type>' puts a value in the table.\n\n";
 }
 
+// Resolves <addr|#result|t#entry> to an address in the target (prints the error and returns nullopt)
+std::optional<uintptr_t> resolve_target(const std::string& where) {
+    if (where.empty()) { std::cerr << "[-] Give an address, #result or t<entry>.\n"; return std::nullopt; }
+    if (where[0] == '#') {
+        const auto& results = ses().scans().state().results;
+        auto index = parse_index(where.substr(1), results.count(), "result");
+        if (!index) return std::nullopt;
+        return results.address(*index);
+    }
+    if (where[0] == 't' || where[0] == 'T') {
+        auto index = parse_table_index(where.substr(1));
+        if (!index) return std::nullopt;
+        const uintptr_t addr = ses().table().with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>& modules) {
+            return t.entries[*index].address(ses().process(), modules);
+        });
+        if (addr == 0) { std::cerr << "[-] Table entry #" << *index << " doesn't lead to an address now.\n"; return std::nullopt; }
+        return addr;
+    }
+    return parse_address_arg(where);
+}
+
+// dissect <addr|#result|t#> [bytes]: reads an object as a C++ struct
+void cmd_dissect(const std::string& where, size_t bytes) {
+    if (!require_attached()) return;
+    auto address = resolve_target(where);
+    if (!address) return;
+
+    view::StructureDissector dissector(ses().process_ptr());
+    const auto layout = dissector.dissect(*address, std::clamp<size_t>(bytes, 8, 4096), ses().process().get_modules());
+    if (!layout.class_name.empty()) {
+        std::cout << "[*] RTTI class: " << layout.class_name;
+        if (layout.vtable_functions) std::cout << "  (vtable: " << layout.vtable_functions << " functions)";
+        std::cout << "\n";
+    } else if (layout.vtable_functions) {
+        std::cout << "[*] Has a vtable with " << layout.vtable_functions << " functions (no RTTI name).\n";
+    }
+    std::cout << "\n" << layout.to_cpp() << "\n";
+}
+
+// script list | add <name> <file> | on <#> | off <#> | show <#> | del <#>
+void cmd_script(const std::string& sub, const std::string& arg1, const std::string& arg2) {
+    auto& table = ses().table();
+    if (sub == "list" || sub.empty()) {
+        if (table.script_count() == 0) {
+            std::cout << "[-] No scripts. 'script add <name> <file>' adds one from a file with [ENABLE]/[DISABLE].\n";
+            return;
+        }
+        std::cout << "\n Index  State  Name\n----------------------------------------\n";
+        for (size_t i = 0; i < table.script_count(); ++i) {
+            const auto s = table.script(i);
+            std::cout << " [" << std::right << std::setw(3) << i << "]  " << (s->enabled ? "ON " : "off")
+                      << "    " << s->name << "\n";
+        }
+        std::cout << "----------------------------------------\n";
+        std::cout << " These patch the game's own code: use them with offline games only.\n\n";
+        return;
+    }
+    if (sub == "add") {
+        if (arg1.empty() || arg2.empty()) { std::cout << "Usage: script add <name> <file>\n"; return; }
+        std::ifstream in(arg2, std::ios::binary);
+        if (!in) { std::cerr << "[-] Can't read " << arg2 << "\n"; return; }
+        std::ostringstream body;
+        body << in.rdbuf();
+        report(table.add_script(arg1, body.str()));
+        return;
+    }
+    auto index = parse_index(arg1, table.script_count(), "script");
+    if (sub == "on") { if (index) report(table.set_script_enabled(*index, true)); }
+    else if (sub == "off") { if (index) report(table.set_script_enabled(*index, false)); }
+    else if (sub == "del") { if (index) report(table.remove_script(*index)); }
+    else if (sub == "show") {
+        if (!index) return;
+        const auto s = table.script(*index);
+        std::cout << "\n--- " << s->name << " (" << (s->enabled ? "on" : "off") << ") ---\n" << s->body << "\n";
+    } else {
+        std::cout << "Usage: script list | add <name> <file> | on <#> | off <#> | show <#> | del <#>\n";
+    }
+}
+
 // Runs one command line. Returns false when the user asked to quit.
 bool handle_command(const std::string& line) {
     std::istringstream iss(line);
@@ -1287,6 +1374,20 @@ bool handle_command(const std::string& line) {
         } else {
             std::cout << "Usage: dump <addr> [size]\n";
         }
+    } else if (cmd == "dissect") {
+        std::string where;
+        size_t bytes = 128;
+        if (iss >> where) {
+            iss >> bytes;
+            cmd_dissect(where, bytes);
+        } else {
+            std::cout << "Usage: dissect <addr|#result|t#> [bytes]\n";
+        }
+    } else if (cmd == "script") {
+        std::string sub, arg1, arg2;
+        iss >> sub >> arg1;
+        std::getline(iss >> std::ws, arg2);
+        cmd_script(sub, arg1, arg2);
     } else if (cmd == "view") {
         std::string where;
         std::optional<size_t> before, after;
