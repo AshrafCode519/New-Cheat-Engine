@@ -18,6 +18,7 @@
 #include "imgui_stdlib.h"
 
 #include "session/session.hpp"
+#include "view/structure_dissector.hpp"
 #include "utils/hex_utils.hpp"
 
 #include <algorithm>
@@ -170,7 +171,7 @@ const char* const kFloatModes[] = {"rounded", "truncated", "exact"}; // in Float
 // A finished job hands back the step that applies its result on the UI thread
 using ApplyResult = std::function<void()>;
 
-enum class Tab { Keep, PointerScanner, Memory, Hotkeys }; // Keep: leave the tab the user chose
+enum class Tab { Keep, PointerScanner, Memory, Hotkeys, Scripts, Dissect }; // Keep: leave the tab the user chose
 
 const char* const kHotkeyActions[] = {"Toggle freeze", "Set to", "Add"}; // in table::Hotkey::Action order
 
@@ -241,6 +242,20 @@ struct App {
     bool hotkey_recording = false; // the next key pressed in this window becomes hotkey_keys
     std::string hotkey_note;
     bool memory_scroll = false;         // scroll the opened address into view when its row is drawn
+
+    // Scripts tab: the script being written
+    std::string script_name;
+    std::string script_body =
+        "[ENABLE]\n\n[DISABLE]\n";
+    std::string script_note;
+    int editing_script = -1; // the row whose body is loaded in the editor, or -1
+
+    // Dissect tab: the object being read as a struct
+    std::string dissect_input;
+    int dissect_bytes = 128;
+    std::optional<view::StructLayout> dissect_result;
+    std::string dissect_note;
+    bool dissect_pending = false; // run the dissection once, next frame it's attached (for --view + --tab dissect)
 
     bool track_pending = false; // --track: start once the noise is learned
 
@@ -380,6 +395,7 @@ void attach(App& app, const hal::ProcessInfo& info, const std::string& note = ""
             app.status += " Only read access was granted: writing and freezing won't work (run as Administrator).";
         }
         if (!report.table_note.empty()) app.status += " " + report.table_note;
+        if (!report.scripts_note.empty()) app.status += " " + report.scripts_note;
         learn_noise(app, app.status + " ");
     } else {
         app.attached_label.clear();
@@ -1353,6 +1369,178 @@ void draw_hotkeys(App& app) {
     if (remove) show(app, keeper.remove_hotkey(bound[*remove].row, bound[*remove].hotkey.keys));
 }
 
+// The Scripts tab: Auto-Assembler scripts saved in the table, with an editor and on/off toggles
+void draw_scripts(App& app) {
+    auto& keeper = app.session.table();
+
+    ImGui::TextWrapped("Auto-Assembler scripts patch the game's own code (an \"infinite health\" hook, for "
+                       "example). Use them with offline / single-player games you run yourself; anti-cheat "
+                       "treats this as cheating.");
+    ImGui::Separator();
+
+    // The list of saved scripts
+    struct Row { size_t index; std::string name; bool enabled; };
+    std::vector<Row> rows;
+    keeper.with([&](const table::CheatTable& t, const std::vector<hal::ModuleInfo>&) {
+        for (size_t i = 0; i < t.scripts.size(); ++i) rows.push_back({i, t.scripts[i].name, t.scripts[i].enabled});
+    });
+
+    if (!rows.empty()) {
+        const ImGuiTableFlags flags = ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter | ImGuiTableFlags_BordersV;
+        if (ImGui::BeginTable("scripts", 3, flags, ImVec2(0, em(8)))) {
+            ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, em(2.5f));
+            ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(8));
+            ImGui::TableHeadersRow();
+            std::optional<size_t> remove;
+            std::optional<std::pair<size_t, bool>> toggle;
+            std::optional<size_t> edit;
+            for (const auto& r : rows) {
+                ImGui::TableNextRow();
+                ImGui::PushID(static_cast<int>(r.index));
+                ImGui::TableNextColumn();
+                bool on = r.enabled;
+                if (ImGui::Checkbox("##on", &on)) toggle = {r.index, on};
+                ImGui::TableNextColumn();
+                ImGui::AlignTextToFramePadding();
+                ImGui::TextUnformatted(r.name.c_str());
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("Edit")) edit = r.index;
+                ImGui::SameLine();
+                if (ImGui::SmallButton("X")) remove = r.index;
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+            if (toggle) show(app, keeper.set_script_enabled(toggle->first, toggle->second));
+            if (edit) {
+                if (const auto s = keeper.script(*edit)) {
+                    app.script_name = s->name;
+                    app.script_body = s->body;
+                    app.editing_script = static_cast<int>(*edit);
+                    app.script_note = "Editing '" + s->name + "'. Save puts the changes back (and turns it off).";
+                }
+            }
+            if (remove) show(app, keeper.remove_script(*remove));
+        }
+    } else {
+        ImGui::TextDisabled("No scripts yet. Write one below, with [ENABLE] and [DISABLE] sections.");
+    }
+
+    ImGui::Separator();
+    ImGui::SetNextItemWidth(em(14));
+    ImGui::InputTextWithHint("##script_name", "script name", &app.script_name);
+    ImGui::SameLine();
+    const bool editing = app.editing_script >= 0;
+    if (ImGui::Button(editing ? "Save changes" : "Add script")) {
+        if (app.script_name.empty()) {
+            app.script_note = "Give the script a name.";
+        } else if (editing) {
+            const auto s = keeper.script(static_cast<size_t>(app.editing_script));
+            session::Outcome done = s && s->name == app.script_name
+                ? keeper.set_script_body(static_cast<size_t>(app.editing_script), app.script_body)
+                : session::Outcome::fail("The name changed; remove the old one and add this as new.");
+            show(app, done);
+            app.script_note = done.message;
+            if (done.ok) { app.editing_script = -1; }
+        } else {
+            const auto done = keeper.add_script(app.script_name, app.script_body);
+            show(app, done);
+            app.script_note = done.message;
+        }
+    }
+    if (editing) {
+        ImGui::SameLine();
+        if (ImGui::Button("New")) {
+            app.editing_script = -1;
+            app.script_name.clear();
+            app.script_body = "[ENABLE]\n\n[DISABLE]\n";
+            app.script_note.clear();
+        }
+    }
+    if (!app.script_note.empty()) ImGui::TextWrapped("%s", app.script_note.c_str());
+    ImGui::InputTextMultiline("##script_body", &app.script_body, ImVec2(-FLT_MIN, ImGui::GetContentRegionAvail().y),
+                              ImGuiInputTextFlags_AllowTabInput);
+}
+
+// The Dissect tab: read an object as a C++ struct and copy it out
+void draw_dissect(App& app) {
+    // Launched with an address to dissect: do it once, now that a process is attached
+    if (app.dissect_pending && is_attached(app)) {
+        app.dissect_pending = false;
+        if (const uintptr_t address = utils::parse_address(app.dissect_input)) {
+            view::StructureDissector d(app.session.process_ptr());
+            app.dissect_result = d.dissect(address, static_cast<size_t>(app.dissect_bytes),
+                                           app.session.process().get_modules());
+        }
+    }
+    ImGui::SetNextItemWidth(em(14));
+    ImGui::InputTextWithHint("##dissect_addr", "0x... or a result/entry address", &app.dissect_input);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(em(5));
+    ImGui::InputInt("bytes", &app.dissect_bytes);
+    app.dissect_bytes = std::clamp(app.dissect_bytes, 8, 4096);
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!is_attached(app) || job_running(app));
+    if (ImGui::Button("Dissect")) {
+        const uintptr_t address = utils::parse_address(app.dissect_input);
+        if (address == 0) {
+            app.dissect_note = "Enter the object's address (e.g. a pointer value from the Memory tab).";
+            app.dissect_result.reset();
+        } else {
+            view::StructureDissector d(app.session.process_ptr());
+            app.dissect_result = d.dissect(address, static_cast<size_t>(app.dissect_bytes),
+                                           app.session.process().get_modules());
+            app.dissect_note.clear();
+        }
+    }
+    ImGui::EndDisabled();
+    if (app.dissect_result && !app.dissect_result->fields.empty()) {
+        ImGui::SameLine();
+        if (ImGui::Button("Copy C++")) {
+            ImGui::SetClipboardText(app.dissect_result->to_cpp().c_str());
+            app.dissect_note = "Copied the struct to the clipboard.";
+        }
+    }
+    if (!app.dissect_note.empty()) ImGui::TextWrapped("%s", app.dissect_note.c_str());
+
+    if (!app.dissect_result) {
+        ImGui::TextDisabled("Reads an object as a C++ struct: the vtable, the class name from RTTI, and each field "
+                            "by what it is. Click a pointer's address in the Memory tab, then paste it here.");
+        return;
+    }
+    const auto& layout = *app.dissect_result;
+    if (!layout.class_name.empty()) {
+        ImGui::Text("class %s", layout.class_name.c_str());
+        if (layout.vtable_functions) { ImGui::SameLine(); ImGui::TextDisabled("(vtable: %zu functions)", layout.vtable_functions); }
+    } else if (layout.vtable_functions) {
+        ImGui::TextDisabled("vtable with %zu functions (no RTTI name)", layout.vtable_functions);
+    } else {
+        ImGui::TextDisabled("no vtable found at this address");
+    }
+
+    const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
+                                  ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
+    if (!ImGui::BeginTable("dissect", 4, flags, ImVec2(0, ImGui::GetContentRegionAvail().y))) return;
+    ImGui::TableSetupScrollFreeze(0, 1);
+    ImGui::TableSetupColumn("Offset", ImGuiTableColumnFlags_WidthFixed, em(4));
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, em(7));
+    ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, em(9));
+    ImGui::TableSetupColumn("Note");
+    ImGui::TableHeadersRow();
+    for (const auto& f : layout.fields) {
+        ImGui::TableNextRow();
+        ImGui::TableNextColumn();
+        ImGui::Text("+0x%zx", f.offset);
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(f.type.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(f.value.c_str());
+        ImGui::TableNextColumn();
+        ImGui::TextUnformatted(f.note.c_str());
+    }
+    ImGui::EndTable();
+}
+
 void draw_ui(App& app) {
     const ImGuiViewport* viewport = ImGui::GetMainViewport();
     ImGui::SetNextWindowPos(viewport->WorkPos);
@@ -1386,6 +1574,8 @@ void draw_ui(App& app) {
             const ImGuiTabItemFlags pointer_flags = flags_for(Tab::PointerScanner);
             const ImGuiTabItemFlags memory_flags = flags_for(Tab::Memory);
             const ImGuiTabItemFlags hotkey_flags = flags_for(Tab::Hotkeys);
+            const ImGuiTabItemFlags scripts_flags = flags_for(Tab::Scripts);
+            const ImGuiTabItemFlags dissect_flags = flags_for(Tab::Dissect);
             app.select_tab = Tab::Keep;
             if (ImGui::BeginTabItem("Pointer scanner", nullptr, pointer_flags)) {
                 draw_pointer_scanner(app);
@@ -1397,6 +1587,14 @@ void draw_ui(App& app) {
             }
             if (ImGui::BeginTabItem("Hotkeys", nullptr, hotkey_flags)) {
                 draw_hotkeys(app);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Scripts", nullptr, scripts_flags)) {
+                draw_scripts(app);
+                ImGui::EndTabItem();
+            }
+            if (ImGui::BeginTabItem("Dissect", nullptr, dissect_flags)) {
+                draw_dissect(app);
                 ImGui::EndTabItem();
             }
             ImGui::EndTabBar();
@@ -1468,6 +1666,12 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
     if (options.tab == "pointers") app.select_tab = Tab::PointerScanner;
     else if (options.tab == "memory") app.select_tab = Tab::Memory;
     else if (options.tab == "hotkeys") app.select_tab = Tab::Hotkeys;
+    else if (options.tab == "scripts") app.select_tab = Tab::Scripts;
+    else if (options.tab == "dissect") app.select_tab = Tab::Dissect;
+    if (options.tab == "dissect" && !options.view.empty()) {
+        app.dissect_input = options.view;
+        app.dissect_pending = true; // dissected on the first attached frame
+    }
     if (!options.track.empty() && is_attached(app)) {
         if (options.track == "auto") {
             app.track_auto_type = true;
