@@ -1,6 +1,7 @@
 #pragma once
 
 #include "process.hpp"
+#include "injector.hpp"
 #include <atomic>
 #include <cstdint>
 #include <functional>
@@ -34,6 +35,8 @@ public:
 
     // Lists processes visible to the connected RemoteServer
     [[nodiscard]] std::vector<ProcessInfo> list_remote_processes() const;
+    // Lists OS threads belonging to the currently attached remote process
+    [[nodiscard]] std::vector<ThreadInfo> list_remote_threads() const;
 
     // IProcess overrides
     bool attach(uint32_t pid) override;

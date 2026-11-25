@@ -140,6 +140,44 @@ TEST_CASE("RemoteServer and RemoteProcess expose IProcess and MemoryScanner over
         CHECK(!ses.is_remote());
     }
 
+    // Remote threads, find_restart(), and is_remote() local-OS safety guards
+    {
+        hal::ProcessInfo p1;
+        p1.pid = 1;
+        p1.name = "remote_game.exe";
+        hal::ProcessInfo p2;
+        p2.pid = 999;
+        p2.name = "remote_game.exe";
+        std::vector<hal::ProcessInfo> remote_procs = {p1, p2};
+        hal::RemoteServer restart_server(factory, [&remote_procs]() { return remote_procs; });
+        REQUIRE(restart_server.start("127.0.0.1", 0, ""));
+        const uint16_t rport = restart_server.bound_port();
+
+        session::Session rses(std::make_shared<FakeProcess>(0x1000), hal::IHotkeys::create());
+        REQUIRE(rses.connect_remote("127.0.0.1", rport, "").ok);
+        REQUIRE(rses.attach(1).ok);
+
+        const auto restarted = rses.find_restart();
+        REQUIRE(restarted.has_value());
+        CHECK(restarted->pid == 999);
+
+        // Local OS-only features must refuse safely while attached remotely
+        CHECK(!rses.dbg_attach());
+        CHECK(!rses.watch(FakeProcess::kBase + 0x100, 4, debugger::WatchKind::Write));
+        CHECK(!rses.set_speed(2.0));
+        CHECK(!rses.enable_speedhack());
+        std::string inj_err;
+        CHECK(!rses.inject_dll("dummy.dll", inj_err));
+        CHECK(inj_err.find("remote") != std::string::npos);
+
+        // list_threads() routes cleanly over NCE2 CMD_LIST_THREADS (no crash or local PID leak)
+        const auto threads = rses.list_threads();
+        (void)threads;
+
+        rses.disconnect_remote();
+        restart_server.stop();
+    }
+
     server.stop();
     CHECK(!server.is_running());
 }

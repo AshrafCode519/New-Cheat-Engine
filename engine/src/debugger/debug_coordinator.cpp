@@ -10,6 +10,7 @@
 #include <cstring>
 #include <filesystem>
 #include <sstream>
+#include <unordered_map>
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -1295,19 +1296,33 @@ void apply_dr_to_linux_tid(pid_t tid, const HardwareWatchSlot slots[4]) {
 void DebugCoordinator::sync_hw_registers_all_threads() {
 #if defined(__x86_64__)
     if (!m_is_attached || m_pid == 0) return;
-    HardwareWatchSlot snapshot[4];
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        for (int i = 0; i < 4; ++i) snapshot[i] = m_hw_slots[i];
+    m_linux_hw_gen.fetch_add(1);
+    if (std::this_thread::get_id() == m_debug_thread.get_id()) {
+        HardwareWatchSlot snapshot[4];
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            for (int i = 0; i < 4; ++i) snapshot[i] = m_hw_slots[i];
+        }
+        for (const auto& t : hal::ProcessInjector::list_threads(m_pid)) {
+            apply_dr_to_linux_tid(static_cast<pid_t>(t.tid), snapshot);
+        }
+        return;
     }
+    m_linux_sync_hw.store(true);
     for (const auto& t : hal::ProcessInjector::list_threads(m_pid)) {
-        apply_dr_to_linux_tid(static_cast<pid_t>(t.tid), snapshot);
+#ifdef SYS_tgkill
+        syscall(SYS_tgkill, static_cast<pid_t>(m_pid), static_cast<pid_t>(t.tid), SIGSTOP);
+#else
+        kill(static_cast<pid_t>(t.tid), SIGSTOP);
+#endif
     }
 #endif
 }
 
 void DebugCoordinator::linux_ptrace_loop(std::promise<bool> start_promise) {
 #if defined(__x86_64__)
+    std::unordered_map<uint32_t, uint64_t> tid_hw_gen;
+    const uint64_t init_hw_gen = m_linux_hw_gen.load();
     auto threads = hal::ProcessInjector::list_threads(m_pid);
     std::vector<pid_t> attached_tids;
     for (const auto& t : threads) {
@@ -1336,6 +1351,7 @@ void DebugCoordinator::linux_ptrace_loop(std::promise<bool> start_promise) {
         }
         for (pid_t tid : attached_tids) {
             apply_dr_to_linux_tid(tid, m_hw_slots);
+            tid_hw_gen[static_cast<uint32_t>(tid)] = init_hw_gen;
         }
     }
 
@@ -1473,6 +1489,13 @@ void DebugCoordinator::linux_ptrace_loop(std::promise<bool> start_promise) {
         }
 
         if (!m_stop_requested) {
+            const uint64_t want_gen = m_linux_hw_gen.load();
+            const uint32_t utid = static_cast<uint32_t>(tid);
+            if (tid_hw_gen[utid] != want_gen) {
+                std::lock_guard<std::mutex> lock(m_mutex);
+                apply_dr_to_linux_tid(tid, m_hw_slots);
+                tid_hw_gen[utid] = want_gen;
+            }
             ptrace(req_tf ? PTRACE_SINGLESTEP : PTRACE_CONT,
                    tid, nullptr, reinterpret_cast<void*>(static_cast<intptr_t>(forward_sig)));
         }

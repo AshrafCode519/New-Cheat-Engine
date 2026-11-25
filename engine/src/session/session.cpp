@@ -933,14 +933,14 @@ void Session::detach() {
 }
 
 bool Session::watch(uintptr_t address, size_t size, debugger::WatchKind kind) {
-    if (!attached()) return false;
+    if (!attached() || is_remote()) return false;
     return m_watcher.start(m_process, address, size, kind);
 }
 
 std::optional<hal::ProcessInfo> Session::find_restart() const {
     const std::string name = m_process->name();
     if (name.empty() || m_process->get_pid() == 0) return std::nullopt;
-    for (const auto& p : hal::IProcess::list_processes()) {
+    for (const auto& p : list_processes()) {
         if (p.pid != m_process->get_pid() && equals_ignore_case(p.name, name)) return p;
     }
     return std::nullopt;
@@ -980,7 +980,7 @@ std::vector<scanner::PointerPath> Session::find_permanent_paths(const table::Tab
 }
 
 bool Session::set_speed(double multiplier) {
-    if (!m_speedhack) return false;
+    if (!m_speedhack || is_remote()) return false;
     if (!m_speedhack->is_installed()) {
         if (!m_speedhack->attach()) return false;
     }
@@ -988,7 +988,7 @@ bool Session::set_speed(double multiplier) {
 }
 
 bool Session::enable_speedhack() {
-    if (!m_speedhack) return false;
+    if (!m_speedhack || is_remote()) return false;
     if (!m_speedhack->is_installed()) {
         if (!m_speedhack->attach()) return false;
     }
@@ -996,7 +996,7 @@ bool Session::enable_speedhack() {
 }
 
 bool Session::disable_speedhack() {
-    if (!m_speedhack) return false;
+    if (!m_speedhack || is_remote()) return false;
     return m_speedhack->disable();
 }
 
@@ -1162,7 +1162,7 @@ scanner::PointerScanResult Session::scan_saved_pointer_map(
 }
 
 bool Session::dbg_attach(debugger::DebugBackend backend) {
-    if (!m_debugger) return false;
+    if (!m_debugger || is_remote()) return false;
     return m_debugger->attach(backend);
 }
 
@@ -1177,12 +1177,19 @@ bool Session::dbg_set_bp(uintptr_t addr, const std::string& note, const std::str
 
 std::vector<hal::ThreadInfo> Session::list_threads() const {
     if (!attached()) return {};
+    if (m_remote && m_remote->is_connected()) {
+        return m_remote->list_remote_threads();
+    }
     return hal::ProcessInjector::list_threads(m_process->get_pid());
 }
 
 bool Session::inject_dll(const std::string& dll_path, std::string& error_out) {
     if (!attached()) {
         error_out = "No target process attached.";
+        return false;
+    }
+    if (is_remote()) {
+        error_out = "DLL/.so injection is not supported over remote NCE2 connections.";
         return false;
     }
     return hal::ProcessInjector::inject_dll(m_process->get_pid(), dll_path, error_out);

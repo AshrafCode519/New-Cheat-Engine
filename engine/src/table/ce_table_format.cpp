@@ -399,6 +399,21 @@ void parse_entries_list(const std::string& entries_xml, const std::string& paren
             }
         }
 
+        const std::string sa_block = find_tag(own_xml, "SignatureAnchor");
+        if (!sa_block.empty()) {
+            SignatureAnchor sa;
+            sa.module_name = unescape_xml(find_tag(sa_block, "Module"));
+            sa.aob_pattern = trim(unescape_xml(find_tag(sa_block, "AOB")));
+            try { sa.code_offset_hint = std::stoll(trim(find_tag(sa_block, "CodeOffsetHint"))); } catch (...) {}
+            try { sa.disp_offset = std::stoull(trim(find_tag(sa_block, "DispOffset"))); } catch (...) {}
+            try { sa.insn_length = std::stoull(trim(find_tag(sa_block, "InsnLength"))); } catch (...) {}
+            sa.is_rip_relative = (trim(find_tag(sa_block, "RipRelative")) == "1");
+            try { sa.struct_offset = std::stoll(trim(find_tag(sa_block, "StructOffset"))); } catch (...) {}
+            if (!sa.aob_pattern.empty()) {
+                entry.signature_anchor = std::move(sa);
+            }
+        }
+
         out_table.entries.push_back(std::move(entry));
 
         if (!nested_entries.empty()) {
@@ -474,6 +489,18 @@ void write_ce_entry(std::ostringstream& ss, const TableEntry& e, int& next_id, c
             ss << indent << "    </Hotkey>\n";
         }
         ss << indent << "  </Hotkeys>\n";
+    }
+    if (e.signature_anchor) {
+        const auto& sa = *e.signature_anchor;
+        ss << indent << "  <SignatureAnchor>\n";
+        ss << indent << "    <Module>" << escape_xml(sa.module_name) << "</Module>\n";
+        ss << indent << "    <AOB>" << escape_xml(sa.aob_pattern) << "</AOB>\n";
+        ss << indent << "    <CodeOffsetHint>" << sa.code_offset_hint << "</CodeOffsetHint>\n";
+        ss << indent << "    <DispOffset>" << sa.disp_offset << "</DispOffset>\n";
+        ss << indent << "    <InsnLength>" << sa.insn_length << "</InsnLength>\n";
+        ss << indent << "    <RipRelative>" << (sa.is_rip_relative ? 1 : 0) << "</RipRelative>\n";
+        ss << indent << "    <StructOffset>" << sa.struct_offset << "</StructOffset>\n";
+        ss << indent << "  </SignatureAnchor>\n";
     }
     ss << indent << "</CheatEntry>\n";
 }

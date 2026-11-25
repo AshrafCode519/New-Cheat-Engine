@@ -2,6 +2,7 @@
 #include "test_helpers.hpp"
 #include "debugger/pe_analyzer.hpp"
 #include "session/session.hpp"
+#include "table/ce_table_format.hpp"
 #include "table/cheat_table.hpp"
 
 #include <cstring>
@@ -173,4 +174,63 @@ TEST_CASE("Lua 5.4 eval_expression REPL, v2 globals, and CheatTable <LuaScript>"
     const auto ct_check = ses.eval_lua_expression("ct_boot_flag");
     CHECK(ct_check.success);
     CHECK(ct_check.output == "nce_v2_ready");
+}
+
+TEST_CASE("Region-aware SignatureAnchor works across unreadable module holes, struct_offset, and .CT XML") {
+    FakeProcess v1(0x10000);
+    v1.set_name("gapped.exe");
+    v1.add_module("gapped.exe", 0, 0x8000);
+    // Punch an unreadable guard/unmapped hole inside the module range (between .text and .data)!
+    v1.make_unreadable(0x1800, 0x800, true);
+
+    const std::vector<uint8_t> fn_v1 = {
+        0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xC1,
+        0x48, 0x8D, 0x05, 0xF9, 0x1F, 0x00, 0x00, // lea rax, [rip + 0x1FF9] at 0x1007 -> 0x100E + 0x1FF9 = 0x3007 (base of struct)
+        0x48, 0x83, 0xC4, 0x28, 0xC3
+    };
+    REQUIRE(v1.write_raw(FakeProcess::kBase + 0x1000, fn_v1.data(), fn_v1.size()));
+    v1.put<int32_t>(0x3017, 555); // struct base 0x3007 + struct_offset 0x10 = 0x3017
+
+    table::CheatTable tbl;
+    tbl.process_name = "gapped.exe";
+    auto entry = table::make_entry(FakeProcess::kBase + 0x3017, scanner::DataType::Int32, v1.get_modules(), "Mana");
+    const auto anchor = table::create_signature_anchor(v1, v1.get_modules(), FakeProcess::kBase + 0x1007, 0x10);
+    REQUIRE(anchor.has_value());
+    CHECK(anchor->is_rip_relative);
+    CHECK(anchor->struct_offset == 0x10);
+    entry.signature_anchor = anchor;
+    tbl.entries.push_back(entry);
+    tbl.lua_script = "print('from_ct')";
+
+    // Round-trip through .CT XML format preserves both SignatureAnchor and LuaScript
+    const std::string xml = table::serialize_ce_table(tbl);
+    table::CheatTable parsed_ct;
+    std::string ct_err;
+    REQUIRE(table::parse_ce_table(xml, parsed_ct, ct_err));
+    REQUIRE(parsed_ct.entries.size() == 1);
+    REQUIRE(parsed_ct.entries[0].signature_anchor.has_value());
+    CHECK(parsed_ct.entries[0].signature_anchor->struct_offset == 0x10);
+    CHECK(parsed_ct.lua_script == "print('from_ct')");
+
+    // Relocate in v2 (which also has an unreadable hole!) -> struct moves to 0x5200, field at 0x5210
+    FakeProcess v2(0x10000);
+    v2.set_name("gapped.exe");
+    v2.add_module("gapped.exe", 0, 0x8000);
+    v2.make_unreadable(0x1800, 0x800, true);
+    // lea rax at 0x2407 (len 7 -> next 0x240E), target = 0x5200 -> disp = 0x5200 - 0x240E = 0x2DF2
+    const std::vector<uint8_t> fn_v2 = {
+        0x48, 0x83, 0xEC, 0x28, 0x48, 0x8B, 0xC1,
+        0x48, 0x8D, 0x05, 0xF2, 0x2D, 0x00, 0x00,
+        0x48, 0x83, 0xC4, 0x28, 0xC3
+    };
+    REQUIRE(v2.write_raw(FakeProcess::kBase + 0x2400, fn_v2.data(), fn_v2.size()));
+    v2.put<int32_t>(0x5210, 888);
+
+    const auto rep = table::migrate_table_by_signatures(parsed_ct, v2, v2.get_modules());
+    CHECK(rep.updated == 1);
+    CHECK(rep.failed == 0);
+    CHECK(parsed_ct.entries[0].address(v2, v2.get_modules()) == FakeProcess::kBase + 0x5210);
+    const auto rval = table::read_entry(parsed_ct.entries[0], v2, v2.get_modules());
+    REQUIRE(rval.has_value());
+    CHECK(std::get<int32_t>(rval->value) == 888);
 }

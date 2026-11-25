@@ -154,6 +154,7 @@ private:
     struct PendingByteWrite { uintptr_t address; uint8_t value; };
     std::vector<PendingByteWrite> m_pending_linux_writes;
     std::atomic<bool> m_linux_sync_hw{false};
+    std::atomic<uint64_t> m_linux_hw_gen{0};
     void linux_ptrace_loop(std::promise<bool> start_promise);
 #endif
 

@@ -40,6 +40,7 @@ enum ProtoCmd : uint16_t {
     CMD_FREE_MEM = 10,
     CMD_SUSPEND = 11,
     CMD_RESUME = 12,
+    CMD_LIST_THREADS = 13,
 };
 
 #ifdef _WIN32
@@ -374,6 +375,25 @@ std::vector<ProcessInfo> RemoteProcess::list_remote_processes() const {
         p.pid = r.u32();
         p.name = r.str();
         if (r.ok) out.push_back(std::move(p));
+    }
+    return out;
+}
+
+std::vector<ThreadInfo> RemoteProcess::list_remote_threads() const {
+    if (!m_attached) return {};
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_LIST_THREADS, {}, resp)) return {};
+    ByteReader r{resp.data(), resp.size()};
+    const uint32_t count = r.u32();
+    std::vector<ThreadInfo> out;
+    if (!r.ok || count > 100000) return out;
+    out.reserve(count);
+    for (uint32_t i = 0; i < count && r.ok; ++i) {
+        ThreadInfo t;
+        t.tid = r.u32();
+        t.owner_pid = r.u32();
+        t.base_priority = static_cast<int32_t>(r.u32());
+        if (r.ok) out.push_back(t);
     }
     return out;
 }
@@ -769,6 +789,18 @@ void RemoteServer::handle_client(uintptr_t client_sock) {
             case CMD_RESUME:
                 resp.u8((proc && proc->resume()) ? 1 : 0);
                 break;
+            case CMD_LIST_THREADS: {
+                const auto threads = (proc && proc->is_attached())
+                    ? ProcessInjector::list_threads(proc->get_pid())
+                    : std::vector<ThreadInfo>{};
+                resp.u32(static_cast<uint32_t>(threads.size()));
+                for (const auto& t : threads) {
+                    resp.u32(t.tid);
+                    resp.u32(t.owner_pid);
+                    resp.u32(static_cast<uint32_t>(t.base_priority));
+                }
+                break;
+            }
             default:
                 resp.u8(0);
                 break;

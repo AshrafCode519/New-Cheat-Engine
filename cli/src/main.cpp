@@ -3078,7 +3078,15 @@ bool handle_command(const std::string& line) {
         if (!(iss >> host)) {
             std::cout << "Usage: remote <host> [port=27055] [token]\n";
         } else {
-            if (iss >> port) {
+            std::string port_tok;
+            if (iss >> port_tok) {
+                char* endp = nullptr;
+                const long parsed = std::strtol(port_tok.c_str(), &endp, 10);
+                if (!endp || *endp != '\0' || parsed < 1 || parsed > 65535) {
+                    std::cout << "[-] Invalid TCP port '" << port_tok << "' (must be 1..65535).\n";
+                    return true;
+                }
+                port = static_cast<uint16_t>(parsed);
                 std::getline(iss >> std::ws, token);
             }
             report(ses().connect_remote(host, port, token));

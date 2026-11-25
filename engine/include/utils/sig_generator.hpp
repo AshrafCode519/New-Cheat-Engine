@@ -4,6 +4,7 @@
 #include <string>
 #include <cstdint>
 #include <optional>
+#include <vector>
 
 namespace nce::utils {
 
@@ -12,6 +13,11 @@ namespace nce::utils {
 // in the host module memory.
 class SignatureGenerator {
 public:
+    struct ReadableSlice {
+        uintptr_t base_address{0};
+        std::vector<uint8_t> bytes;
+    };
+
     struct GeneratedSig {
         std::string pattern;      // e.g. "48 89 5C 24 ?? 57 48 83 EC 20"
         size_t length{0};         // Total bytes
@@ -19,6 +25,12 @@ public:
         bool is_unique{false};    // True if verified unique in module
         size_t module_matches{0}; // Match count in module
     };
+
+    // Reads committed readable sub-ranges of `mod` cleanly, skipping guard/unmapped gaps.
+    [[nodiscard]] static std::vector<ReadableSlice> read_module_slices(
+        const hal::IProcess& process,
+        const hal::ModuleInfo& mod
+    );
 
     // Generates a unique AOB signature for the code at `address`.
     // Automatically replaces relative jump/call and RIP-relative displacements with wildcards.

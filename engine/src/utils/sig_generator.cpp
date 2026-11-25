@@ -37,6 +37,74 @@ size_t count_pattern_matches(
 
 } // anonymous namespace
 
+std::vector<SignatureGenerator::ReadableSlice> SignatureGenerator::read_module_slices(
+    const hal::IProcess& process,
+    const hal::ModuleInfo& mod
+) {
+    std::vector<ReadableSlice> slices;
+    if (!process.is_attached() || mod.base_address == 0 || mod.size == 0 || mod.size > 256u * 1024u * 1024u) {
+        return slices;
+    }
+
+    const uintptr_t mod_begin = mod.base_address;
+    const uintptr_t mod_end = mod.base_address + mod.size;
+    constexpr uint32_t kFilter =
+        hal::FilterFlags::OnlyCommitted | hal::FilterFlags::ExcludeNoAccess | hal::FilterFlags::ExcludeGuardPages;
+
+    const auto regions = process.query_regions(kFilter);
+    auto append_range = [&](uintptr_t r_begin, uintptr_t r_end) {
+        if (r_end <= r_begin) return;
+        const size_t total = static_cast<size_t>(r_end - r_begin);
+        ReadableSlice slice;
+        slice.base_address = r_begin;
+        slice.bytes.resize(total);
+        if (process.read_raw(r_begin, slice.bytes.data(), total)) {
+            slices.push_back(std::move(slice));
+            return;
+        }
+        // Fallback: read page-by-page across partial gaps so one unreadable page doesn't discard the region
+        constexpr size_t kPage = 4096;
+        ReadableSlice cur;
+        for (size_t off = 0; off < total; off += kPage) {
+            const size_t chunk = std::min(kPage, total - off);
+            uint8_t page_buf[kPage]{};
+            if (process.read_raw(r_begin + off, page_buf, chunk)) {
+                if (cur.bytes.empty()) cur.base_address = r_begin + off;
+                cur.bytes.insert(cur.bytes.end(), page_buf, page_buf + chunk);
+            } else if (!cur.bytes.empty()) {
+                slices.push_back(std::move(cur));
+                cur = {};
+            }
+        }
+        if (!cur.bytes.empty()) slices.push_back(std::move(cur));
+    };
+
+    for (const auto& reg : regions) {
+        if (!reg.is_readable || !reg.is_committed || reg.is_guard || reg.size == 0) continue;
+        const uintptr_t lo = std::max(mod_begin, reg.base_address);
+        const uintptr_t hi = std::min(mod_end, reg.end_address());
+        if (lo < hi) {
+            // Coalesce adjacent readable slices so patterns spanning section boundaries still match
+            if (!slices.empty() && slices.back().base_address + slices.back().bytes.size() == lo) {
+                const size_t prev_sz = slices.back().bytes.size();
+                const size_t add_sz = static_cast<size_t>(hi - lo);
+                slices.back().bytes.resize(prev_sz + add_sz);
+                if (!process.read_raw(lo, slices.back().bytes.data() + prev_sz, add_sz)) {
+                    slices.back().bytes.resize(prev_sz);
+                    append_range(lo, hi);
+                }
+            } else {
+                append_range(lo, hi);
+            }
+        }
+    }
+
+    if (slices.empty()) {
+        append_range(mod_begin, mod_end);
+    }
+    return slices;
+}
+
 std::optional<SignatureGenerator::GeneratedSig> SignatureGenerator::generate(
     const hal::IProcess& process,
     uintptr_t address,
@@ -66,13 +134,9 @@ std::optional<SignatureGenerator::GeneratedSig> SignatureGenerator::generate(
 
     if (instructions.empty()) return std::nullopt;
 
-    // Read host module code for uniqueness verification
-    std::vector<uint8_t> module_memory;
+    std::vector<ReadableSlice> module_slices;
     if (host_module) {
-        module_memory.resize(host_module->size);
-        if (!process.read_raw(host_module->base_address, module_memory.data(), host_module->size)) {
-            module_memory.clear();
-        }
+        module_slices = read_module_slices(process, *host_module);
     }
 
     std::vector<uint8_t> pattern_bytes;
@@ -107,12 +171,13 @@ std::optional<SignatureGenerator::GeneratedSig> SignatureGenerator::generate(
             }
         }
 
-        // Test uniqueness against module memory if available
+        // Test uniqueness across all readable slices of the host module
         size_t matches = 0;
-        if (!module_memory.empty()) {
-            matches = count_pattern_matches(
-                module_memory.data(), module_memory.size(), pattern_bytes, pattern_mask
+        for (const auto& slice : module_slices) {
+            matches += count_pattern_matches(
+                slice.bytes.data(), slice.bytes.size(), pattern_bytes, pattern_mask
             );
+            if (matches > 1) break;
         }
 
         // Format pattern string

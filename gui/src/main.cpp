@@ -434,6 +434,7 @@ struct App {
     std::string remote_host = "127.0.0.1";
     int remote_port = 27055;
     std::string remote_token;
+    std::string remote_error;
 
     // Pseudo-C Decompiler & Causality Timeline
     std::string decomp_struct_addr;
@@ -445,6 +446,7 @@ struct App {
     int anchor_row = -1;
     std::string anchor_code_addr;
     int anchor_struct_offset = 0;
+    std::string anchor_error;
 };
 
 scanner::DataType type_at(int index) {
@@ -848,7 +850,10 @@ void draw_process_bar(App& app) {
         ImGui::SameLine();
         ImGui::TextColored(ImVec4(0.35f, 0.90f, 1.0f, 1.0f), "[REMOTE %s]", app.session.remote_endpoint().c_str());
     } else {
-        if (ImGui::SmallButton("Remote...")) ImGui::OpenPopup("RemoteHostPopup");
+        if (ImGui::SmallButton("Remote...")) {
+            app.remote_error.clear();
+            ImGui::OpenPopup("RemoteHostPopup");
+        }
         if (ImGui::BeginPopup("RemoteHostPopup")) {
             ImGui::TextUnformatted("Connect to nce_server (TCP):");
             ImGui::SetNextItemWidth(em(12));
@@ -857,12 +862,20 @@ void draw_process_bar(App& app) {
             ImGui::InputInt("Port", &app.remote_port);
             ImGui::SetNextItemWidth(em(12));
             ImGui::InputTextWithHint("Token", "optional auth secret", &app.remote_token);
+            if (!app.remote_error.empty()) {
+                ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", app.remote_error.c_str());
+            }
             if (ImGui::Button("Connect")) {
                 const uint16_t port = static_cast<uint16_t>(std::clamp(app.remote_port, 1, 65535));
                 const auto res = app.session.connect_remote(app.remote_host, port, app.remote_token);
                 show(app, res);
-                if (res.ok) refresh_processes(app);
-                ImGui::CloseCurrentPopup();
+                if (res.ok) {
+                    app.remote_error.clear();
+                    refresh_processes(app);
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    app.remote_error = res.message;
+                }
             }
             ImGui::EndPopup();
         }
@@ -1212,7 +1225,8 @@ void draw_cheat_table(App& app) {
     }
     ImGui::SameLine();
     if (ImGui::Button("Anchor AOB")) {
-        app.anchor_row = 0;
+        app.anchor_row = std::max(0, app.anchor_row);
+        app.anchor_error.clear();
         ImGui::OpenPopup("AnchorSigPopup");
     }
     ImGui::EndDisabled();
@@ -1221,14 +1235,23 @@ void draw_cheat_table(App& app) {
         ImGui::InputInt("Entry #", &app.anchor_row);
         ImGui::InputTextWithHint("Code Addr", "0x... or module+offset", &app.anchor_code_addr);
         ImGui::InputInt("Struct Offset", &app.anchor_struct_offset);
+        if (!app.anchor_error.empty()) {
+            ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", app.anchor_error.c_str());
+        }
         if (ImGui::Button("Create Anchor")) {
             const uintptr_t ca = utils::parse_address(app.anchor_code_addr);
             if (app.anchor_row >= 0 && ca != 0) {
-                show(app, app.session.anchor_entry_signature(
-                    static_cast<size_t>(app.anchor_row), ca, app.anchor_struct_offset));
-                ImGui::CloseCurrentPopup();
+                const auto out = app.session.anchor_entry_signature(
+                    static_cast<size_t>(app.anchor_row), ca, app.anchor_struct_offset);
+                show(app, out);
+                if (out.ok) {
+                    app.anchor_error.clear();
+                    ImGui::CloseCurrentPopup();
+                } else {
+                    app.anchor_error = out.message;
+                }
             } else {
-                app.status = "Provide a valid entry index and instruction address.";
+                app.anchor_error = "Provide a valid entry index and instruction address.";
             }
         }
         ImGui::EndPopup();
@@ -2757,9 +2780,11 @@ void draw_watch(App& app) {
     ImGui::Combo("##watch_size", &app.watch_size_index, kSizeNames, IM_ARRAYSIZE(kSizeNames));
 
     const bool attached = is_attached(app);
+    const bool remote_mode = app.session.is_remote();
     const auto active_watches = app.session.watched_addresses();
     const bool slots_full = active_watches.size() >= 4;
-    ImGui::BeginDisabled(!attached || slots_full);
+    if (remote_mode) ImGui::TextDisabled("Hardware watches are local-only (disabled in Remote NCE2 mode).");
+    ImGui::BeginDisabled(!attached || remote_mode || slots_full);
     if (ImGui::Button("Find writes")) {
         const uintptr_t a = utils::parse_address(app.watch_input);
         if (!a) app.watch_note = "Enter the address to watch.";
@@ -2935,6 +2960,7 @@ void draw_disasm(App& app) {
     ImGui::TextWrapped("Interactive x86-64 Disassembler & Step Debugger: set INT 3 breakpoints, single-step instructions (F7/F8), and inspect live call stack.");
     ImGui::Separator();
 
+    const bool remote_mode = app.session.is_remote();
     const bool attached = is_attached(app);
     auto* dbg = app.session.step_debugger();
     const bool dbg_attached = dbg && dbg->is_attached();
@@ -2942,7 +2968,7 @@ void draw_disasm(App& app) {
     const uintptr_t cur_rip = dbg ? dbg->current_rip() : 0;
 
     // --- Interactive Debugger Control Toolbar ---
-    ImGui::BeginDisabled(!attached);
+    ImGui::BeginDisabled(!attached || remote_mode);
 
     static const char* const kDbgBackends[] = {"Win32 DebugAPI", "VEH (In-Process)"};
     if (!dbg_attached) {
@@ -4068,6 +4094,7 @@ void draw_speedhack(App& app) {
     ImGui::TextWrapped("Dilates or slows down game time progression by hooking QueryPerformanceCounter and GetTickCount64 inside the target process.");
     ImGui::Separator();
 
+    const bool remote_mode = app.session.is_remote();
     const bool attached = is_attached(app);
     const bool installed = app.session.speedhack_installed();
     const bool enabled = app.session.speedhack_enabled();
@@ -4101,7 +4128,8 @@ void draw_speedhack(App& app) {
     ImGui::Separator();
     ImGui::Spacing();
 
-    ImGui::BeginDisabled(!attached);
+    if (remote_mode) ImGui::TextDisabled("Speedhack hooks are local-only (disabled in Remote NCE2 mode).");
+    ImGui::BeginDisabled(!attached || remote_mode);
 
     ImGui::Text("Speed Multiplier: ");
     ImGui::SameLine();
@@ -4980,9 +5008,11 @@ void draw_lua_studio(App& app) {
     }
 
     ImGui::SetNextItemWidth(-em(7));
-    ImGui::InputTextWithHint("##lua_watch_in", "Live Lua watch expr (e.g. readFloat('game.exe+0x100'))", &app.lua_watch_expr_input);
+    const bool watch_submit = ImGui::InputTextWithHint(
+        "##lua_watch_in", "Live Lua watch expr (e.g. readFloat('game.exe+0x100'))",
+        &app.lua_watch_expr_input, ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
-    if (ImGui::Button("Watch##lua") && !app.lua_watch_expr_input.empty()) {
+    if ((watch_submit || ImGui::Button("Watch##lua")) && !app.lua_watch_expr_input.empty()) {
         app.lua_watches.push_back({app.lua_watch_expr_input, "", true});
         app.lua_watch_expr_input.clear();
     }

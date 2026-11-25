@@ -7,6 +7,7 @@
 #include "../../include/utils/text_encoding.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
+#include <cctype>
 #include <charconv>
 #include <cstring>
 #include <fstream>
@@ -627,22 +628,31 @@ SignatureMigrationReport migrate_table_by_signatures(
     SignatureMigrationReport report;
     if (!process.is_attached()) return report;
 
-    std::map<std::string, std::pair<const hal::ModuleInfo*, std::vector<uint8_t>>> mod_cache;
-    auto get_module_bytes = [&](const std::string& name) -> std::pair<const hal::ModuleInfo*, const std::vector<uint8_t>*> {
+    auto mod_eq = [](const std::string& a, const std::string& b) {
+        if (a.size() != b.size()) return false;
+        for (size_t k = 0; k < a.size(); ++k) {
+            if (std::tolower(static_cast<unsigned char>(a[k])) !=
+                std::tolower(static_cast<unsigned char>(b[k]))) return false;
+        }
+        return true;
+    };
+
+    using SliceVec = std::vector<utils::SignatureGenerator::ReadableSlice>;
+    std::map<std::string, std::pair<const hal::ModuleInfo*, SliceVec>> mod_cache;
+    auto get_module_slices = [&](const std::string& name) -> std::pair<const hal::ModuleInfo*, const SliceVec*> {
         auto it = mod_cache.find(name);
         if (it != mod_cache.end()) {
             return {it->second.first, it->second.second.empty() ? nullptr : &it->second.second};
         }
         const hal::ModuleInfo* found = nullptr;
         for (const auto& m : modules) {
-            if (m.name == name) { found = &m; break; }
+            if (mod_eq(m.name, name)) { found = &m; break; }
         }
-        std::vector<uint8_t> buf;
-        if (found && found->size > 0 && found->size <= 256u * 1024u * 1024u) {
-            buf.resize(found->size);
-            if (!process.read_raw(found->base_address, buf.data(), buf.size())) buf.clear();
+        SliceVec slices;
+        if (found) {
+            slices = utils::SignatureGenerator::read_module_slices(process, *found);
         }
-        auto [ins_it, _] = mod_cache.emplace(name, std::make_pair(found, std::move(buf)));
+        auto [ins_it, _] = mod_cache.emplace(name, std::make_pair(found, std::move(slices)));
         return {ins_it->second.first, ins_it->second.second.empty() ? nullptr : &ins_it->second.second};
     };
 
@@ -664,8 +674,8 @@ SignatureMigrationReport migrate_table_by_signatures(
             continue;
         }
 
-        const auto [mod, mod_bytes] = get_module_bytes(sa.module_name);
-        if (!mod || !mod_bytes || mod_bytes->size() < pat->bytes.size()) {
+        const auto [mod, slices] = get_module_slices(sa.module_name);
+        if (!mod || !slices || slices->empty()) {
             ++report.failed;
             item.note = "Host module '" + sa.module_name + "' not loaded or unreadable";
             report.items.push_back(std::move(item));
@@ -673,55 +683,71 @@ SignatureMigrationReport migrate_table_by_signatures(
         }
 
         size_t hits = 0;
+        const utils::SignatureGenerator::ReadableSlice* match_slice = nullptr;
         size_t match_off = 0;
-        const size_t limit = mod_bytes->size() - pat->bytes.size();
-        for (size_t off = 0; off <= limit; ++off) {
-            bool ok = true;
-            for (size_t j = 0; j < pat->bytes.size(); ++j) {
-                if (pat->mask[j] && (*mod_bytes)[off + j] != pat->bytes[j]) {
-                    ok = false;
-                    break;
+        for (const auto& slice : *slices) {
+            if (slice.bytes.size() < pat->bytes.size()) continue;
+            const size_t limit = slice.bytes.size() - pat->bytes.size();
+            for (size_t off = 0; off <= limit; ++off) {
+                bool ok = true;
+                for (size_t j = 0; j < pat->bytes.size(); ++j) {
+                    if (pat->mask[j] && slice.bytes[off + j] != pat->bytes[j]) {
+                        ok = false;
+                        break;
+                    }
+                }
+                if (ok) {
+                    ++hits;
+                    match_slice = &slice;
+                    match_off = off;
+                    if (hits > 1) break;
                 }
             }
-            if (ok) {
-                ++hits;
-                match_off = off;
-                if (hits > 1) break;
-            }
+            if (hits > 1) break;
         }
 
-        if (hits != 1) {
+        if (hits != 1 || !match_slice) {
             ++report.failed;
             item.note = (hits == 0) ? "AOB pattern not found" : "AOB pattern matched multiple locations";
             report.items.push_back(std::move(item));
             continue;
         }
 
-        const uintptr_t code_va = mod->base_address + match_off;
+        const uintptr_t code_va = match_slice->base_address + match_off;
         item.resolved_code_va = code_va;
 
-        if (sa.is_rip_relative && sa.insn_length >= 5 && match_off + sa.insn_length <= mod_bytes->size()) {
+        if (sa.is_rip_relative && sa.insn_length >= 5 && match_off + sa.insn_length <= match_slice->bytes.size()) {
             int32_t disp = 0;
-            std::memcpy(&disp, mod_bytes->data() + match_off + sa.disp_offset, 4);
-            const uintptr_t target_va = code_va + sa.insn_length + static_cast<int64_t>(disp);
+            std::memcpy(&disp, match_slice->bytes.data() + match_off + sa.disp_offset, 4);
+            const uintptr_t base_target_va = code_va + sa.insn_length + static_cast<int64_t>(disp);
+
+            // Apply struct_offset directly when targeting a flat static struct address; preserve pointer chains otherwise
+            uintptr_t effective_base_va = base_target_va;
+            std::vector<int64_t> effective_offsets = entry.location.offsets;
+            if (effective_offsets.empty()) {
+                effective_base_va = static_cast<uintptr_t>(static_cast<int64_t>(base_target_va) + sa.struct_offset);
+            } else if (sa.struct_offset != 0) {
+                effective_offsets = {sa.struct_offset};
+            }
 
             scanner::PointerPath new_loc;
-            new_loc.base_offset = target_va;
+            new_loc.base_offset = effective_base_va;
+            new_loc.offsets = std::move(effective_offsets);
             for (const auto& tm : modules) {
-                if (target_va >= tm.base_address && target_va < tm.base_address + tm.size) {
+                if (effective_base_va >= tm.base_address && effective_base_va < tm.base_address + tm.size) {
                     new_loc.module_name = tm.name;
-                    new_loc.base_offset = target_va - tm.base_address;
+                    new_loc.base_offset = effective_base_va - tm.base_address;
                     break;
                 }
             }
 
             if (new_loc.module_name != entry.location.module_name ||
                 new_loc.base_offset != entry.location.base_offset ||
-                !entry.location.offsets.empty()) {
+                new_loc.offsets != entry.location.offsets) {
                 entry.location = std::move(new_loc);
                 item.updated = true;
                 ++report.updated;
-                item.note = "Relocated via RIP-relative signature -> " + utils::format_address(target_va);
+                item.note = "Relocated via RIP-relative signature -> " + utils::format_address(effective_base_va);
             } else {
                 item.note = "Signature verified at " + utils::format_address(code_va);
             }
