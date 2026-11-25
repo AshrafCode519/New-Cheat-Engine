@@ -1814,13 +1814,13 @@ void cmd_pe(std::istringstream& iss) {
         std::cout << " Ordinal   RVA          VA                   Function Name\n";
         std::cout << "----------------------------------------------------------------------\n";
         for (const auto& exp : info->exports) {
-            std::cout << " " << std::setw(7) << std::dec << exp.ordinal << "   "
+            std::cout << " " << std::right << std::setfill(' ') << std::setw(7) << std::dec << exp.ordinal << "   "
                       << "0x" << std::hex << std::setw(8) << std::setfill('0') << exp.rva << "   "
-                      << utils::format_address(exp.va) << "   "
+                      << std::setfill(' ') << utils::format_address(exp.va) << "   "
                       << exp.name
                       << (exp.is_forwarded ? (" -> " + exp.forwarder_name) : "") << "\n";
         }
-        std::cout << std::dec << std::setfill(' ');
+        std::cout << std::dec << std::setfill(' ') << std::right;
         return;
     }
 
@@ -1856,11 +1856,11 @@ void cmd_pe(std::istringstream& iss) {
         if (sec.is_readable) flags += "R";
         if (sec.is_writable) flags += "W";
         if (sec.is_executable) flags += "X";
-        std::cout << " " << std::left << std::setw(10) << sec.name
+        std::cout << " " << std::left << std::setfill(' ') << std::setw(10) << sec.name << std::right
                   << "0x" << std::hex << std::setw(8) << std::setfill('0') << sec.virtual_address << "   "
                   << "0x" << std::setw(8) << sec.virtual_size << "   "
                   << "0x" << std::setw(8) << sec.raw_size << "   "
-                  << flags << "\n";
+                  << std::setfill(' ') << flags << "\n";
     }
     std::cout << std::dec << std::setfill(' ') << std::right;
 }

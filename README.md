@@ -1,5 +1,6 @@
 # New-Cheat-Engine (NCE)
 
+[![Build & Test](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
 [![Tests](https://img.shields.io/badge/Unit%20Tests-180%20passed%20(2497%20assertions)-brightgreen.svg)](tests/)
@@ -10,9 +11,26 @@
 محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
 
 ### Quick Start (English Summary)
+- **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`memscan_cli`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
 - **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
 - **Linux (GCC / CMake):** `cmake -B build && cmake --build build -j 4` -> outputs `memscan_cli`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer`, `clock_gettime` speedhack).
 - **Third-Party Libraries Included (`third_party/`):** Dear ImGui (MIT), Lua 5.4.7 (MIT), doctest (MIT), nlohmann/json (MIT).
+- **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for local build instructions and cross-platform PR guidelines.
+
+---
+
+## 📸 Screenshots
+
+| Memory Viewer & Live Data Inspector | Live Structure Dissector (Auto Type Inference) |
+| :---: | :---: |
+| ![NCE Memory View](docs/images/memory_view.png) | ![NCE Structure Dissector](docs/images/dissect_view.png) |
+
+<details>
+<summary>Scanner, Cheat Table & Pointer Scanner View</summary>
+
+![NCE Scanner and Cheat Table](docs/images/scanner_table.png)
+
+</details>
 
 ---
 

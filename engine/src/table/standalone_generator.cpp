@@ -130,6 +130,15 @@ uintptr_t ResolveAddress(HANDLE hProcess, DWORD pid, const std::string& modName,
     return current;
 }
 
+struct AtomicFlag {
+    std::atomic<bool> value{false};
+    AtomicFlag() = default;
+    AtomicFlag(const AtomicFlag& other) : value(other.value.load()) {}
+    AtomicFlag& operator=(const AtomicFlag& other) { value.store(other.value.load()); return *this; }
+    operator bool() const { return value.load(); }
+    AtomicFlag& operator=(bool v) { value.store(v); return *this; }
+};
+
 struct TrainerItem {
     std::string description;
     std::string moduleName;
@@ -138,7 +147,7 @@ struct TrainerItem {
     int typeId; // 0=int32, 1=int64, 2=float, 3=double, 4=int16, 5=int8
     int hotkeyVk;
     const char* hotkeyText;
-    std::atomic<bool> enabled{false};
+    AtomicFlag enabled;
     int32_t freezeValI32{99999};
     int64_t freezeValI64{99999};
     float freezeValFloat{9999.0f};
@@ -211,7 +220,16 @@ std::string generate_standalone_trainer_cpp(
            << "#include <cstring>\n#include <dirent.h>\n#include <fstream>\n#include <iostream>\n"
            << "#include <sstream>\n#include <string>\n#include <sys/uio.h>\n#include <thread>\n#include <vector>\n\n";
         ss << "namespace {\nconst char* kTargetProcess = \"" << proc << "\";\n\n";
-        ss << R"LINUX_TR(struct TrainerItem {
+        ss << R"LINUX_TR(struct AtomicFlag {
+    std::atomic<bool> value{false};
+    AtomicFlag() = default;
+    AtomicFlag(const AtomicFlag& other) : value(other.value.load()) {}
+    AtomicFlag& operator=(const AtomicFlag& other) { value.store(other.value.load()); return *this; }
+    operator bool() const { return value.load(); }
+    AtomicFlag& operator=(bool v) { value.store(v); return *this; }
+};
+
+struct TrainerItem {
     std::string description;
     std::string moduleName;
     uintptr_t baseOffset{0};
@@ -219,7 +237,7 @@ std::string generate_standalone_trainer_cpp(
     int typeId{0};
     int hotkeyVk{0};
     const char* hotkeyText{""};
-    std::atomic<bool> enabled{false};
+    AtomicFlag enabled;
     int32_t freezeValI32{99999};
     int64_t freezeValI64{99999};
     float freezeValFloat{9999.0f};
@@ -359,138 +377,6 @@ int main() {
     ss << "#include <chrono>\n\n";
 
     append_common_helpers(ss, proc, table);
-
-    if (kind == TrainerKind::LinuxConsole) {
-        ss << "// Type: Standalone Linux / Steam Deck Console Trainer (process_vm_writev)\n";
-        ss << "// Compile with: g++ -O2 -pthread trainer.cpp -o trainer_linux\n";
-        ss << "// =======================================================================\n\n";
-        ss << "#include <atomic>\n#include <chrono>\n#include <cstdint>\n#include <cstdlib>\n"
-           << "#include <cstring>\n#include <dirent.h>\n#include <fstream>\n#include <iostream>\n"
-           << "#include <sstream>\n#include <string>\n#include <sys/uio.h>\n#include <thread>\n#include <vector>\n\n";
-        ss << "namespace {\nconst char* kTargetProcess = \"" << proc << "\";\n\n";
-        ss << R"LINUX_TR(struct TrainerItem {
-    std::string description;
-    std::string moduleName;
-    uintptr_t baseOffset{0};
-    std::vector<int64_t> offsets;
-    int typeId{0};
-    int hotkeyVk{0};
-    const char* hotkeyText{""};
-    std::atomic<bool> enabled{false};
-    int32_t freezeValI32{99999};
-    int64_t freezeValI64{99999};
-    float freezeValFloat{9999.0f};
-    double freezeValDouble{9999.0};
-    int16_t freezeValI16{9999};
-    int8_t freezeValI8{99};
-};
-
-std::vector<TrainerItem> g_items;
-pid_t g_pid = 0;
-std::atomic<bool> g_running{true};
-
-pid_t FindLinuxPid(const std::string& name) {
-    DIR* dir = opendir("/proc");
-    if (!dir) return 0;
-    struct dirent* ent = nullptr;
-    pid_t found = 0;
-    while ((ent = readdir(dir)) != nullptr) {
-        if (ent->d_name[0] < '0' || ent->d_name[0] > '9') continue;
-        pid_t p = static_cast<pid_t>(std::strtol(ent->d_name, nullptr, 10));
-        std::ifstream f(std::string("/proc/") + ent->d_name + "/comm");
-        std::string comm;
-        if (f.is_open() && std::getline(f, comm) && comm == name) { found = p; break; }
-    }
-    closedir(dir);
-    return found;
-}
-
-uintptr_t GetLinuxModuleBase(pid_t pid, const std::string& mod) {
-    std::ifstream f("/proc/" + std::to_string(pid) + "/maps");
-    std::string line;
-    while (std::getline(f, line)) {
-        if (mod.empty() || line.find(mod) != std::string::npos) {
-            size_t dash = line.find('-');
-            if (dash != std::string::npos) {
-                return static_cast<uintptr_t>(std::strtoull(line.substr(0, dash).c_str(), nullptr, 16));
-            }
-        }
-    }
-    return 0;
-}
-
-bool ReadProc(pid_t pid, uintptr_t addr, void* out, size_t sz) {
-    struct iovec l{out, sz}, r{reinterpret_cast<void*>(addr), sz};
-    return process_vm_readv(pid, &l, 1, &r, 1, 0) == static_cast<ssize_t>(sz);
-}
-
-bool WriteProc(pid_t pid, uintptr_t addr, const void* src, size_t sz) {
-    struct iovec l{const_cast<void*>(src), sz}, r{reinterpret_cast<void*>(addr), sz};
-    return process_vm_writev(pid, &l, 1, &r, 1, 0) == static_cast<ssize_t>(sz);
-}
-
-uintptr_t ResolveAddress(pid_t pid, const std::string& mod, uintptr_t baseOff, const std::vector<int64_t>& offs) {
-    uintptr_t cur = mod.empty() ? baseOff : (GetLinuxModuleBase(pid, mod) + baseOff);
-    if (cur == 0) return 0;
-    for (int64_t o : offs) {
-        uintptr_t nxt = 0;
-        if (!ReadProc(pid, cur, &nxt, sizeof(nxt)) || nxt == 0) return 0;
-        cur = nxt + static_cast<uintptr_t>(o);
-    }
-    return cur;
-}
-)LINUX_TR";
-        append_init_items(ss, table);
-        ss << R"LINUX_MAIN(void FreezeWorker() {
-    while (g_running) {
-        if (g_pid > 0) {
-            for (auto& it : g_items) {
-                if (!it.enabled) continue;
-                uintptr_t a = ResolveAddress(g_pid, it.moduleName, it.baseOffset, it.offsets);
-                if (!a) continue;
-                if (it.typeId == 0) WriteProc(g_pid, a, &it.freezeValI32, 4);
-                else if (it.typeId == 1) WriteProc(g_pid, a, &it.freezeValI64, 8);
-                else if (it.typeId == 2) WriteProc(g_pid, a, &it.freezeValFloat, 4);
-                else if (it.typeId == 3) WriteProc(g_pid, a, &it.freezeValDouble, 8);
-                else if (it.typeId == 4) WriteProc(g_pid, a, &it.freezeValI16, 2);
-                else if (it.typeId == 5) WriteProc(g_pid, a, &it.freezeValI8, 1);
-            }
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
-}
-} // namespace
-
-int main() {
-    InitItems();
-    std::cout << "[*] Waiting for Linux process: " << kTargetProcess << " ...\n";
-    while (g_pid == 0) {
-        g_pid = FindLinuxPid(kTargetProcess);
-        if (g_pid == 0) std::this_thread::sleep_for(std::chrono::milliseconds(500));
-    }
-    std::cout << "[+] Attached PID " << g_pid << ". Type item index (0.." << g_items.size() << ") to toggle, or 'q' to quit.\n";
-    for (size_t i = 0; i < g_items.size(); ++i) {
-        std::cout << "  [" << i << "] " << g_items[i].description << "\n";
-    }
-    std::thread fw(FreezeWorker);
-    std::string line;
-    while (std::getline(std::cin, line)) {
-        if (line == "q" || line == "quit") break;
-        try {
-            size_t idx = std::stoul(line);
-            if (idx < g_items.size()) {
-                g_items[idx].enabled = !g_items[idx].enabled;
-                std::cout << "[*] " << g_items[idx].description << ": " << (g_items[idx].enabled ? "ON" : "OFF") << "\n";
-            }
-        } catch (...) {}
-    }
-    g_running = false;
-    fw.join();
-    return 0;
-}
-)LINUX_MAIN";
-        return ss.str();
-    }
 
     if (kind == TrainerKind::GUI) {
         ss << R"TRAINER_GUI(#define WM_UPDATE_CHECKBOX (WM_USER + 101)
