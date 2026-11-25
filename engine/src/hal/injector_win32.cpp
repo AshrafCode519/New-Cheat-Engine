@@ -19,6 +19,7 @@
 #include <sys/ptrace.h>
 #include <sys/user.h>
 #include <sys/wait.h>
+#include <cctype>
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>

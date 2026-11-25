@@ -325,7 +325,7 @@ bool LinuxProcess::read_raw(uintptr_t address, void* buffer, size_t size) const 
 
     // Fallback to /proc/[pid]/mem
     if (m_mem_fd >= 0) {
-        ssize_t res = pread64(m_mem_fd, buffer, size, static_cast<off64_t>(address));
+        ssize_t res = pread(m_mem_fd, buffer, size, static_cast<off_t>(address));
         return (res == static_cast<ssize_t>(size));
     }
 
@@ -469,7 +469,7 @@ bool LinuxProcess::write_raw(uintptr_t address, const void* buffer, size_t size,
 
     // Fallback to /proc/[pid]/mem
     if (m_mem_fd >= 0) {
-        ssize_t res = pwrite64(m_mem_fd, buffer, size, static_cast<off64_t>(address));
+        ssize_t res = pwrite(m_mem_fd, buffer, size, static_cast<off_t>(address));
         if (res == static_cast<ssize_t>(size)) {
             return true;
         }

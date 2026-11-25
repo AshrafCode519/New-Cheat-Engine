@@ -2,8 +2,10 @@
 #include "test_helpers.hpp"
 #include "hal/hotkeys.hpp"
 #include "session/session.hpp"
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <filesystem>
 #include <mutex>
 #include <set>

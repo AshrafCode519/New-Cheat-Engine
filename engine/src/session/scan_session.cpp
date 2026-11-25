@@ -1,6 +1,7 @@
 #include "../../include/session/scan_session.hpp"
 #include "../../include/utils/hex_utils.hpp"
 #include "../../include/utils/text_encoding.hpp"
+#include <cstring>
 #include <sstream>
 
 namespace nce::session {

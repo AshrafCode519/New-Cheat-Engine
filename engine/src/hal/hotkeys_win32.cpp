@@ -1,5 +1,7 @@
 #include "../../include/hal/hotkeys.hpp"
 
+#ifdef _WIN32
+
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -158,3 +160,4 @@ std::unique_ptr<IHotkeys> IHotkeys::create() {
 }
 
 } // namespace nce::hal
+#endif

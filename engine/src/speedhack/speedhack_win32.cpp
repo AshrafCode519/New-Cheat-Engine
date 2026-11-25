@@ -2,6 +2,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <cstddef>
 #include <cstring>
 #include <vector>
 
@@ -420,7 +421,9 @@ bool Speedhack::update_shared_time(double new_speed, bool enable_flag) {
 #else
 
 #include "../../include/debugger/elf_analyzer.hpp"
+#include <cctype>
 #include <chrono>
+#include <cstddef>
 #include <cstring>
 #include <ctime>
 #include <vector>

@@ -5,6 +5,7 @@
 #include "utils/hex_utils.hpp"
 #include "table/ce_table_format.hpp"
 #include "test_helpers.hpp"
+#include <cstring>
 
 using namespace nce;
 using namespace nce::scanner;

@@ -1,4 +1,5 @@
 #include "../../include/scanner/grouped_scanner.hpp"
+#include <algorithm>
 #include <cstring>
 #include <cmath>
 #include <cstdint>
