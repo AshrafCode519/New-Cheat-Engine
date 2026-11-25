@@ -2,6 +2,7 @@
 #include "test_helpers.hpp"
 #include "scanner/memory_scanner.hpp"
 #include <memory>
+#include <stdexcept>
 #include <variant>
 
 using namespace nce;

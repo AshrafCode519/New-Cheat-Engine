@@ -3,6 +3,7 @@
 #include <cctype>
 #include <charconv>
 #include <cstring>
+#include <utility>
 #include <vector>
 
 namespace nce::debugger {

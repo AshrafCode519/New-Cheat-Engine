@@ -5,6 +5,7 @@
 #include <charconv>
 #include <cstring>
 #include <sstream>
+#include <utility>
 
 namespace nce::assembler {
 

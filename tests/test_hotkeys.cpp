@@ -250,12 +250,14 @@ TEST_CASE("the Windows hotkey thread registers combos and passes on presses") {
     CHECK(pressed[0] == combo);
     CHECK_FALSE(hotkeys->deliver("Ctrl+Alt+Shift+F23"));
 
+#ifdef _WIN32
     // A combo is held by one registration system-wide: a second one sees it taken
     auto other = hal::IHotkeys::create();
     CHECK(other->set({combo}) == std::vector<std::string>{combo});
     CHECK(hotkeys->set({}).empty());
     CHECK_FALSE(hotkeys->deliver(combo));
     CHECK(other->set({combo}).empty()); // free again
+#endif
 }
 
 TEST_CASE("a table hotkey registered with Windows changes the value when pressed") {

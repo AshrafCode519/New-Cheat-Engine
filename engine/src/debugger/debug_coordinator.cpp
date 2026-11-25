@@ -6,6 +6,7 @@
 #include "../../include/utils/hex_utils.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstring>
 #include <filesystem>
 #include <sstream>
@@ -1316,7 +1317,7 @@ void DebugCoordinator::linux_ptrace_loop(std::promise<bool> start_promise) {
             waitpid(tid, &st, __WALL);
             if (tid == static_cast<pid_t>(m_pid)) {
                 ptrace(PTRACE_SETOPTIONS, tid, nullptr,
-                       reinterpret_cast<void*>(PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT));
+                       reinterpret_cast<void*>(static_cast<uintptr_t>(PTRACE_O_TRACECLONE | PTRACE_O_TRACEEXIT)));
             }
             attached_tids.push_back(tid);
         }

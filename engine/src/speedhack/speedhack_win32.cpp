@@ -426,6 +426,7 @@ bool Speedhack::update_shared_time(double new_speed, bool enable_flag) {
 #include <cstddef>
 #include <cstring>
 #include <ctime>
+#include <initializer_list>
 #include <vector>
 
 namespace nce::speedhack {

@@ -1,7 +1,8 @@
 #include "../../include/debugger/hook_engine.hpp"
 #include "../../include/debugger/disassembler.hpp"
-#include <cstring>
 #include <algorithm>
+#include <cstring>
+#include <iterator>
 
 namespace nce::debugger {
 

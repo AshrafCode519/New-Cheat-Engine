@@ -1,6 +1,7 @@
 #include "../../include/hal/hotkeys.hpp"
 #include <algorithm>
 #include <cctype>
+#include <utility>
 
 namespace nce::hal {
 

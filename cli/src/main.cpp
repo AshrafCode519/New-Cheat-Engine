@@ -12,6 +12,7 @@
 #include <exception>
 #include <utility>
 #include <charconv>
+#include <cstdlib>
 #include <filesystem>
 #include <cctype>
 

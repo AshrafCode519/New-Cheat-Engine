@@ -4,6 +4,7 @@
 #include <bit>
 #include <cmath>
 #include <thread>
+#include <utility>
 
 namespace nce::scanner {
 
