@@ -46,6 +46,12 @@ hal::IProcess* get_process_from_lua(lua_State* L) {
     return s ? &s->process() : nullptr;
 }
 
+bool iequals(const std::string& a, const std::string& b) {
+    return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](unsigned char ca, unsigned char cb) {
+        return std::tolower(ca) == std::tolower(cb);
+    });
+}
+
 uintptr_t parse_address(lua_State* L, int idx, hal::IProcess* proc) {
     if (lua_isinteger(L, idx)) {
         return static_cast<uintptr_t>(lua_tointeger(L, idx));
@@ -61,7 +67,7 @@ uintptr_t parse_address(lua_State* L, int idx, hal::IProcess* proc) {
             std::string off_str = s.substr(plus_pos + 1);
             uintptr_t base = 0;
             for (const auto& mod : proc->get_modules()) {
-                if (_stricmp(mod.name.c_str(), mod_name.c_str()) == 0) {
+                if (iequals(mod.name, mod_name)) {
                     base = mod.base_address;
                     break;
                 }
@@ -370,7 +376,7 @@ int l_getModuleAddress(lua_State* L) {
     if (!proc || !lua_isstring(L, 1)) { lua_pushnil(L); return 1; }
     std::string mod_name = lua_tostring(L, 1);
     for (const auto& mod : proc->get_modules()) {
-        if (_stricmp(mod.name.c_str(), mod_name.c_str()) == 0) {
+        if (iequals(mod.name, mod_name)) {
             lua_pushinteger(L, static_cast<lua_Integer>(mod.base_address));
             return 1;
         }
