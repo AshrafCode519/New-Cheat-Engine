@@ -77,6 +77,57 @@ TEST_CASE("Phase 5 X86Assembler: SSE2 packed ops, conversions, bit tests, and bs
     }
 }
 
+TEST_CASE("Phase 5 X86Assembler: movd/movq, scalar/packed SSE ops, atomics, lock, and rep string ops") {
+    assembler::X86Assembler enc(true);
+    std::string err;
+
+    struct Case { const char* line; const char* mnem; };
+    const Case cases[] = {
+        {"movd xmm0, eax", "movd"},
+        {"movd eax, xmm1", "movd"},
+        {"movd xmm2, dword ptr [rcx]", "movd"},
+        {"movq xmm0, rax", "movq"},
+        {"movq rax, xmm1", "movq"},
+        {"movq xmm2, xmm3", "movq"},
+        {"movq qword ptr [rcx], xmm0", "movq"},
+        {"cvtss2sd xmm0, xmm1", "cvtss2sd"},
+        {"cvtsd2ss xmm2, xmm3", "cvtsd2ss"},
+        {"minss xmm0, xmm1", "minss"},
+        {"minsd xmm2, xmm3", "minsd"},
+        {"maxss xmm4, xmm5", "maxss"},
+        {"maxsd xmm6, xmm7", "maxsd"},
+        {"andps xmm0, xmm1", "andps"},
+        {"andpd xmm2, xmm3", "andpd"},
+        {"orps xmm4, xmm5", "orps"},
+        {"orpd xmm6, xmm7", "orpd"},
+        {"pxor xmm0, xmm1", "pxor"},
+        {"xadd dword ptr [rcx], eax", "xadd"},
+        {"lock xadd qword ptr [rcx], rax", "lock xadd"},
+        {"cmpxchg dword ptr [rdx], ecx", "cmpxchg"},
+        {"lock cmpxchg qword ptr [rdx], rbx", "lock cmpxchg"},
+        {"lock add dword ptr [rcx], 1", "lock add"},
+        {"rep movsb", "rep movsb"},
+        {"rep stosb", "rep stosb"},
+        {"rep movsq", "rep movsq"},
+        {"rep stosq", "rep stosq"},
+    };
+
+    for (const auto& c : cases) {
+        auto out = enc.encode(c.line, 0x140001000ULL, err);
+        INFO("Instruction: " << std::string(c.line) << " err=" << err);
+        REQUIRE(out.has_value());
+        REQUIRE(!out->bytes.empty());
+
+        auto dec = debugger::Disassembler::decode(out->bytes.data(), out->bytes.size(), 0x140001000ULL);
+        CHECK(dec.mnemonic == c.mnem);
+        CHECK(dec.length == out->bytes.size());
+    }
+
+    // Invalid lock usage without memory operand must fail cleanly
+    CHECK_FALSE(enc.encode("lock mov eax, ebx", 0x140001000ULL, err).has_value());
+    CHECK_FALSE(enc.encode("rep add eax, ebx", 0x140001000ULL, err).has_value());
+}
+
 TEST_CASE("Phase 5 Disassembler CFG: splits basic blocks and classifies branch edges") {
     // Function layout at 0x10000:
     // +0x00: 85 C0       test eax, eax

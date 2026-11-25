@@ -109,10 +109,15 @@ public:
     // Addresses that change on their own: first scans skip them, next scans drop them (nullptr = none)
     void set_noise_map(std::shared_ptr<const NoiseMap> noise) { m_noise = std::move(noise); }
 
+    // Maximum RAM kept by in-progress and merged ScanResults before spilling chunks to a temp file.
+    void set_disk_spill_limit(size_t max_ram_bytes) noexcept { m_disk_spill_limit = max_ram_bytes; }
+    [[nodiscard]] size_t disk_spill_limit() const noexcept { return m_disk_spill_limit; }
+
 private:
     std::shared_ptr<hal::IProcess> m_process;
     std::shared_ptr<const NoiseMap> m_noise;
     size_t m_thread_count;
+    size_t m_disk_spill_limit{256ULL * 1024ULL * 1024ULL};
 };
 
 } // namespace nce::scanner

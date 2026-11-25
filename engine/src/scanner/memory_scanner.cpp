@@ -232,8 +232,9 @@ void scan_chunk_aob(
 }
 
 // Concatenates per-work-item results in order, freeing each part as it goes
-ScanResults merge_parts(std::vector<ScanResults>& parts, DataType type, size_t value_size) {
+ScanResults merge_parts(std::vector<ScanResults>& parts, DataType type, size_t value_size, size_t ram_limit) {
     ScanResults merged(type, value_size);
+    merged.set_ram_limit(ram_limit);
     size_t total = 0;
     for (const auto& p : parts) total += p.count();
     merged.reserve(total);
@@ -253,6 +254,7 @@ ScanResults scan_regions(
     const NoiseMap* noise,
     size_t thread_count,
     const ScanProgressCallback& progress,
+    size_t ram_limit,
     DataType type,
     size_t value_size,
     ChunkScanner&& scan_chunk
@@ -261,7 +263,9 @@ ScanResults scan_regions(
     const bool use_noise = noise && !noise->empty();
     const auto regions = use_noise ? noise->filter_regions(process.query_regions(region_filter))
                                    : process.query_regions(region_filter);
-    if (regions.empty() || value_size == 0) return ScanResults(type, value_size);
+    ScanResults empty_out(type, value_size);
+    empty_out.set_ram_limit(ram_limit);
+    if (regions.empty() || value_size == 0) return empty_out;
 
     size_t total_bytes = 0;
     for (const auto& r : regions) total_bytes += r.size;
@@ -288,9 +292,13 @@ ScanResults scan_regions(
         }
     }
 
-    if (tasks.empty()) return ScanResults(type, value_size);
+    if (tasks.empty()) return empty_out;
 
+    const size_t part_ram_limit = (ram_limit == SIZE_MAX)
+        ? SIZE_MAX
+        : std::max<size_t>(1024, ram_limit / std::max<size_t>(1, std::min<size_t>(thread_count, 8)));
     std::vector<ScanResults> parts(tasks.size(), ScanResults(type, value_size));
+    for (auto& part : parts) part.set_ram_limit(part_ram_limit);
 
     parallel_for(tasks.size(), thread_count,
         [&] { return std::vector<uint8_t>(CHUNK_SIZE + overlap); },
@@ -319,7 +327,7 @@ ScanResults scan_regions(
             }
         });
 
-    auto results = merge_parts(parts, type, value_size);
+    auto results = merge_parts(parts, type, value_size, ram_limit);
     return use_noise ? noise->filter(results) : results;
 }
 
@@ -331,14 +339,21 @@ ScanResults filter_results(
     const ScanResults& previous,
     size_t thread_count,
     const ScanProgressCallback& progress,
+    size_t ram_limit,
     Match&& match
 ) {
     const size_t total = previous.count();
     const size_t value_size = previous.value_size();
-    if (total == 0 || value_size == 0) return ScanResults(previous.type(), value_size);
+    ScanResults empty_out(previous.type(), value_size);
+    empty_out.set_ram_limit(ram_limit);
+    if (total == 0 || value_size == 0) return empty_out;
 
     const size_t slices = (total + NEXT_SCAN_SLICE - 1) / NEXT_SCAN_SLICE;
+    const size_t part_ram_limit = (ram_limit == SIZE_MAX)
+        ? SIZE_MAX
+        : std::max<size_t>(1024, ram_limit / std::max<size_t>(1, std::min<size_t>(thread_count, 8)));
     std::vector<ScanResults> parts(slices, ScanResults(previous.type(), value_size));
+    for (auto& part : parts) part.set_ram_limit(part_ram_limit);
     std::atomic<size_t> processed{0};
     std::atomic<size_t> found{0};
 
@@ -386,7 +401,7 @@ ScanResults filter_results(
             }
         });
 
-    return merge_parts(parts, previous.type(), value_size);
+    return merge_parts(parts, previous.type(), value_size, ram_limit);
 }
 
 } // anonymous namespace
@@ -416,7 +431,7 @@ ScanResults MemoryScanner::first_scan(
         const T target1 = std::get<T>(val1.value);
         const T target2 = (condition == ScanCondition::Between) ? std::get<T>(val2.value) : T{};
 
-        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
+        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, m_disk_spill_limit, type, sizeof(T),
             [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
                 scan_chunk_typed<T>(buffer, size, limit, base, condition, target1, target2, step, out, is_be);
             });
@@ -438,7 +453,7 @@ ScanResults MemoryScanner::first_scan_aob(
     const auto& pattern = *opt_pattern;
     const size_t step = std::max<size_t>(1, alignment);
 
-    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, DataType::AOB, pattern.bytes.size(),
+    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, m_disk_spill_limit, DataType::AOB, pattern.bytes.size(),
         [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
             scan_chunk_aob(buffer, size, limit, base, pattern, step, out);
         });
@@ -466,7 +481,7 @@ ScanResults MemoryScanner::first_scan_string(
     const DataType type = utf16 ? DataType::String16 : DataType::String;
     const size_t step = std::max<size_t>(1, alignment);
 
-    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, pattern.bytes.size(),
+    return scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, m_disk_spill_limit, type, pattern.bytes.size(),
         [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
             scan_chunk_aob(buffer, size, limit, base, pattern, step, out);
         });
@@ -549,7 +564,7 @@ ScanResults MemoryScanner::next_scan(
         const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
         const T target2 = uses_val2 ? std::get<T>(val2.value) : T{};
 
-        results = filter_results(*m_process, previous_results, m_thread_count, progress,
+        results = filter_results(*m_process, previous_results, m_thread_count, progress, m_disk_spill_limit,
             [&](const uint8_t* live, const uint8_t* prev) {
                 return match_next_bytes<T>(live, prev, condition, target1, target2, is_be);
             });
@@ -559,7 +574,7 @@ ScanResults MemoryScanner::next_scan(
     if (!is_numeric && (condition == ScanCondition::Changed || condition == ScanCondition::Unchanged)) {
         const bool want_unchanged = (condition == ScanCondition::Unchanged);
         const size_t size = previous_results.value_size();
-        results = filter_results(*m_process, previous_results, m_thread_count, progress,
+        results = filter_results(*m_process, previous_results, m_thread_count, progress, m_disk_spill_limit,
             [&](const uint8_t* live, const uint8_t* prev) {
                 return (std::memcmp(live, prev, size) == 0) == want_unchanged;
             });
@@ -589,7 +604,11 @@ ScanResults MemoryScanner::next_scan(
         const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
         const T target2 = uses_val2 ? std::get<T>(val2.value) : T{};
 
+        const size_t part_ram_limit = (m_disk_spill_limit == SIZE_MAX)
+            ? SIZE_MAX
+            : std::max<size_t>(1024, m_disk_spill_limit / std::max<size_t>(1, std::min<size_t>(m_thread_count, 8)));
         std::vector<ScanResults> parts(snapshot.blocks.size(), ScanResults(type, sizeof(T)));
+        for (auto& part : parts) part.set_ram_limit(part_ram_limit);
         std::atomic<size_t> compared_bytes{0};
         std::atomic<size_t> found{0};
         const size_t total_bytes = snapshot.total_bytes();
@@ -615,7 +634,7 @@ ScanResults MemoryScanner::next_scan(
                 }
             });
 
-        results = merge_parts(parts, type, sizeof(T));
+        results = merge_parts(parts, type, sizeof(T), m_disk_spill_limit);
     });
 
     return results;
@@ -721,7 +740,7 @@ ScanResults MemoryScanner::first_scan_xor(
 
     dispatch_numeric(type, [&]<typename T>() {
         const T target_val = std::get<T>(target.value);
-        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
+        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, m_disk_spill_limit, type, sizeof(T),
             [&, target_val, is_be, xor_key, step](const uint8_t* buffer, size_t buffer_size, size_t start_limit,
                                                   uintptr_t chunk_base, ScanResults& out) {
                 for (size_t offset = 0; offset < start_limit && offset + sizeof(T) <= buffer_size; offset += step) {
@@ -785,7 +804,7 @@ ScanResults MemoryScanner::first_scan_xor_auto(
         } else {
             using Bits = std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>;
             const int default_off = static_cast<int>(sizeof(T));
-            results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
+            results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, m_disk_spill_limit, type, sizeof(T),
                 [&, target_val, is_be, key_offset, default_off, step](
                     const uint8_t* buffer, size_t buffer_size, size_t start_limit,
                     uintptr_t chunk_base, ScanResults& out) {

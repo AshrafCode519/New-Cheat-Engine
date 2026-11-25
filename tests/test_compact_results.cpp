@@ -155,3 +155,65 @@ TEST_CASE("next_scan(snapshot) and filter_snapshot agree") {
         CHECK(direct.address(i) == via_filter.address(i));
     }
 }
+
+TEST_CASE("ScanResults spills large result sets to disk and supports sorted/concurrent access") {
+    scanner::ScanResults results(DataType::Int32, 4);
+    results.set_ram_limit(2048); // 2 KB RAM cap (~128 entries per chunk)
+
+    constexpr size_t N = 5000;
+    for (size_t i = 0; i < N; ++i) {
+        const int32_t cur = static_cast<int32_t>(i * 3 + 7);
+        const int32_t prev = static_cast<int32_t>(i);
+        // Insert in reverse address order to exercise external chunked sort
+        const uintptr_t addr = 0x1000000 + (N - 1 - i) * 8;
+        results.add(addr, &cur, &prev);
+    }
+
+    REQUIRE(results.count() == N);
+    CHECK(results.is_spilled());
+    CHECK(results.spilled_count() > 4000);
+    CHECK(results.disk_bytes() > 0);
+    CHECK(results.in_memory_bytes() <= 4096);
+
+    // Verify random/boundary access before sorting
+    CHECK(results.address(0) == 0x1000000 + (N - 1) * 8);
+    CHECK(std::get<int32_t>(results[0].current_value.value) == 7);
+    CHECK(std::get<int32_t>(results[4999].current_value.value) == static_cast<int32_t>(4999 * 3 + 7));
+
+    results.sort_by_address();
+    REQUIRE(results.count() == N);
+    CHECK(sorted_by_address(results));
+    CHECK(results.address(0) == 0x1000000);
+    CHECK(std::get<int32_t>(results[0].current_value.value) == static_cast<int32_t>(4999 * 3 + 7));
+
+    size_t streamed = 0;
+    uintptr_t prev_addr = 0;
+    results.for_each([&](size_t idx, uintptr_t addr, const uint8_t* cur, const uint8_t*) {
+        CHECK(idx == streamed);
+        if (streamed > 0) CHECK(addr > prev_addr);
+        int32_t v = 0;
+        std::memcpy(&v, cur, 4);
+        CHECK(v == static_cast<int32_t>((N - 1 - idx) * 3 + 7));
+        prev_addr = addr;
+        ++streamed;
+    });
+    CHECK(streamed == N);
+
+    // Exercise multithreaded next_scan reading disk-spilled ScanResults under a tight RAM cap
+    auto process = std::make_shared<FakeProcess>(0x40000);
+    scanner::MemoryScanner ms(process);
+    ms.set_disk_spill_limit(2048);
+    for (size_t off = 0; off < 0x40000; off += 16) {
+        process->put<int32_t>(off, 12345);
+    }
+
+    auto scanned = ms.first_scan(DataType::Int32, ScanCondition::ExactValue, i32(12345), {}, 16);
+    REQUIRE(scanned.count() == 0x40000 / 16);
+    CHECK(scanned.is_spilled());
+    CHECK(sorted_by_address(scanned));
+
+    process->put<int32_t>(0x1000, 99999);
+    auto unchanged = ms.next_scan(scanned, ScanCondition::Unchanged);
+    CHECK(unchanged.count() == (0x40000 / 16) - 1);
+    CHECK(sorted_by_address(unchanged));
+}

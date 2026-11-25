@@ -223,6 +223,7 @@ std::vector<hal::MemoryRegion> NoiseMap::filter_regions(const std::vector<hal::M
 ScanResults NoiseMap::filter(const ScanResults& results) const {
     if (m_blocks.empty()) return results;
     ScanResults out(results.type(), results.value_size());
+    out.set_ram_limit(results.ram_limit());
     out.reserve(results.count());
     for (size_t i = 0; i < results.count(); ++i) {
         if (!is_noisy(results.address(i), results.value_size())) {

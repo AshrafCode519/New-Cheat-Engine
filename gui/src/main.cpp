@@ -1,7 +1,8 @@
-// New Cheat Engine - graphical front end (Dear ImGui on Win32 + Direct3D 11).
+// New Cheat Engine - graphical front end (Dear ImGui: Win32 + DX11 on Windows, SDL2 + OpenGL3 on Linux).
 // Long operations (scans, pointer scans) run on a worker thread; their results are applied on the
 // UI thread once they finish, and the scan controls are disabled meanwhile.
 
+#ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
@@ -11,11 +12,19 @@
 #include <windows.h>
 #include <shellapi.h>
 #include <d3d11.h>
+#endif
 
 #include "imgui.h"
+#include "imgui_stdlib.h"
+#ifdef _WIN32
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
-#include "imgui_stdlib.h"
+#else
+#include <SDL.h>
+#include <SDL_opengl.h>
+#include "imgui_impl_sdl2.h"
+#include "imgui_impl_opengl3.h"
+#endif
 
 #include "session/session.hpp"
 #include "view/structure_dissector.hpp"
@@ -44,11 +53,24 @@
 #include <utility>
 #include <vector>
 
+#ifdef _WIN32
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam);
+#endif
 
 using namespace nce;
 
 namespace {
+
+// Global hotkeys for smart track, so the user can answer without leaving the game. Each action has a
+// numpad key and a Ctrl+Shift+digit alternative (for keyboards without a numpad).
+enum HotkeyAction { HOTKEY_READY = 1, HOTKEY_DOWN, HOTKEY_UP, HOTKEY_CHANGED };
+std::vector<int> g_hotkeys_pressed; // filled by window_proc on Windows, drained by the main loop
+
+// Audible feedback: the game is in front, so the window can't show anything
+#ifdef _WIN32
+void beep(uint32_t frequency, uint32_t ms) {
+    std::thread([frequency, ms] { Beep(static_cast<DWORD>(frequency), static_cast<DWORD>(ms)); }).detach();
+}
 
 // ---- Direct3D 11 setup (as in the Dear ImGui Win32 + DX11 example) ------------------------------
 
@@ -108,11 +130,7 @@ void cleanup_device() {
     if (g_device) { g_device->Release(); g_device = nullptr; }
 }
 
-// Global hotkeys for smart track, so the user can answer without leaving the game. Each action has a
-// numpad key and a Ctrl+Shift+digit alternative (for keyboards without a numpad).
-enum HotkeyAction { HOTKEY_READY = 1, HOTKEY_DOWN, HOTKEY_UP, HOTKEY_CHANGED };
 HWND g_window = nullptr;
-std::vector<int> g_hotkeys_pressed; // filled by window_proc, drained by the main loop (same thread)
 
 bool register_hotkeys() {
     const UINT numpad[] = {VK_NUMPAD0, VK_SUBTRACT, VK_ADD, VK_MULTIPLY};
@@ -129,11 +147,6 @@ void unregister_hotkeys() {
         UnregisterHotKey(g_window, action);
         UnregisterHotKey(g_window, action + 10);
     }
-}
-
-// Audible feedback: the game is in front, so the window can't show anything
-void beep(DWORD frequency, DWORD ms) {
-    std::thread([frequency, ms] { Beep(frequency, ms); }).detach();
 }
 
 LRESULT WINAPI window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
@@ -159,6 +172,12 @@ LRESULT WINAPI window_proc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
     }
     return DefWindowProcW(hwnd, msg, wparam, lparam);
 }
+#else
+SDL_Window* g_sdl_window = nullptr;
+bool register_hotkeys() { return false; }
+void unregister_hotkeys() {}
+void beep(uint32_t, uint32_t) {}
+#endif
 
 // ---- Application state ---------------------------------------------------------------------------
 
@@ -4842,12 +4861,14 @@ void draw_ui(App& app) {
     draw_oscilloscope(app);
 }
 
+#ifdef _WIN32
 std::string to_utf8(const wchar_t* text) {
     const int size = WideCharToMultiByte(CP_UTF8, 0, text, -1, nullptr, 0, nullptr, nullptr);
     std::string out(size > 0 ? size - 1 : 0, '\0');
     if (size > 1) WideCharToMultiByte(CP_UTF8, 0, text, -1, out.data(), size, nullptr, nullptr);
     return out;
 }
+#endif
 
 struct LaunchOptions {
     std::string pid;
@@ -4864,6 +4885,19 @@ struct LaunchOptions {
 // nce_gui.exe [--pid <pid>] [--table <file.json>] [--track <type|auto>] [--view <address>]
 //             [--tab pointers|memory|hotkeys] [--library <folder>|off]
 //             [--screenshot <file.bmp> [--wait <seconds>]]
+void parse_launch_option(LaunchOptions& options, const std::string& option, const std::string& value) {
+    if (option == "--pid") options.pid = value;
+    else if (option == "--table") options.table = value;
+    else if (option == "--screenshot") options.screenshot = value;
+    else if (option == "--track") options.track = value;
+    else if (option == "--wait") options.wait_seconds = std::atoi(value.c_str());
+    else if (option == "--view") options.view = value;
+    else if (option == "--watch") options.watch = value;
+    else if (option == "--tab") options.tab = value;
+    else if (option == "--library") options.library = value;
+}
+
+#ifdef _WIN32
 LaunchOptions parse_command_line() {
     LaunchOptions options;
     int argc = 0;
@@ -4871,21 +4905,20 @@ LaunchOptions parse_command_line() {
     if (!argv) return options;
 
     for (int i = 1; i + 1 < argc; i += 2) {
-        const std::wstring option = argv[i];
-        const std::string value = to_utf8(argv[i + 1]);
-        if (option == L"--pid") options.pid = value;
-        else if (option == L"--table") options.table = value;
-        else if (option == L"--screenshot") options.screenshot = value;
-        else if (option == L"--track") options.track = value;
-        else if (option == L"--wait") options.wait_seconds = std::atoi(value.c_str());
-        else if (option == L"--view") options.view = value;
-        else if (option == L"--watch") options.watch = value;
-        else if (option == L"--tab") options.tab = value;
-        else if (option == L"--library") options.library = value;
+        parse_launch_option(options, to_utf8(argv[i]), to_utf8(argv[i + 1]));
     }
     LocalFree(argv);
     return options;
 }
+#else
+LaunchOptions parse_command_line(int argc, char** argv) {
+    LaunchOptions options;
+    for (int i = 1; i + 1 < argc; i += 2) {
+        parse_launch_option(options, argv[i], argv[i + 1]);
+    }
+    return options;
+}
+#endif
 
 void apply_launch_options(App& app, const LaunchOptions& options) {
     if (!options.pid.empty()) {
@@ -4935,6 +4968,38 @@ void apply_launch_options(App& app, const LaunchOptions& options) {
     }
 }
 
+bool write_bmp_bgra(const std::string& path, uint32_t width, uint32_t height, const std::vector<uint8_t>& bgra_top_down) {
+    if (width == 0 || height == 0 || bgra_top_down.size() < static_cast<size_t>(width) * height * 4) return false;
+    const uint32_t image_size = width * height * 4;
+    const uint32_t off_bits = 54;
+    const uint32_t file_size = off_bits + image_size;
+    auto put_u16 = [](uint8_t* dst, uint16_t v) { dst[0] = static_cast<uint8_t>(v & 0xFF); dst[1] = static_cast<uint8_t>(v >> 8); };
+    auto put_u32 = [](uint8_t* dst, uint32_t v) {
+        dst[0] = static_cast<uint8_t>(v & 0xFF);
+        dst[1] = static_cast<uint8_t>((v >> 8) & 0xFF);
+        dst[2] = static_cast<uint8_t>((v >> 16) & 0xFF);
+        dst[3] = static_cast<uint8_t>((v >> 24) & 0xFF);
+    };
+
+    uint8_t hdr[54]{};
+    hdr[0] = 'B';
+    hdr[1] = 'M';
+    put_u32(hdr + 2, file_size);
+    put_u32(hdr + 10, off_bits);
+    put_u32(hdr + 14, 40);
+    put_u32(hdr + 18, width);
+    put_u32(hdr + 22, static_cast<uint32_t>(-static_cast<int32_t>(height))); // top-down rows
+    put_u16(hdr + 26, 1);
+    put_u16(hdr + 28, 32);
+    put_u32(hdr + 34, image_size);
+
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out.write(reinterpret_cast<const char*>(hdr), sizeof(hdr));
+    out.write(reinterpret_cast<const char*>(bgra_top_down.data()), static_cast<std::streamsize>(image_size));
+    return static_cast<bool>(out);
+}
+
+#ifdef _WIN32
 // Saves the frame that was just rendered (call before Present) as a top-down 32-bit BMP
 bool save_back_buffer(const std::string& path) {
     ID3D11Texture2D* back_buffer = nullptr;
@@ -4956,43 +5021,100 @@ bool save_back_buffer(const std::string& path) {
     bool saved = false;
     D3D11_MAPPED_SUBRESOURCE mapped{};
     if (SUCCEEDED(g_device_context->Map(staging, 0, D3D11_MAP_READ, 0, &mapped))) {
-        BITMAPINFOHEADER info{};
-        info.biSize = sizeof(info);
-        info.biWidth = static_cast<LONG>(desc.Width);
-        info.biHeight = -static_cast<LONG>(desc.Height); // top-down rows
-        info.biPlanes = 1;
-        info.biBitCount = 32;
-        info.biCompression = BI_RGB;
-        info.biSizeImage = desc.Width * desc.Height * 4;
-
-        BITMAPFILEHEADER header{};
-        header.bfType = 0x4D42; // "BM"
-        header.bfOffBits = sizeof(header) + sizeof(info);
-        header.bfSize = header.bfOffBits + info.biSizeImage;
-
-        std::ofstream out(path, std::ios::binary | std::ios::trunc);
-        out.write(reinterpret_cast<const char*>(&header), sizeof(header));
-        out.write(reinterpret_cast<const char*>(&info), sizeof(info));
-        std::vector<uint8_t> row(desc.Width * 4);
+        std::vector<uint8_t> bgra(static_cast<size_t>(desc.Width) * desc.Height * 4);
         for (UINT y = 0; y < desc.Height; ++y) {
             const auto* src = static_cast<const uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+            uint8_t* dst = bgra.data() + static_cast<size_t>(y) * desc.Width * 4;
             for (UINT x = 0; x < desc.Width; ++x) { // RGBA -> BGRA
-                row[x * 4 + 0] = src[x * 4 + 2];
-                row[x * 4 + 1] = src[x * 4 + 1];
-                row[x * 4 + 2] = src[x * 4 + 0];
-                row[x * 4 + 3] = src[x * 4 + 3];
+                dst[x * 4 + 0] = src[x * 4 + 2];
+                dst[x * 4 + 1] = src[x * 4 + 1];
+                dst[x * 4 + 2] = src[x * 4 + 0];
+                dst[x * 4 + 3] = src[x * 4 + 3];
             }
-            out.write(reinterpret_cast<const char*>(row.data()), static_cast<std::streamsize>(row.size()));
         }
-        saved = static_cast<bool>(out);
+        saved = write_bmp_bgra(path, desc.Width, desc.Height, bgra);
         g_device_context->Unmap(staging, 0);
     }
     staging->Release();
     return saved;
 }
+#else
+bool save_back_buffer(const std::string& path) {
+    if (!g_sdl_window) return false;
+    int w = 0, h = 0;
+    SDL_GL_GetDrawableSize(g_sdl_window, &w, &h);
+    if (w <= 0 || h <= 0) return false;
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4);
+    glReadPixels(0, 0, w, h, GL_RGBA, GL_UNSIGNED_BYTE, rgba.data());
+    std::vector<uint8_t> bgra(rgba.size());
+    for (int y = 0; y < h; ++y) {
+        const uint8_t* src = rgba.data() + static_cast<size_t>(h - 1 - y) * w * 4; // GL origin is bottom-left
+        uint8_t* dst = bgra.data() + static_cast<size_t>(y) * w * 4;
+        for (int x = 0; x < w; ++x) {
+            dst[x * 4 + 0] = src[x * 4 + 2];
+            dst[x * 4 + 1] = src[x * 4 + 1];
+            dst[x * 4 + 2] = src[x * 4 + 0];
+            dst[x * 4 + 3] = 255;
+        }
+    }
+    return write_bmp_bgra(path, static_cast<uint32_t>(w), static_cast<uint32_t>(h), bgra);
+}
+#endif
+
+void init_imgui_context(float dpi_scale) {
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO& io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+    io.IniFilename = nullptr;
+
+    // Crisp text on high-DPI screens: build the font at the monitor's scale instead of stretching it
+    const float clamped = std::max(1.0f, dpi_scale);
+    ImFontConfig font_config;
+    font_config.SizePixels = 13.0f * clamped;
+    io.Fonts->AddFontDefault(&font_config);
+    ImGui::StyleColorsDark();
+    ImGui::GetStyle().ScaleAllSizes(clamped);
+}
+
+void init_app_session(App& app, const LaunchOptions& options) {
+    // Each program's table opens by itself on attach and is saved while it changes
+    if (options.library == "off") app.session.table().set_library({});
+    else if (!options.library.empty()) {
+        app.session.table().set_library(std::filesystem::path(std::u8string(options.library.begin(), options.library.end())));
+    } else {
+        app.session.table().set_library(session::default_library_folder());
+    }
+    app.session.table().on_hotkey([&app](const std::string& combo, const session::Outcome& outcome) {
+        std::lock_guard<std::mutex> lock(app.hotkey_mutex); // on the hotkey thread: the UI shows it next frame
+        app.hotkey_events.emplace_back(combo, outcome);
+    });
+    apply_launch_options(app, options);
+}
+
+void tick_app_logic(App& app) {
+    poll_job(app);
+    tick_reattach(app);
+    process_hotkeys(app);
+    show_table_hotkeys(app);
+    tick_tracking(app);
+}
+
+bool should_capture_screenshot(
+    const App& app,
+    const LaunchOptions& options,
+    bool screenshot_mode,
+    int& frame,
+    std::chrono::steady_clock::time_point started)
+{
+    constexpr int SCREENSHOT_FRAME = 10; // let tables settle their column widths first
+    return screenshot_mode && ++frame >= SCREENSHOT_FRAME && !job_running(app) && !app.track_pending &&
+           elapsed_ms(started) >= options.wait_seconds * 1000LL;
+}
 
 } // anonymous namespace
 
+#ifdef _WIN32
 int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     const LaunchOptions options = parse_command_line();
     const bool screenshot_mode = !options.screenshot.empty();
@@ -5014,38 +5136,14 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     ShowWindow(hwnd, screenshot_mode ? SW_HIDE : SW_SHOWDEFAULT);
     UpdateWindow(hwnd);
 
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO& io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
-    io.IniFilename = nullptr;
-
-    // Crisp text on high-DPI screens: build the font at the monitor's scale instead of stretching it
-    const float dpi_scale = ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd);
-    ImFontConfig font_config;
-    font_config.SizePixels = 13.0f * dpi_scale;
-    io.Fonts->AddFontDefault(&font_config);
-    ImGui::StyleColorsDark();
-    ImGui::GetStyle().ScaleAllSizes(dpi_scale);
+    init_imgui_context(ImGui_ImplWin32_GetDpiScaleForHwnd(hwnd));
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_device, g_device_context);
 
     App app;
-    // Each program's table opens by itself on attach and is saved while it changes
-    if (options.library == "off") app.session.table().set_library({});
-    else if (!options.library.empty()) {
-        app.session.table().set_library(std::filesystem::path(std::u8string(options.library.begin(), options.library.end())));
-    } else {
-        app.session.table().set_library(session::default_library_folder());
-    }
-    app.session.table().on_hotkey([&app](const std::string& combo, const session::Outcome& outcome) {
-        std::lock_guard<std::mutex> lock(app.hotkey_mutex); // on the hotkey thread: the UI shows it next frame
-        app.hotkey_events.emplace_back(combo, outcome);
-    });
-    apply_launch_options(app, options);
+    init_app_session(app, options);
 
-    constexpr int SCREENSHOT_FRAME = 10; // let tables settle their column widths first
     int frame = 0;
     const auto started = std::chrono::steady_clock::now();
     int exit_code = 0;
@@ -5073,11 +5171,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
             create_render_target();
         }
 
-        poll_job(app);
-        tick_reattach(app);
-        process_hotkeys(app);
-        show_table_hotkeys(app);
-        tick_tracking(app);
+        tick_app_logic(app);
 
         ImGui_ImplDX11_NewFrame();
         ImGui_ImplWin32_NewFrame();
@@ -5091,8 +5185,7 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
         ImGui_ImplDX11_RenderDrawData(ImGui::GetDrawData());
 
         // Capture once the startup work (attach, noise learning, --track snapshot) has finished
-        if (screenshot_mode && ++frame >= SCREENSHOT_FRAME && !job_running(app) && !app.track_pending &&
-            elapsed_ms(started) >= options.wait_seconds * 1000LL) {
+        if (should_capture_screenshot(app, options, screenshot_mode, frame, started)) {
             exit_code = save_back_buffer(options.screenshot) ? 0 : 1;
             done = true;
         }
@@ -5112,3 +5205,109 @@ int WINAPI WinMain(HINSTANCE instance, HINSTANCE, LPSTR, int) {
     UnregisterClassW(wc.lpszClassName, wc.hInstance);
     return exit_code;
 }
+#else
+int main(int argc, char** argv) {
+    const LaunchOptions options = parse_command_line(argc, argv);
+    const bool screenshot_mode = !options.screenshot.empty();
+
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        return 1;
+    }
+
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+
+    Uint32 win_flags = SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE | SDL_WINDOW_ALLOW_HIGHDPI;
+    if (screenshot_mode) win_flags |= SDL_WINDOW_HIDDEN;
+    SDL_Window* window = SDL_CreateWindow("New Cheat Engine",
+                                          SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                                          1400, 860, win_flags);
+    if (!window) {
+        SDL_Quit();
+        return 1;
+    }
+    g_sdl_window = window;
+
+    SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+    if (!gl_context) {
+        g_sdl_window = nullptr;
+        SDL_DestroyWindow(window);
+        SDL_Quit();
+        return 1;
+    }
+    SDL_GL_MakeCurrent(window, gl_context);
+    SDL_GL_SetSwapInterval(1);
+
+    int win_w = 0, draw_w = 0;
+    SDL_GetWindowSize(window, &win_w, nullptr);
+    SDL_GL_GetDrawableSize(window, &draw_w, nullptr);
+    const float dpi_scale = (win_w > 0 && draw_w > win_w) ? static_cast<float>(draw_w) / static_cast<float>(win_w) : 1.0f;
+    init_imgui_context(dpi_scale);
+
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init("#version 130");
+
+    App app;
+    init_app_session(app, options);
+
+    int frame = 0;
+    const auto started = std::chrono::steady_clock::now();
+    int exit_code = 0;
+    bool done = false;
+    while (!done) {
+        SDL_Event event;
+        while (SDL_PollEvent(&event)) {
+            ImGui_ImplSDL2_ProcessEvent(&event);
+            if (event.type == SDL_QUIT) done = true;
+            if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
+                event.window.windowID == SDL_GetWindowID(window)) {
+                done = true;
+            }
+        }
+        if (done) break;
+
+        if (!screenshot_mode && (SDL_GetWindowFlags(window) & SDL_WINDOW_MINIMIZED) != 0) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            continue;
+        }
+
+        tick_app_logic(app);
+
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+        draw_ui(app);
+        ImGui::Render();
+
+        int dw = 0, dh = 0;
+        SDL_GL_GetDrawableSize(window, &dw, &dh);
+        glViewport(0, 0, dw, dh);
+        glClearColor(0.08f, 0.08f, 0.10f, 1.0f);
+        glClear(GL_COLOR_BUFFER_BIT);
+        ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+
+        if (should_capture_screenshot(app, options, screenshot_mode, frame, started)) {
+            exit_code = save_back_buffer(options.screenshot) ? 0 : 1;
+            done = true;
+        }
+
+        SDL_GL_SwapWindow(window);
+    }
+
+    if (app.job.valid()) app.job.wait();
+
+    ImGui_ImplOpenGL3_Shutdown();
+    ImGui_ImplSDL2_Shutdown();
+    ImGui::DestroyContext();
+    g_sdl_window = nullptr;
+    SDL_GL_DeleteContext(gl_context);
+    SDL_DestroyWindow(window);
+    SDL_Quit();
+    return exit_code;
+}
+#endif

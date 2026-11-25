@@ -48,6 +48,18 @@ unsigned long key_name_to_xkeysym(const std::string& key) {
     return (it != special.end()) ? it->second : 0ul;
 }
 
+class LinuxHotkeys;
+
+struct LinuxHotkeyRegistry {
+    std::mutex mutex;
+    std::map<std::string, LinuxHotkeys*> owners;
+};
+
+LinuxHotkeyRegistry& hotkey_registry() {
+    static LinuxHotkeyRegistry reg;
+    return reg;
+}
+
 class LinuxHotkeys final : public IHotkeys {
 public:
     LinuxHotkeys() {
@@ -57,6 +69,7 @@ public:
     ~LinuxHotkeys() override {
         m_stop = true;
         if (m_worker.joinable()) m_worker.join();
+        release_owned_combos();
     }
 
     void on_press(Handler handler) override {
@@ -66,8 +79,11 @@ public:
 
     std::vector<std::string> set(const std::vector<std::string>& combos) override {
         std::lock_guard<std::mutex> lock(m_mutex);
+        release_owned_combos();
         m_entries.clear();
         std::vector<std::string> failed;
+        auto& reg = hotkey_registry();
+        std::lock_guard<std::mutex> rlock(reg.mutex);
         for (const auto& text : combos) {
             auto parsed = parse_hotkey(text);
             if (!parsed) {
@@ -82,6 +98,12 @@ public:
                 failed.push_back(text);
                 continue;
             }
+            auto it = reg.owners.find(e.combo_text);
+            if (it != reg.owners.end() && it->second != this) {
+                failed.push_back(text);
+                continue;
+            }
+            reg.owners[e.combo_text] = this;
             m_entries.push_back(std::move(e));
         }
         return failed;
@@ -107,6 +129,15 @@ public:
     }
 
 private:
+    void release_owned_combos() {
+        auto& reg = hotkey_registry();
+        std::lock_guard<std::mutex> rlock(reg.mutex);
+        for (auto it = reg.owners.begin(); it != reg.owners.end();) {
+            if (it->second == this) it = reg.owners.erase(it);
+            else ++it;
+        }
+    }
+
     struct WatchEntry {
         std::string combo_text;
         KeyCombo parsed;

@@ -133,3 +133,141 @@ TEST_CASE("Linux HAL: Proton and Wine detection and Game name extraction") {
         CHECK_FALSE(is_proton_or_wine(cmd));
     }
 }
+
+#ifndef _WIN32
+#include "debugger/debug_coordinator.hpp"
+#include "debugger/elf_analyzer.hpp"
+#include <cerrno>
+#include <chrono>
+#include <csignal>
+#include <fstream>
+#include <sys/wait.h>
+#include <thread>
+#include <unistd.h>
+
+namespace {
+
+volatile int32_t g_linux_live_marker = 0x13572468;
+
+int read_yama_ptrace_scope() {
+    std::ifstream f("/proc/sys/kernel/yama/ptrace_scope");
+    int scope = 0;
+    if (f.is_open() && (f >> scope)) return scope;
+    return 0;
+}
+
+} // namespace
+
+TEST_CASE("Linux HAL live: LinuxProcess self-attach, maps, read/write, and ELFAnalyzer") {
+    auto proc = hal::IProcess::create();
+    const uint32_t self_pid = static_cast<uint32_t>(getpid());
+    REQUIRE(proc->attach(self_pid));
+    CHECK(proc->is_attached());
+    CHECK(proc->get_pid() == self_pid);
+    CHECK_FALSE(proc->name().empty());
+
+    const auto all_procs = hal::IProcess::list_processes();
+    CHECK_FALSE(all_procs.empty());
+
+    const auto regions = proc->query_regions();
+    CHECK_FALSE(regions.empty());
+
+    const auto mods = proc->get_modules();
+    REQUIRE_FALSE(mods.empty());
+
+    const uintptr_t addr = reinterpret_cast<uintptr_t>(&g_linux_live_marker);
+    int32_t val = 0;
+    REQUIRE(proc->read(addr, val));
+    CHECK(val == 0x13572468);
+
+    // Find module containing this binary and run live ELFAnalyzer against process RAM
+    uintptr_t self_base = 0;
+    for (const auto& m : mods) {
+        if (addr >= m.base_address && addr < m.base_address + m.size) {
+            self_base = m.base_address;
+            break;
+        }
+    }
+    if (self_base != 0 && debugger::ELFAnalyzer::is_elf_magic(*proc, self_base)) {
+        auto elf = debugger::ELFAnalyzer::analyze(*proc, self_base);
+        REQUIRE(elf.has_value());
+        CHECK(elf->is_valid);
+        CHECK(elf->is_64bit);
+        CHECK_FALSE(elf->segments.empty());
+    }
+
+    proc->detach();
+    CHECK_FALSE(proc->is_attached());
+}
+
+TEST_CASE("Linux HAL live: child process attach, remote mmap, and DebugCoordinator ptrace") {
+    if (read_yama_ptrace_scope() >= 2) {
+        MESSAGE("Skipping child ptrace test because /proc/sys/kernel/yama/ptrace_scope >= 2");
+        return;
+    }
+
+    int pipe_fd[2]{-1, -1};
+    REQUIRE(pipe(pipe_fd) == 0);
+
+    const pid_t child = fork();
+    REQUIRE(child >= 0);
+    if (child == 0) {
+        close(pipe_fd[1]);
+        char buf = 0;
+        // Block waiting for parent to close pipe or finish testing (retry on EINTR during ptrace)
+        for (;;) {
+            const ssize_t r = read(pipe_fd[0], &buf, 1);
+            if (r == 0 || (r < 0 && errno != EINTR)) break;
+        }
+        close(pipe_fd[0]);
+        _exit(0);
+    }
+
+    close(pipe_fd[0]);
+    // Give child a moment to enter blocking read()
+    std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+    auto proc = hal::IProcess::create();
+    REQUIRE(proc->attach(static_cast<uint32_t>(child)));
+
+    int32_t marker = 0;
+    const uintptr_t marker_addr = reinterpret_cast<uintptr_t>(&g_linux_live_marker);
+    REQUIRE(proc->read(marker_addr, marker));
+    CHECK(marker == 0x13572468);
+
+    REQUIRE(proc->write(marker_addr, int32_t{0x2468ACE0}));
+    int32_t updated = 0;
+    REQUIRE(proc->read(marker_addr, updated));
+    CHECK(updated == 0x2468ACE0);
+
+    const uintptr_t cave = proc->allocate_memory(4096, 0x40);
+    REQUIRE(cave != 0);
+    const uint8_t nop_ret[4] = {0x90, 0x90, 0x90, 0xC3};
+    REQUIRE(proc->write_raw(cave, nop_ret, sizeof(nop_ret), true));
+    uint8_t rb[4]{};
+    REQUIRE(proc->read_raw(cave, rb, sizeof(rb)));
+    CHECK(rb[0] == 0x90);
+    CHECK(rb[3] == 0xC3);
+    CHECK(proc->free_memory(cave, 4096));
+
+    // Attach DebugCoordinator using Linux ptrace backend, pause, read registers, and detach
+    debugger::DebugCoordinator dbg(proc);
+    REQUIRE(dbg.attach());
+    CHECK(dbg.is_attached());
+    CHECK(dbg.pause());
+    for (int i = 0; i < 40 && !dbg.is_paused(); ++i) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    if (dbg.is_paused()) {
+        CHECK(dbg.registers().rip != 0);
+        CHECK(dbg.resume());
+    }
+    dbg.detach();
+    CHECK_FALSE(dbg.is_attached());
+
+    proc->detach();
+    close(pipe_fd[1]);
+    int st = 0;
+    waitpid(child, &st, 0);
+}
+#endif

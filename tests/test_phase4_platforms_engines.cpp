@@ -514,3 +514,127 @@ TEST_CASE("Phase 4 EngineInspector: Unreal Engine detection, FNamePool, and FUOb
     REQUIRE(filtered.size() == 1);
     CHECK(filtered[0].name == "BP_HeroPawn_C");
 }
+
+TEST_CASE("Phase 4 ELFAnalyzer: parses DWARF .debug_info/.debug_abbrev/.debug_str subprograms") {
+    std::vector<uint8_t> img(0x3000, 0);
+
+    // ELF64 ET_DYN header with 0 program headers and 5 sections:
+    // [0] null, [1] .shstrtab, [2] .text, [3] .debug_abbrev, [4] .debug_info, [5] .debug_str
+    auto wr_str = [&](size_t off, const std::string& s) {
+        std::memcpy(img.data() + off, s.data(), s.size());
+        img[off + s.size()] = 0;
+    };
+    img[0] = 0x7F; img[1] = 'E'; img[2] = 'L'; img[3] = 'F';
+    img[4] = 2; img[5] = 1; img[6] = 1;
+    wr_le<uint16_t>(img, 16, 3);
+    wr_le<uint16_t>(img, 18, 0x3E);
+    wr_le<uint32_t>(img, 20, 1);
+    wr_le<uint64_t>(img, 40, 0x2000); // e_shoff
+    wr_le<uint16_t>(img, 52, 64);
+    wr_le<uint16_t>(img, 58, 64);     // e_shentsize
+    wr_le<uint16_t>(img, 60, 6);      // e_shnum
+    wr_le<uint16_t>(img, 62, 1);      // e_shstrndx = .shstrtab
+
+    // Section data offsets
+    constexpr size_t kShstrOff   = 0x0400;
+    constexpr size_t kAbbrevOff  = 0x0600;
+    constexpr size_t kInfoOff    = 0x0800;
+    constexpr size_t kDebugStrOff = 0x0A00;
+
+    // .shstrtab
+    size_t shstr_cur = 1;
+    auto add_shstr = [&](const std::string& s) -> uint32_t {
+        uint32_t off = static_cast<uint32_t>(shstr_cur);
+        wr_str(kShstrOff + shstr_cur, s);
+        shstr_cur += s.size() + 1;
+        return off;
+    };
+    const uint32_t n_shstr   = add_shstr(".shstrtab");
+    const uint32_t n_text    = add_shstr(".text");
+    const uint32_t n_dabbrev = add_shstr(".debug_abbrev");
+    const uint32_t n_dinfo   = add_shstr(".debug_info");
+    const uint32_t n_dstr    = add_shstr(".debug_str");
+
+    // .debug_str
+    const std::string fn1 = "CalculateDamage";
+    const std::string fn2 = "StaticHelperFn";
+    wr_str(kDebugStrOff + 0, fn1);
+    const uint32_t fn2_str_off = static_cast<uint32_t>(fn1.size() + 1);
+    wr_str(kDebugStrOff + fn2_str_off, fn2);
+
+    // .debug_abbrev:
+    // [1] DW_TAG_compile_unit (0x11), has_children=1: DW_AT_name (0x03) DW_FORM_string (0x08)
+    // [2] DW_TAG_subprogram   (0x2E), has_children=0:
+    //     DW_AT_name (0x03) DW_FORM_strp (0x0E)
+    //     DW_AT_low_pc (0x11) DW_FORM_addr (0x01)
+    //     DW_AT_high_pc (0x12) DW_FORM_udata (0x0F)
+    std::vector<uint8_t> abbrev = {
+        1, 0x11, 1,  0x03, 0x08,  0, 0,
+        2, 0x2E, 0,  0x03, 0x0E,  0x11, 0x01,  0x12, 0x0F,  0, 0,
+        0
+    };
+    std::memcpy(img.data() + kAbbrevOff, abbrev.data(), abbrev.size());
+
+    // .debug_info (DWARF 4 32-bit CU):
+    // header: version=4, abbrev_off=0, addr_size=8
+    std::vector<uint8_t> cu_body;
+    auto push_u8  = [&](uint8_t v)  { cu_body.push_back(v); };
+    auto push_u16 = [&](uint16_t v) { for (int i = 0; i < 2; ++i) cu_body.push_back(static_cast<uint8_t>(v >> (i * 8))); };
+    auto push_u32 = [&](uint32_t v) { for (int i = 0; i < 4; ++i) cu_body.push_back(static_cast<uint8_t>(v >> (i * 8))); };
+    auto push_u64 = [&](uint64_t v) { for (int i = 0; i < 8; ++i) cu_body.push_back(static_cast<uint8_t>(v >> (i * 8))); };
+
+    push_u16(4);     // DWARF version 4
+    push_u32(0);     // debug_abbrev_offset
+    push_u8(8);      // address_size = 8
+    // DIE 1 (CU)
+    push_u8(1);
+    for (char c : std::string("combat.cpp")) push_u8(static_cast<uint8_t>(c));
+    push_u8(0);
+    // DIE 2 (subprogram fn1: low_pc=0x1100, size=0x40)
+    push_u8(2);
+    push_u32(0);
+    push_u64(0x1100);
+    push_u8(0x40); // uleb128 0x40
+    // DIE 3 (subprogram fn2: low_pc=0x1180, size=0x28)
+    push_u8(2);
+    push_u32(fn2_str_off);
+    push_u64(0x1180);
+    push_u8(0x28); // uleb128 0x28
+    // End of CU children
+    push_u8(0);
+
+    wr_le<uint32_t>(img, kInfoOff, static_cast<uint32_t>(cu_body.size()));
+    std::memcpy(img.data() + kInfoOff + 4, cu_body.data(), cu_body.size());
+
+    auto put_sh = [&](size_t idx, uint32_t name, uint32_t type, uint64_t flags,
+                      uint64_t addr, uint64_t off, uint64_t sz) {
+        size_t o = 0x2000 + idx * 64;
+        wr_le<uint32_t>(img, o + 0, name);
+        wr_le<uint32_t>(img, o + 4, type);
+        wr_le<uint64_t>(img, o + 8, flags);
+        wr_le<uint64_t>(img, o + 16, addr);
+        wr_le<uint64_t>(img, o + 24, off);
+        wr_le<uint64_t>(img, o + 32, sz);
+    };
+    put_sh(1, n_shstr,   3, 0, 0, kShstrOff, shstr_cur);
+    put_sh(2, n_text,    1, 6, 0x1000, 0x1000, 0x500);
+    put_sh(3, n_dabbrev, 1, 0, 0, kAbbrevOff, abbrev.size());
+    put_sh(4, n_dinfo,   1, 0, 0, kInfoOff, 4 + cu_body.size());
+    put_sh(5, n_dstr,    1, 0, 0, kDebugStrOff, fn2_str_off + fn2.size() + 1);
+
+    auto elf = debugger::ELFAnalyzer::analyze_bytes(img, 0x500000);
+    REQUIRE(elf.has_value());
+    CHECK(elf->has_dwarf);
+    CHECK(elf->dwarf_function_count == 2);
+
+    const auto* s1 = debugger::ELFAnalyzer::find_symbol_by_name(*elf, "CalculateDamage");
+    REQUIRE(s1 != nullptr);
+    CHECK(s1->va == 0x501100);
+    CHECK(s1->size == 0x40);
+    CHECK(s1->section_index == 2);
+    CHECK(s1->type == 2);
+
+    const auto* s2 = debugger::ELFAnalyzer::find_symbol_by_address(*elf, 0x501188);
+    REQUIRE(s2 != nullptr);
+    CHECK(s2->name == "StaticHelperFn");
+}

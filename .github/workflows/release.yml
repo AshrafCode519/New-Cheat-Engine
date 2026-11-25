@@ -54,7 +54,7 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - name: Install build tools
-        run: sudo apt-get update && sudo apt-get install -y cmake g++
+        run: sudo apt-get update && sudo apt-get install -y cmake g++ libsdl2-dev libgl-dev
       - name: Configure & Build
         run: |
           cmake -S . -B build -DNCE_BUILD_TESTS=ON
@@ -70,7 +70,7 @@ jobs:
           fi
           DIR="NCE-${TAG}-linux-x64"
           mkdir -p "$DIR"
-          cp build/bin/memscan_cli build/bin/target_dummy LICENSE README.md "$DIR/"
+          cp build/bin/nce_gui build/bin/memscan_cli build/bin/target_dummy LICENSE README.md "$DIR/"
           tar -czf "${DIR}.tar.gz" "$DIR"
       - uses: actions/upload-artifact@v6
         with:

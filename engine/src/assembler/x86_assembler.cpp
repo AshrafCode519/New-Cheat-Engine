@@ -207,8 +207,9 @@ struct Insn {
     bool x64;
     bool rex_w{false}, rex_r{false}, rex_x{false}, rex_b{false};
     bool need_rex{false};   // a byte register spl/bpl/sil/dil/r8b.. forces a REX even when 0
-    bool op16{false};       // 16-bit operand-size prefix
-    uint8_t rep_prefix{0};  // 0xF2 / 0xF3 SSE prefix emitted before op16/REX
+    bool lock_prefix{false}; // 0xF0 LOCK prefix
+    bool op16{false};        // 16-bit operand-size prefix
+    uint8_t rep_prefix{0};   // 0xF2 / 0xF3 prefix emitted before op16/REX
     std::vector<uint8_t> opcode;
     bool has_modrm{false};
     uint8_t modrm{0};
@@ -235,6 +236,7 @@ struct Insn {
     std::vector<uint8_t> bytes() {
         std::vector<uint8_t> out;
         out.reserve(16);
+        if (lock_prefix) out.push_back(0xF0);
         if (rep_prefix != 0) out.push_back(rep_prefix);
         if (op16) out.push_back(0x66);
         const bool rex = rex_w || rex_r || rex_x || rex_b || need_rex;
@@ -311,7 +313,27 @@ void apply_width(Insn& in, int bits) {
 
 std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& instruction, uintptr_t address,
                                                           std::string& error) {
-    const std::string line = trim(instruction);
+    std::string line = trim(instruction);
+    bool has_lock = false;
+    uint8_t str_rep = 0;
+    while (true) {
+        const size_t psp = line.find_first_of(" \t");
+        if (psp == std::string::npos) break;
+        const std::string ptok = lower(line.substr(0, psp));
+        if (ptok == "lock") {
+            has_lock = true;
+            line = trim(line.substr(psp));
+        } else if (ptok == "rep" || ptok == "repe" || ptok == "repz") {
+            str_rep = 0xF3;
+            line = trim(line.substr(psp));
+        } else if (ptok == "repne" || ptok == "repnz") {
+            str_rep = 0xF2;
+            line = trim(line.substr(psp));
+        } else {
+            break;
+        }
+    }
+
     const size_t sp = line.find_first_of(" \t");
     const std::string mnem = lower(sp == std::string::npos ? line : line.substr(0, sp));
     const std::string rest = sp == std::string::npos ? "" : trim(line.substr(sp));
@@ -320,6 +342,23 @@ std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& ins
     Insn in;
     in.x64 = m_x64;
     auto done = [&](std::optional<size_t> rel = std::nullopt) -> std::optional<Encoded> {
+        if (has_lock) {
+            const bool lock_mnem = (mnem == "add" || mnem == "adc" || mnem == "and" ||
+                                    mnem == "btc" || mnem == "btr" || mnem == "bts" ||
+                                    mnem == "cmpxchg" || mnem == "dec" || mnem == "inc" ||
+                                    mnem == "neg" || mnem == "not" || mnem == "or" ||
+                                    mnem == "sbb" || mnem == "sub" || mnem == "xadd" ||
+                                    mnem == "xchg" || mnem == "xor");
+            if (!lock_mnem || rest.find('[') == std::string::npos || rel.has_value()) {
+                error = "lock prefix requires a lockable instruction with a memory operand";
+                return std::nullopt;
+            }
+            in.lock_prefix = true;
+        }
+        if (str_rep != 0) {
+            error = "rep prefix is only supported on string instructions";
+            return std::nullopt;
+        }
         Encoded e;
         e.bytes = in.bytes();
         if (rel) e.rel32_offset = in.rel32_at;
@@ -328,6 +367,27 @@ std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& ins
 
     // --- no operands ---
     if (ops.empty()) {
+        if (has_lock) {
+            error = "lock prefix cannot be used without a memory operand";
+            return std::nullopt;
+        }
+        auto emit_string_op = [&](std::vector<uint8_t> op) -> Encoded {
+            if (str_rep != 0) op.insert(op.begin(), str_rep);
+            return Encoded{std::move(op), std::nullopt, false, 0};
+        };
+        if (mnem == "movsb") return emit_string_op({0xA4});
+        if (mnem == "movsw") return emit_string_op({0x66, 0xA5});
+        if (mnem == "movsd") return emit_string_op({0xA5});
+        if (mnem == "movsq" && m_x64) return emit_string_op({0x48, 0xA5});
+        if (mnem == "stosb") return emit_string_op({0xAA});
+        if (mnem == "stosw") return emit_string_op({0x66, 0xAB});
+        if (mnem == "stosd") return emit_string_op({0xAB});
+        if (mnem == "stosq" && m_x64) return emit_string_op({0x48, 0xAB});
+
+        if (str_rep != 0) {
+            error = "rep prefix is only supported on string instructions";
+            return std::nullopt;
+        }
         if (mnem == "nop") return Encoded{{0x90}, std::nullopt, false, 0};
         if (mnem == "ret") return Encoded{{0xC3}, std::nullopt, false, 0};
         if (mnem == "int3") return Encoded{{0xCC}, std::nullopt, false, 0};
@@ -565,6 +625,21 @@ std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& ins
             }
         }
 
+        // xadd / cmpxchg r/m, r
+        if (mnem == "xadd" || mnem == "cmpxchg") {
+            if ((dst->kind != Operand::Kind::Reg && dst->kind != Operand::Kind::Mem) ||
+                src->kind != Operand::Kind::Reg || src->reg.is_xmm ||
+                (dst->kind == Operand::Kind::Reg && dst->reg.is_xmm)) {
+                error = mnem + " expects gp reg/mem destination and gp register source";
+                return std::nullopt;
+            }
+            const uint8_t base_op = (mnem == "cmpxchg") ? 0xB0 : 0xC0;
+            in.opcode = {0x0F, static_cast<uint8_t>(byte ? base_op : (base_op + 1))};
+            in.set_reg(src->reg.num);
+            if (dst->kind == Operand::Kind::Reg) in.rm_reg(dst->reg); else in.rm_mem(dst->mem, m_x64);
+            return done();
+        }
+
         // movzx / movsx / movsxd
         if (mnem == "movzx" || mnem == "movsx" || mnem == "movsxd") {
             if (dst->kind != Operand::Kind::Reg || src->kind == Operand::Kind::Imm) {
@@ -670,7 +745,16 @@ std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& ins
                 {"sqrtss",  0xF3, false, 0x51, 0},    {"sqrtsd",  0xF2, false, 0x51, 0},
                 {"xorps",   0,    false, 0x57, 0},    {"xorpd",   0,    true,  0x57, 0},
                 {"comiss",  0,    false, 0x2F, 0},    {"comisd",  0,    true,  0x2F, 0},
-                {"ucomiss", 0,    false, 0x2E, 0},    {"ucomisd", 0,    true,  0x2E, 0}
+                {"ucomiss", 0,    false, 0x2E, 0},    {"ucomisd", 0,    true,  0x2E, 0},
+                {"cvtss2sd",0xF3, false, 0x5A, 0},    {"cvtsd2ss",0xF2, false, 0x5A, 0},
+                {"cvtps2pd",0,    false, 0x5A, 0},    {"cvtpd2ps",0,    true,  0x5A, 0},
+                {"minss",   0xF3, false, 0x5D, 0},    {"minsd",   0xF2, false, 0x5D, 0},
+                {"minps",   0,    false, 0x5D, 0},    {"minpd",   0,    true,  0x5D, 0},
+                {"maxss",   0xF3, false, 0x5F, 0},    {"maxsd",   0xF2, false, 0x5F, 0},
+                {"maxps",   0,    false, 0x5F, 0},    {"maxpd",   0,    true,  0x5F, 0},
+                {"andps",   0,    false, 0x54, 0},    {"andpd",   0,    true,  0x54, 0},
+                {"orps",    0,    false, 0x56, 0},    {"orpd",    0,    true,  0x56, 0},
+                {"pxor",    0,    true,  0xEF, 0}
             };
             for (const auto& s : kSseOps) {
                 if (mnem != s.name) continue;
@@ -686,6 +770,69 @@ std::optional<X86Assembler::Encoded> X86Assembler::encode(const std::string& ins
                 }
                 if (s.store_op != 0 && src->kind == Operand::Kind::Reg && src->reg.is_xmm && dst->kind == Operand::Kind::Mem) {
                     in.opcode = {0x0F, s.store_op};
+                    in.set_reg(src->reg.num);
+                    in.rm_mem(dst->mem, m_x64);
+                    return done();
+                }
+            }
+
+            // movd / movq (XMM <-> GPR32/64 and XMM <-> XMM/mem64)
+            if (mnem == "movd" || mnem == "movq") {
+                const bool is_movq = (mnem == "movq");
+                if (dst->kind == Operand::Kind::Reg && dst->reg.is_xmm &&
+                    src->kind == Operand::Kind::Reg && !src->reg.is_xmm) {
+                    if ((!is_movq && src->reg.bits != 32) || (is_movq && (!m_x64 || src->reg.bits != 64))) {
+                        error = mnem + " requires matching 32/64-bit gp register source";
+                        return std::nullopt;
+                    }
+                    in = Insn{};
+                    in.x64 = m_x64;
+                    in.op16 = true;
+                    in.rex_w = is_movq;
+                    in.opcode = {0x0F, 0x6E};
+                    in.set_reg(dst->reg.num);
+                    in.rm_reg(src->reg);
+                    return done();
+                }
+                if (dst->kind == Operand::Kind::Reg && !dst->reg.is_xmm &&
+                    src->kind == Operand::Kind::Reg && src->reg.is_xmm) {
+                    if ((!is_movq && dst->reg.bits != 32) || (is_movq && (!m_x64 || dst->reg.bits != 64))) {
+                        error = mnem + " requires matching 32/64-bit gp register destination";
+                        return std::nullopt;
+                    }
+                    in = Insn{};
+                    in.x64 = m_x64;
+                    in.op16 = true;
+                    in.rex_w = is_movq;
+                    in.opcode = {0x0F, 0x7E};
+                    in.set_reg(src->reg.num);
+                    in.rm_reg(dst->reg);
+                    return done();
+                }
+                if (dst->kind == Operand::Kind::Reg && dst->reg.is_xmm &&
+                    ((src->kind == Operand::Kind::Reg && src->reg.is_xmm) || src->kind == Operand::Kind::Mem)) {
+                    in = Insn{};
+                    in.x64 = m_x64;
+                    if (is_movq) {
+                        in.rep_prefix = 0xF3;
+                        in.opcode = {0x0F, 0x7E};
+                    } else {
+                        if (src->kind != Operand::Kind::Mem) {
+                            error = "movd xmm, xmm is not valid; use movq or GPR";
+                            return std::nullopt;
+                        }
+                        in.op16 = true;
+                        in.opcode = {0x0F, 0x6E};
+                    }
+                    in.set_reg(dst->reg.num);
+                    if (src->kind == Operand::Kind::Reg) in.rm_reg(src->reg); else in.rm_mem(src->mem, m_x64);
+                    return done();
+                }
+                if (dst->kind == Operand::Kind::Mem && src->kind == Operand::Kind::Reg && src->reg.is_xmm) {
+                    in = Insn{};
+                    in.x64 = m_x64;
+                    in.op16 = true;
+                    in.opcode = {0x0F, static_cast<uint8_t>(is_movq ? 0xD6 : 0x7E)};
                     in.set_reg(src->reg.num);
                     in.rm_mem(dst->mem, m_x64);
                     return done();

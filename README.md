@@ -3,17 +3,17 @@
 [![Build & Test](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-180%20passed%20(2497%20assertions)-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-184%2B%20passed%20(17k%2B%20assertions)-brightgreen.svg)](tests/)
 
 > **⚠️ تنويه وإخلاء مسؤولية (Disclaimer):** هذا المشروع مخصّص لأغراض **التعليم، الهندسة العكسية، البحث الأمني، وتعديل الألعاب الفردية (Offline/Single-Player)** فقط.
 > Intended strictly for **educational reverse engineering, security research, and single-player/offline game analysis**.
 
-محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
+محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز و**SDL2 + OpenGL 3** على لينكس) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
 
 ### Quick Start (English Summary)
-- **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`memscan_cli`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
+- **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`nce_gui`, `memscan_cli`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
 - **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
-- **Linux (GCC / CMake):** `cmake -B build && cmake --build build -j 4` -> outputs `memscan_cli`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer`, `clock_gettime` speedhack).
+- **Linux (GCC / CMake):** `sudo apt install libsdl2-dev libgl-dev && cmake -B build && cmake --build build -j 4` -> outputs `nce_gui`, `memscan_cli`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer` + DWARF, `clock_gettime` speedhack).
 - **Third-Party Libraries Included (`third_party/`):** Dear ImGui (MIT), Lua 5.4.7 (MIT), doctest (MIT), nlohmann/json (MIT).
 - **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for local build instructions and cross-platform PR guidelines.
 
@@ -156,7 +156,7 @@ cmake --build build
 # أو عبر CTest:
 ctest --test-dir build --output-on-failure
 ```
-تغطي الاختبارات (`180 test cases / 2,497 assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process`, `HookEngine`, `Speedhack`, `Lua 5.4`, `Disassembler` (`x64/x86/AVX/x87/X-Refs`), `PointerMap`, و`EngineInspector` (`Unity / Unreal`). لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
+تغطي الاختبارات (`184+ test cases / 17,600+ assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process` و`LinuxProcess` (`ptrace` + `ELFAnalyzer` DWARF)، و`HookEngine`، و`Speedhack`، و`Lua 5.4`، و`Disassembler`/`X86Assembler` (`x64/x86/AVX/x87/X-Refs/Atomics/SSE2`)، و`ScanResults` (تفريغ القرص)، و`CETableFormat`، و`PointerMap`، و`EngineInspector` (`Unity / Unreal`). لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
 
 ### التشغيل والاختبار:
 1. قم بتشغيل الهدف التجريبي:

@@ -63,6 +63,7 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
     bool rex_w = false, rex_r = false, rex_x = false, rex_b = false;
     bool saw_rex = false;
     bool op_size_override = false; // 0x66
+    bool has_lock = false;         // 0xF0
     uint8_t sse_rep = 0;            // 0xF2 or 0xF3
 
     // 1. Prefixes
@@ -70,7 +71,8 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
         uint8_t b = code[offset];
         if (b == 0x66) { op_size_override = true; offset++; }
         else if (b == 0xF3 || b == 0xF2) { sse_rep = b; offset++; }
-        else if (b == 0xF0 || b == 0x67) { offset++; } // LOCK / Addr-size prefix
+        else if (b == 0xF0) { has_lock = true; offset++; }
+        else if (b == 0x67) { offset++; } // Addr-size prefix
         else if (is_64bit && b >= 0x40 && b <= 0x4F) { // REX prefix (x86-64 only)
             saw_rex = true;
             rex_w = (b & 0x08) != 0;
@@ -781,6 +783,20 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
                 inst.operands = (is_64bit ? kRegs64 : kRegs32)[(opcode & 0x07) | ((is_64bit && rex_b) ? 8 : 0)];
                 break;
 
+            // String operations (movs / stos)
+            case 0xA4:
+                inst.mnemonic = (sse_rep == 0xF3) ? "rep movsb" : "movsb";
+                break;
+            case 0xA5:
+                inst.mnemonic = std::string(sse_rep == 0xF3 ? "rep " : "") + (rex_w ? "movsq" : (op_size_override ? "movsw" : "movsd"));
+                break;
+            case 0xAA:
+                inst.mnemonic = (sse_rep == 0xF3) ? "rep stosb" : "stosb";
+                break;
+            case 0xAB:
+                inst.mnemonic = std::string(sse_rep == 0xF3 ? "rep " : "") + (rex_w ? "stosq" : (op_size_override ? "stosw" : "stosd"));
+                break;
+
             default:
                 inst.mnemonic = "db";
                 inst.operands = fmt_hex_imm(opcode);
@@ -867,8 +883,8 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
                 break;
             }
             case 0x10: case 0x11: case 0x28: case 0x29:
-            case 0x51: case 0x57: case 0x58: case 0x59: case 0x5C: case 0x5E:
-            case 0x2E: case 0x2F: case 0x6F: case 0x7F: {
+            case 0x51: case 0x54: case 0x56: case 0x57: case 0x58: case 0x59: case 0x5A: case 0x5C: case 0x5D: case 0x5E: case 0x5F:
+            case 0x2E: case 0x2F: case 0x6F: case 0x7F: case 0xEF: {
                 if (opcode == 0x10 || opcode == 0x11) {
                     inst.mnemonic = (sse_rep == 0xF3) ? "movss" : (sse_rep == 0xF2 ? "movsd" : (op_size_override ? "movupd" : "movups"));
                 } else if (opcode == 0x28 || opcode == 0x29) {
@@ -877,14 +893,26 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
                     inst.mnemonic = (sse_rep == 0xF3) ? "movdqu" : "movdqa";
                 } else if (opcode == 0x51) {
                     inst.mnemonic = (sse_rep == 0xF3) ? "sqrtss" : (sse_rep == 0xF2 ? "sqrtsd" : (op_size_override ? "sqrtpd" : "sqrtps"));
+                } else if (opcode == 0x54) {
+                    inst.mnemonic = op_size_override ? "andpd" : "andps";
+                } else if (opcode == 0x56) {
+                    inst.mnemonic = op_size_override ? "orpd" : "orps";
                 } else if (opcode == 0x57) {
                     inst.mnemonic = op_size_override ? "xorpd" : "xorps";
+                } else if (opcode == 0x5A) {
+                    inst.mnemonic = (sse_rep == 0xF3) ? "cvtss2sd" : (sse_rep == 0xF2 ? "cvtsd2ss" : (op_size_override ? "cvtpd2ps" : "cvtps2pd"));
+                } else if (opcode == 0xEF) {
+                    inst.mnemonic = "pxor";
                 } else if (opcode == 0x2E) {
                     inst.mnemonic = op_size_override ? "ucomisd" : "ucomiss";
                 } else if (opcode == 0x2F) {
                     inst.mnemonic = op_size_override ? "comisd" : "comiss";
                 } else {
-                    const char* base = (opcode == 0x58) ? "add" : (opcode == 0x5C ? "sub" : (opcode == 0x59 ? "mul" : "div"));
+                    const char* base = (opcode == 0x58) ? "add"
+                                     : (opcode == 0x5C) ? "sub"
+                                     : (opcode == 0x59) ? "mul"
+                                     : (opcode == 0x5D) ? "min"
+                                     : (opcode == 0x5F) ? "max" : "div";
                     inst.mnemonic = std::string(base) + (sse_rep == 0xF3 ? "ss" : (sse_rep == 0xF2 ? "sd" : (op_size_override ? "pd" : "ps")));
                 }
                 if (offset < max_len) {
@@ -897,6 +925,63 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
                     std::string rm_str = (mod == 3) ? ("xmm" + std::to_string(rm | (rex_b ? 8 : 0))) : decode_modrm_mem(mod, rm, offset, mem_bits);
                     const bool store_op = (opcode == 0x11 || opcode == 0x29 || opcode == 0x7F);
                     inst.operands = store_op ? (rm_str + ", " + xmm) : (xmm + ", " + rm_str);
+                }
+                break;
+            }
+            case 0x6E: case 0x7E: case 0xD6: {
+                if (opcode == 0x7E && sse_rep == 0xF3) {
+                    inst.mnemonic = "movq";
+                    if (offset < max_len) {
+                        uint8_t modrm = code[offset++];
+                        uint8_t mod = (modrm >> 6) & 0x03;
+                        uint8_t reg = (modrm >> 3) & 0x07;
+                        uint8_t rm  = modrm & 0x07;
+                        std::string xmm = "xmm" + std::to_string(reg | (rex_r ? 8 : 0));
+                        std::string rm_str = (mod == 3) ? ("xmm" + std::to_string(rm | (rex_b ? 8 : 0))) : decode_modrm_mem(mod, rm, offset, 64);
+                        inst.operands = xmm + ", " + rm_str;
+                    }
+                } else if (opcode == 0xD6) {
+                    inst.mnemonic = "movq";
+                    if (offset < max_len) {
+                        uint8_t modrm = code[offset++];
+                        uint8_t mod = (modrm >> 6) & 0x03;
+                        uint8_t reg = (modrm >> 3) & 0x07;
+                        uint8_t rm  = modrm & 0x07;
+                        std::string xmm = "xmm" + std::to_string(reg | (rex_r ? 8 : 0));
+                        std::string rm_str = (mod == 3) ? ("xmm" + std::to_string(rm | (rex_b ? 8 : 0))) : decode_modrm_mem(mod, rm, offset, 64);
+                        inst.operands = rm_str + ", " + xmm;
+                    }
+                } else {
+                    inst.mnemonic = rex_w ? "movq" : "movd";
+                    if (offset < max_len) {
+                        uint8_t modrm = code[offset++];
+                        uint8_t mod = (modrm >> 6) & 0x03;
+                        uint8_t reg = (modrm >> 3) & 0x07;
+                        uint8_t rm  = modrm & 0x07;
+                        std::string xmm = "xmm" + std::to_string(reg | (rex_r ? 8 : 0));
+                        const int bits = rex_w ? 64 : 32;
+                        std::string rm_str;
+                        if (mod == 3) {
+                            const uint8_t idx = (rm | (rex_b ? 8 : 0)) & 15;
+                            rm_str = rex_w ? kRegs64[idx] : kRegs32[idx];
+                        } else {
+                            rm_str = decode_modrm_mem(mod, rm, offset, bits);
+                        }
+                        inst.operands = (opcode == 0x6E) ? (xmm + ", " + rm_str) : (rm_str + ", " + xmm);
+                    }
+                }
+                break;
+            }
+            case 0xB0: case 0xB1: case 0xC0: case 0xC1: {
+                const bool is_byte = (opcode == 0xB0 || opcode == 0xC0);
+                inst.mnemonic = (opcode == 0xB0 || opcode == 0xB1) ? "cmpxchg" : "xadd";
+                if (offset < max_len) {
+                    uint8_t modrm = code[offset++];
+                    uint8_t mod = (modrm >> 6) & 0x03;
+                    uint8_t reg = ((modrm >> 3) & 0x07) | (rex_r ? 8 : 0);
+                    uint8_t rm  = modrm & 0x07;
+                    std::string rm_str = (mod == 3) ? get_reg(rm | (rex_b ? 8 : 0), is_byte) : decode_modrm_mem(mod, rm, offset, is_byte ? 8 : 0);
+                    inst.operands = rm_str + ", " + get_reg(reg, is_byte);
                 }
                 break;
             }
@@ -976,6 +1061,9 @@ DecodedInstruction Disassembler::decode(const uint8_t* code, size_t max_len, uin
         inst.branch_target = address + inst.length + rip_disp;
     } else if (has_abs32 && inst.branch_target == 0) {
         inst.branch_target = abs32_addr;
+    }
+    if (has_lock && !inst.mnemonic.empty() && inst.mnemonic != "db") {
+        inst.mnemonic = "lock " + inst.mnemonic;
     }
     inst.bytes.assign(code, code + inst.length);
     inst.full_text = inst.format();

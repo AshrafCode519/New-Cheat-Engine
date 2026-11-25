@@ -123,3 +123,88 @@ TEST_CASE("serialize_ce_table roundtrips with parse_ce_table") {
     CHECK(parsed.scripts[0].name == "Infinite Stamina");
     CHECK(parsed.scripts[0].body == s1.body);
 }
+
+TEST_CASE("CETableFormat parses nested groups, unsigned ShowAsSigned, and hotkeys") {
+    const std::string xml = R"(<?xml version="1.0" encoding="utf-8"?>
+<CheatTable>
+  <CheatEntries>
+    <CheatEntry>
+      <ID>10</ID>
+      <Description>"Player"</Description>
+      <GroupHeader>1</GroupHeader>
+      <CheatEntries>
+        <CheatEntry>
+          <ID>11</ID>
+          <Description>"Combat"</Description>
+          <GroupHeader>1</GroupHeader>
+          <CheatEntries>
+            <CheatEntry>
+              <ID>12</ID>
+              <Description>"Coins"</Description>
+              <ShowAsSigned>0</ShowAsSigned>
+              <VariableType>4 Bytes</VariableType>
+              <Address>"game.exe"+1234</Address>
+              <Hotkeys>
+                <Hotkey>
+                  <Action>Toggle Activation</Action>
+                  <Keys>
+                    <Key>17</Key>
+                    <Key>112</Key>
+                  </Keys>
+                </Hotkey>
+                <Hotkey>
+                  <Action>Set Value</Action>
+                  <Keys>
+                    <Key>113</Key>
+                  </Keys>
+                  <Value>999</Value>
+                </Hotkey>
+              </Hotkeys>
+            </CheatEntry>
+          </CheatEntries>
+        </CheatEntry>
+        <CheatEntry>
+          <ID>13</ID>
+          <Description>"BannerText"</Description>
+          <VariableType>Unicode String</VariableType>
+          <Length>16</Length>
+          <Address>200000</Address>
+        </CheatEntry>
+      </CheatEntries>
+    </CheatEntry>
+  </CheatEntries>
+</CheatTable>)";
+
+    std::string err;
+    table::CheatTable parsed;
+    REQUIRE(table::parse_ce_table(xml, parsed, err));
+    REQUIRE(err.empty());
+    REQUIRE(parsed.entries.size() == 2);
+
+    CHECK(parsed.entries[0].description == "Coins");
+    CHECK(parsed.entries[0].group == "Player / Combat");
+    CHECK(parsed.entries[0].type == scanner::DataType::UInt32);
+    CHECK(parsed.entries[0].hotkeys.size() == 2);
+
+    CHECK(parsed.entries[1].description == "BannerText");
+    CHECK(parsed.entries[1].group == "Player");
+    CHECK(parsed.entries[1].type == scanner::DataType::String16);
+    CHECK(parsed.entries[1].length == 16);
+
+    const std::string exported = table::serialize_ce_table(parsed);
+    CHECK(exported.find("<GroupHeader>1</GroupHeader>") != std::string::npos);
+    CHECK(exported.find("<ShowAsSigned>0</ShowAsSigned>") != std::string::npos);
+    CHECK(exported.find("<Hotkeys>") != std::string::npos);
+    CHECK(exported.find("<Key>17</Key>") != std::string::npos);
+    CHECK(exported.find("<Key>112</Key>") != std::string::npos);
+
+    table::CheatTable roundtrip;
+    REQUIRE(table::parse_ce_table(exported, roundtrip, err));
+    REQUIRE(err.empty());
+    REQUIRE(roundtrip.entries.size() == 2);
+    CHECK(roundtrip.entries[0].group == "Player / Combat");
+    CHECK(roundtrip.entries[0].type == scanner::DataType::UInt32);
+    CHECK(roundtrip.entries[0].hotkeys.size() == 2);
+    CHECK(roundtrip.entries[1].group == "Player");
+    CHECK(roundtrip.entries[1].type == scanner::DataType::String16);
+}

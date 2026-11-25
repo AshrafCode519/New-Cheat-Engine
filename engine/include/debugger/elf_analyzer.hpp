@@ -62,6 +62,8 @@ struct ELFInfo {
     std::vector<ELFSegment> segments;
     std::vector<ELFSymbol> symbols;
     std::vector<std::string> needed_libraries;
+    bool has_dwarf{false};
+    size_t dwarf_function_count{0};
 };
 
 class ELFAnalyzer {
