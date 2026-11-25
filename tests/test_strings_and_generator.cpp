@@ -62,6 +62,17 @@ TEST_CASE("standalone trainer generator creates valid Native Win32 GUI source co
     CHECK(cpp.find("Infinite Health") != std::string::npos);
     CHECK(cpp.find("gui_game.exe") != std::string::npos);
     CHECK(cpp.find("0x54321") != std::string::npos);
+
+    // Special characters in description/module/process must be escaped as valid C++ string literals
+    TableEntry e_esc;
+    e_esc.description = "God \"Mode\" \\ Shield";
+    e_esc.type = DataType::Int32;
+    e_esc.location.module_name = "sub\\mod.dll";
+    table.entries.push_back(e_esc);
+    const std::string escaped_cpp = generate_standalone_trainer_cpp(table, "my\"game.exe", TrainerKind::Console);
+    CHECK(escaped_cpp.find("God \\\"Mode\\\" \\\\ Shield") != std::string::npos);
+    CHECK(escaped_cpp.find("sub\\\\mod.dll") != std::string::npos);
+    CHECK(escaped_cpp.find("kTargetProcess = \"my\\\"game.exe\"") != std::string::npos);
 }
 
 TEST_CASE("strings scanner extracts ASCII and UTF-16 strings with filter") {

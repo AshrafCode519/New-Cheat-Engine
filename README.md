@@ -48,7 +48,7 @@
 
 2. **`engine` (نواة المحرك):**
    * **طبقة تجريد النظام (HAL):**
-     * واجهة `IProcess` للتعامل الشفاف مع أنظمة التشغيل (Windows حالياً مع جاهزية التوسيع لـ Linux).
+     * واجهة `IProcess` للتعامل الشفاف مع **Windows و Linux** (`/proc/<pid>/maps`, `process_vm_readv/writev`, `ptrace`).
      * فحص ذكي لصفحات الذاكرة عبر `VirtualQueryEx` مع استبعاد صفحات الـ Guard و NoAccess.
      * كتابة آمنة على الذاكرة مع إدارة الصلاحيات تلقائياً (`VirtualProtectEx`).
      * تجميد واستئناف العمليات الهدف (`NtSuspendProcess` / `NtResumeProcess`) لمنع القراءات الممزقة (Torn Reads).

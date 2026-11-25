@@ -754,14 +754,14 @@ void draw_process_bar(App& app) {
     ImGui::BeginDisabled(job_running(app));
     if (ImGui::Button("Refresh")) refresh_processes(app);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(em(10));
+    ImGui::SetNextItemWidth(em(8));
     ImGui::InputTextWithHint("##filter", "filter processes", &app.process_filter);
     ImGui::SameLine();
 
     const std::string preview = app.selected_process >= 0
         ? app.processes[app.selected_process].name + " (" + std::to_string(app.processes[app.selected_process].pid) + ")"
         : std::string("select a process");
-    ImGui::SetNextItemWidth(em(20));
+    ImGui::SetNextItemWidth(em(13));
     if (ImGui::BeginCombo("##process", preview.c_str())) {
         std::string filter = app.process_filter;
         std::transform(filter.begin(), filter.end(), filter.begin(), ::tolower);
@@ -1351,7 +1351,7 @@ void draw_pointer_scanner(App& app) {
     ImGui::Combo("Add as", &app.ptr_add_type, kTypeNames, 10); // numeric types only
 
     ImGui::BeginDisabled(!is_attached(app) || job_running(app));
-    ImGui::SetNextItemWidth(em(14));
+    ImGui::SetNextItemWidth(em(13));
     ImGui::InputTextWithHint("##ptr_map_path", "pointers.ncem", &app.ptr_map_path);
     ImGui::SameLine();
     if (ImGui::Button("Save Map (.ncem)")) {
@@ -2009,7 +2009,7 @@ void draw_scripts(App& app) {
     }
 
     ImGui::Separator();
-    ImGui::SetNextItemWidth(em(14));
+    ImGui::SetNextItemWidth(em(13));
     ImGui::InputTextWithHint("##script_name", "script name", &app.script_name);
     ImGui::SameLine();
     const bool editing = app.editing_script >= 0;
@@ -4084,7 +4084,7 @@ void draw_pe_tools(App& app) {
         app.pe_status = "Failed to parse PE or ELF headers for: " + input;
     };
 
-    ImGui::SetNextItemWidth(em(14));
+    ImGui::SetNextItemWidth(em(13));
     ImGui::InputTextWithHint("##pe_mod_in", "Module name or 0xAddress", &app.pe_module_input);
     ImGui::SameLine();
     ImGui::BeginDisabled(!attached);
@@ -4321,7 +4321,7 @@ void draw_engine_inspector(App& app) {
                                          " (" + std::to_string(app.unity_report->types.size()) + " types)";
             }
             ImGui::EndDisabled();
-            ImGui::SetNextItemWidth(em(14));
+            ImGui::SetNextItemWidth(em(13));
             ImGui::InputTextWithHint("##unity_obj_addr", "IL2CPP Object 0xAddr", &app.unity_obj_input);
             ImGui::SameLine();
             ImGui::BeginDisabled(!attached);
@@ -4380,7 +4380,7 @@ void draw_engine_inspector(App& app) {
                 app.engine_status = "Decoded " + std::to_string(app.unreal_names.size()) + " FNames, " +
                                     std::to_string(app.unreal_objects.size()) + " UObjects.";
             }
-            ImGui::SetNextItemWidth(em(14));
+            ImGui::SetNextItemWidth(em(13));
             ImGui::InputTextWithHint("##ue_uworld", "GWorld / UWorld* 0xAddr", &app.unreal_uworld_input);
             ImGui::SameLine();
             if (ImGui::Button("Dump World Actors")) {
@@ -4745,7 +4745,7 @@ void draw_ui(App& app) {
     if (ImGui::BeginTable("layout", 2, ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                           ImGui::GetContentRegionAvail())) {
         ImGui::TableSetupColumn("scan", ImGuiTableColumnFlags_WidthStretch, 1.0f);
-        ImGui::TableSetupColumn("table", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("table", ImGuiTableColumnFlags_WidthStretch, 1.32f);
         ImGui::TableNextRow();
 
         ImGui::TableNextColumn();
@@ -4758,7 +4758,7 @@ void draw_ui(App& app) {
         ImGui::TableNextColumn();
         ImGui::SeparatorText("Cheat table");
         draw_cheat_table(app);
-        if (ImGui::BeginTabBar("tools")) {
+        if (ImGui::BeginTabBar("tools", ImGuiTabBarFlags_FittingPolicyScroll | ImGuiTabBarFlags_TabListPopupButton)) {
             auto flags_for = [&](Tab tab) { return app.select_tab == tab ? ImGuiTabItemFlags_SetSelected : 0; };
             const ImGuiTabItemFlags pointer_flags = flags_for(Tab::PointerScanner);
             const ImGuiTabItemFlags memory_flags = flags_for(Tab::Memory);

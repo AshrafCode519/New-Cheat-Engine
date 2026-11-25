@@ -1329,7 +1329,8 @@ void cmd_disasm(const std::string& where, size_t count) {
         }
         std::cout << "\n";
     }
-    std::cout << "--------------------------------------------------------------------------------\n\n";
+    std::cout << std::right << std::setfill(' ')
+              << "--------------------------------------------------------------------------------\n\n";
 }
 
 void cmd_xrefs(const std::string& where, const std::string& mod_filter) {
@@ -1427,7 +1428,7 @@ void cmd_assemble(const std::string& where, const std::string& instruction) {
     for (uint8_t b : encoded->bytes) {
         std::cout << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(b) << " ";
     }
-    std::cout << std::dec << "\n";
+    std::cout << std::dec << std::setfill(' ') << "\n";
 }
 
 // gentrainer <output.cpp> [proc_name] [gui|console]

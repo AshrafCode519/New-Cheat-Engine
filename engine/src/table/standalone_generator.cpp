@@ -15,6 +15,22 @@ namespace {
 
 void append_common_helpers(std::ostringstream& ss, const std::string& proc, const CheatTable& table);
 
+std::string escape_cpp_string(const std::string& text) {
+    std::string out;
+    out.reserve(text.size() + 8);
+    for (char c : text) {
+        switch (c) {
+            case '\\': out += "\\\\"; break;
+            case '"':  out += "\\\""; break;
+            case '\n': out += "\\n"; break;
+            case '\r': out += "\\r"; break;
+            case '\t': out += "\\t"; break;
+            default:   out += c; break;
+        }
+    }
+    return out;
+}
+
 void append_init_items(std::ostringstream& ss, const CheatTable& table) {
     ss << "void InitItems() {\n";
     int hotkey_idx = 1;
@@ -42,8 +58,8 @@ void append_init_items(std::ostringstream& ss, const CheatTable& table) {
 
         ss << "    {\n";
         ss << "        TrainerItem item;\n";
-        ss << "        item.description = \"" << (e.description.empty() ? ("Item_" + std::to_string(i)) : e.description) << "\";\n";
-        ss << "        item.moduleName = \"" << e.location.module_name << "\";\n";
+        ss << "        item.description = \"" << escape_cpp_string(e.description.empty() ? ("Item_" + std::to_string(i)) : e.description) << "\";\n";
+        ss << "        item.moduleName = \"" << escape_cpp_string(e.location.module_name) << "\";\n";
         ss << "        item.baseOffset = 0x" << std::hex << e.location.base_offset << std::dec << ";\n";
         if (!e.location.offsets.empty()) {
             ss << "        item.offsets = {";
@@ -69,7 +85,7 @@ void append_init_items(std::ostringstream& ss, const CheatTable& table) {
 
 void append_common_helpers(std::ostringstream& ss, const std::string& proc, const CheatTable& table) {
     ss << "namespace {\n\n";
-    ss << "const char* kTargetProcess = \"" << proc << "\";\n\n";
+    ss << "const char* kTargetProcess = \"" << escape_cpp_string(proc) << "\";\n\n";
 
     ss << R"(DWORD FindProcessId(const std::string& processName) {
     PROCESSENTRY32 entry;
@@ -219,7 +235,7 @@ std::string generate_standalone_trainer_cpp(
         ss << "#include <atomic>\n#include <chrono>\n#include <cstdint>\n#include <cstdlib>\n"
            << "#include <cstring>\n#include <dirent.h>\n#include <fstream>\n#include <iostream>\n"
            << "#include <sstream>\n#include <string>\n#include <sys/uio.h>\n#include <thread>\n#include <vector>\n\n";
-        ss << "namespace {\nconst char* kTargetProcess = \"" << proc << "\";\n\n";
+        ss << "namespace {\nconst char* kTargetProcess = \"" << escape_cpp_string(proc) << "\";\n\n";
         ss << R"LINUX_TR(struct AtomicFlag {
     std::atomic<bool> value{false};
     AtomicFlag() = default;
