@@ -141,6 +141,7 @@ TEST_CASE("Linux HAL: Proton and Wine detection and Game name extraction") {
 #include <chrono>
 #include <csignal>
 #include <fstream>
+#include <memory>
 #include <sys/wait.h>
 #include <thread>
 #include <unistd.h>
@@ -159,7 +160,7 @@ int read_yama_ptrace_scope() {
 } // namespace
 
 TEST_CASE("Linux HAL live: LinuxProcess self-attach, maps, read/write, and ELFAnalyzer") {
-    auto proc = hal::IProcess::create();
+    std::shared_ptr<hal::IProcess> proc = hal::IProcess::create();
     const uint32_t self_pid = static_cast<uint32_t>(getpid());
     REQUIRE(proc->attach(self_pid));
     CHECK(proc->is_attached());
@@ -227,7 +228,7 @@ TEST_CASE("Linux HAL live: child process attach, remote mmap, and DebugCoordinat
     // Give child a moment to enter blocking read()
     std::this_thread::sleep_for(std::chrono::milliseconds(30));
 
-    auto proc = hal::IProcess::create();
+    std::shared_ptr<hal::IProcess> proc = hal::IProcess::create();
     REQUIRE(proc->attach(static_cast<uint32_t>(child)));
 
     int32_t marker = 0;

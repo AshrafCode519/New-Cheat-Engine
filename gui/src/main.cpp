@@ -20,6 +20,7 @@
 #include "imgui_impl_dx11.h"
 #include "imgui_impl_win32.h"
 #else
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include "imgui_impl_sdl2.h"
@@ -36,8 +37,12 @@
 #include "utils/hex_utils.hpp"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -484,7 +489,13 @@ void poll_job(App& app) {
 void refresh_processes(App& app) {
     app.processes = hal::IProcess::list_processes();
     std::sort(app.processes.begin(), app.processes.end(), [](const hal::ProcessInfo& a, const hal::ProcessInfo& b) {
-        return _stricmp(a.name.c_str(), b.name.c_str()) < 0;
+        const size_t n = std::min(a.name.size(), b.name.size());
+        for (size_t i = 0; i < n; ++i) {
+            const int ca = std::tolower(static_cast<unsigned char>(a.name[i]));
+            const int cb = std::tolower(static_cast<unsigned char>(b.name[i]));
+            if (ca != cb) return ca < cb;
+        }
+        return a.name.size() < b.name.size();
     });
     app.selected_process = -1;
 }
