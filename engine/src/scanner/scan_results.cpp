@@ -29,8 +29,10 @@ std::optional<std::vector<uint8_t>> parse_hex_bytes(const std::string& hex) {
 
 std::vector<uint8_t> value_to_bytes(const ScanValue& value) {
     std::vector<uint8_t> bytes;
+    const bool is_be = is_big_endian(value.type);
     const bool numeric = dispatch_numeric(value.type, [&]<typename T>() {
-        const T x = std::get<T>(value.value);
+        T x = std::get<T>(value.value);
+        if (is_be) x = swap_bytes(x);
         bytes.resize(sizeof(T));
         std::memcpy(bytes.data(), &x, sizeof(T));
     });
@@ -43,10 +45,12 @@ std::vector<uint8_t> value_to_bytes(const ScanValue& value) {
 
 std::optional<ScanValue> value_from_bytes(DataType type, const uint8_t* data, size_t size) {
     std::optional<ScanValue> result;
+    const bool is_be = is_big_endian(type);
     const bool numeric = dispatch_numeric(type, [&]<typename T>() {
         if (size != sizeof(T)) return;
         T x{};
         std::memcpy(&x, data, sizeof(T));
+        if (is_be) x = swap_bytes(x);
         result = ScanValue::of(type, x);
     });
     if (numeric) return result;

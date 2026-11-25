@@ -1,38 +1,28 @@
 #include "../../include/debugger/access_watcher.hpp"
+#include "../../include/debugger/debug_coordinator.hpp"
 #include "../../include/debugger/disassembler.hpp"
 #include "../../include/utils/hex_utils.hpp"
 
-#ifdef _WIN32
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#include <tlhelp32.h>
-
 #include <algorithm>
+#include <cctype>
+#include <cstdlib>
 #include <sstream>
 
 namespace nce::debugger {
 
 namespace {
 
-// Decodes the memory operand of the hit instruction into a base register + displacement, so the caller can
-// see which pointer the value hangs off. Only the simple [reg + disp] / [reg] form is reported.
 void find_base(const DecodedInstruction& insn, std::string& base_reg, int64_t& base_off) {
     const std::string& ops = insn.operands;
     const size_t open = ops.find('[');
     const size_t close = ops.find(']', open);
     if (open == std::string::npos || close == std::string::npos) return;
-    std::string inside = ops.substr(open + 1, close - open - 1); // "rcx + 0x10", "rax", "rbp - 0x8"
-    // no scaled index (contains '*'): those aren't a plain base pointer
+    std::string inside = ops.substr(open + 1, close - open - 1);
     if (inside.find('*') != std::string::npos) return;
 
     std::string reg;
     size_t i = 0;
-    while (i < inside.size() && (std::isalnum(static_cast<unsigned char>(inside[i])))) reg += inside[i++];
+    while (i < inside.size() && std::isalnum(static_cast<unsigned char>(inside[i]))) reg += inside[i++];
     if (reg.empty() || !(reg[0] == 'r' || reg[0] == 'e')) return;
     base_reg = reg;
     base_off = 0;
@@ -45,16 +35,13 @@ void find_base(const DecodedInstruction& insn, std::string& base_reg, int64_t& b
     }
 }
 
-// A data breakpoint traps after the store, so RIP points past the writing instruction. x86 has no reliable
-// backward decode, so this reads the bytes before RIP and finds the instruction stream that lands exactly on
-// RIP, taking the last instruction as the writer. `start_address` gets where that instruction begins.
 DecodedInstruction writer_before(const hal::IProcess& process, uintptr_t rip, uintptr_t& start_address) {
-    constexpr size_t window = 15; // the longest an x86 instruction can be
+    constexpr size_t window = 15;
     if (rip <= window) return {};
     uint8_t buf[window] = {0};
     if (!process.read_raw(rip - window, buf, window)) return {};
 
-    for (size_t back = window; back >= 1; --back) { // try the farthest-back anchor first (least coincidental)
+    for (size_t back = window; back >= 1; --back) {
         const uintptr_t anchor = rip - back;
         uintptr_t cur = anchor;
         DecodedInstruction last;
@@ -95,7 +82,6 @@ uint64_t Registers::by_name(const std::string& name) const {
         {"r11", &Registers::r11}, {"r12", &Registers::r12}, {"r13", &Registers::r13}, {"r14", &Registers::r14},
         {"r15", &Registers::r15},
     };
-    // 32-bit names (eax..) map to the low half of the 64-bit register
     std::string key = name;
     if (!key.empty() && key[0] == 'e') key = "r" + key.substr(1);
     for (const auto& [n, member] : table) {
@@ -110,8 +96,12 @@ uintptr_t AccessHit::base_pointer() const {
 
 AccessWatcher::~AccessWatcher() { stop(); }
 
-bool AccessWatcher::start(std::shared_ptr<hal::IProcess> process, uintptr_t address, size_t size, WatchKind kind) {
+void AccessWatcher::set_coordinator(std::shared_ptr<DebugCoordinator> coordinator) {
     stop();
+    m_shared_coordinator = std::move(coordinator);
+}
+
+bool AccessWatcher::start(std::shared_ptr<hal::IProcess> process, uintptr_t address, size_t size, WatchKind kind) {
     if (!process || !process->is_attached() || address == 0) return false;
     if (size != 1 && size != 2 && size != 4 && size != 8) size = 4;
 
@@ -120,138 +110,120 @@ bool AccessWatcher::start(std::shared_ptr<hal::IProcess> process, uintptr_t addr
     m_address = address;
     m_size = size;
     m_kind = kind;
-    m_pid = m_process->get_pid();
-    m_stop = false;
-    {
-        std::lock_guard<std::mutex> lock(m_mutex);
-        m_hits.clear();
+
+    std::shared_ptr<DebugCoordinator> coord = m_shared_coordinator;
+    if (!coord) {
+        if (!m_owned_coordinator) {
+            m_owned_coordinator = std::make_shared<DebugCoordinator>(m_process);
+        }
+        coord = m_owned_coordinator;
     }
 
-    // DebugActiveProcess, WaitForDebugEvent and ContinueDebugEvent must all run on one thread, so the attach
-    // happens inside the debug thread; start() waits here for it to report success or failure.
-    std::promise<bool> attached;
-    auto future = attached.get_future();
-    m_thread = std::thread([this, p = std::move(attached)]() mutable { run(std::move(p)); });
-    const bool ok = future.get();
-    if (!ok && m_thread.joinable()) m_thread.join();
-    return ok;
+    if (!coord->is_attached()) {
+        if (!coord->attach(coord->backend())) {
+            return false;
+        }
+    }
+
+    int slot = coord->add_hw_watch(address, size, kind, [this](uint32_t tid, uintptr_t rip, const Registers& regs) {
+        on_hw_hit(tid, rip, regs);
+    });
+    if (slot < 0) return false;
+
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        if (std::find(m_watched_addresses.begin(), m_watched_addresses.end(), address) == m_watched_addresses.end()) {
+            m_watched_addresses.push_back(address);
+        }
+        if (m_watched_addresses.size() == 1) {
+            m_hits.clear();
+        }
+    }
+    m_active = true;
+    return true;
+}
+
+void AccessWatcher::stop_address(uintptr_t address) {
+    auto coord = m_shared_coordinator ? m_shared_coordinator : m_owned_coordinator;
+    if (coord) {
+        coord->remove_hw_watch(address);
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_watched_addresses.erase(
+        std::remove(m_watched_addresses.begin(), m_watched_addresses.end(), address),
+        m_watched_addresses.end()
+    );
+    if (m_watched_addresses.empty()) {
+        m_active = false;
+        m_address = 0;
+    } else {
+        m_address = m_watched_addresses.back();
+    }
 }
 
 void AccessWatcher::stop() {
-    if (!m_active && !m_thread.joinable()) return;
-    m_stop = true;
-    if (m_thread.joinable()) m_thread.join();
+    auto coord = m_shared_coordinator ? m_shared_coordinator : m_owned_coordinator;
+    if (coord) {
+        std::vector<uintptr_t> to_remove;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            to_remove = m_watched_addresses;
+        }
+        for (uintptr_t a : to_remove) {
+            coord->remove_hw_watch(a);
+        }
+    }
+    if (m_owned_coordinator) {
+        m_owned_coordinator->detach();
+        m_owned_coordinator.reset();
+    }
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_watched_addresses.clear();
     m_active = false;
     m_address = 0;
-    m_pid = 0;
 }
 
-// Sets (or clears) the DR0 hardware breakpoint in one thread's debug registers
-void AccessWatcher::arm_thread(void* handle, bool enable) const {
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(static_cast<HANDLE>(handle), &ctx)) return;
-    if (enable) {
-        ctx.Dr0 = m_address;
-        ctx.Dr7 |= 1ULL;              // L0: breakpoint 0 enabled for this thread
-        ctx.Dr7 &= ~(0xFULL << 16);   // clear RW0 + LEN0
-        const uint64_t rw = (m_kind == WatchKind::Access) ? 3 : 1; // 01 = on write, 11 = on read/write
-        uint64_t len = 3;             // LEN0: 00=1, 01=2, 11=4, 10=8
-        if (m_size == 1) len = 0;
-        else if (m_size == 2) len = 1;
-        else if (m_size == 8) len = 2;
-        ctx.Dr7 |= (rw << 16) | (len << 18);
+std::vector<uintptr_t> AccessWatcher::watched_addresses() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_watched_addresses;
+}
+
+void AccessWatcher::on_hw_hit(uint32_t, uintptr_t rip, const Registers& regs) {
+    if (!m_process) return;
+
+    uintptr_t writer_addr = rip;
+    DecodedInstruction decoded;
+    if (m_kind == WatchKind::Execute) {
+        uint8_t code[16] = {0};
+        m_process->read_raw(rip, code, sizeof code);
+        decoded = Disassembler::decode(code, sizeof code, rip);
+        writer_addr = rip;
     } else {
-        ctx.Dr0 = 0;
-        ctx.Dr7 &= ~1ULL;
-    }
-    SetThreadContext(static_cast<HANDLE>(handle), &ctx);
-}
-
-void AccessWatcher::record_hit(uint32_t thread_id) {
-    HANDLE thread = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, thread_id);
-    if (!thread) return;
-
-    CONTEXT ctx{};
-    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
-    if (GetThreadContext(thread, &ctx)) {
-        const uintptr_t rip = static_cast<uintptr_t>(ctx.Rip);
-        // The write already happened; find the instruction that ends at RIP (the one that did it)
-        uintptr_t writer_addr = rip;
-        auto decoded = writer_before(*m_process, rip, writer_addr);
-        if (decoded.length == 0) { // couldn't back-decode: fall back to the instruction at RIP
+        decoded = writer_before(*m_process, rip, writer_addr);
+        if (decoded.length == 0) {
             uint8_t code[16] = {0};
             m_process->read_raw(rip, code, sizeof code);
             decoded = Disassembler::decode(code, sizeof code, rip);
             writer_addr = rip;
         }
-
-        Registers r;
-        r.rax = ctx.Rax; r.rbx = ctx.Rbx; r.rcx = ctx.Rcx; r.rdx = ctx.Rdx; r.rsi = ctx.Rsi; r.rdi = ctx.Rdi;
-        r.rbp = ctx.Rbp; r.rsp = ctx.Rsp; r.rip = ctx.Rip; r.r8 = ctx.R8; r.r9 = ctx.R9; r.r10 = ctx.R10;
-        r.r11 = ctx.R11; r.r12 = ctx.R12; r.r13 = ctx.R13; r.r14 = ctx.R14; r.r15 = ctx.R15; r.eflags = ctx.EFlags;
-
-        {
-            std::lock_guard<std::mutex> lock(m_mutex);
-            auto it = std::find_if(m_hits.begin(), m_hits.end(), [&](const AccessHit& h) { return h.instruction == writer_addr; });
-            if (it != m_hits.end()) {
-                ++it->count;
-                it->registers = r;
-            } else {
-                AccessHit hit;
-                hit.instruction = writer_addr;
-                hit.location = locate(writer_addr, m_modules);
-                hit.disassembly = decoded.mnemonic + (decoded.operands.empty() ? "" : " " + decoded.operands);
-                hit.bytes = decoded.bytes;
-                hit.registers = r;
-                hit.count = 1;
-                find_base(decoded, hit.base_register, hit.base_offset);
-                m_hits.push_back(std::move(hit));
-            }
-        }
-
-        // A data breakpoint traps AFTER the store, so RIP is already past it: just clear the trigger status
-        // and leave the breakpoint armed. (An execute breakpoint would need a single-step dance; writes don't.)
-        ctx.Dr6 = 0;
-        SetThreadContext(thread, &ctx);
-    }
-    CloseHandle(thread);
-}
-
-void AccessWatcher::run(std::promise<bool> attached) {
-    if (!DebugActiveProcess(m_pid)) { attached.set_value(false); return; } // another debugger, or no permission
-    DebugSetProcessKillOnExit(FALSE); // detaching must not kill the game
-    m_active = true;
-    attached.set_value(true);
-
-    // DebugActiveProcess reports the existing threads through CREATE_PROCESS (the main thread) and
-    // CREATE_THREAD events right after attaching; new threads come the same way later. Arming the breakpoint
-    // as each thread is reported is reliable, unlike setting it before the attach events are consumed.
-    DEBUG_EVENT event{};
-    while (!m_stop) {
-        if (!WaitForDebugEvent(&event, 50)) continue;
-        DWORD status = DBG_CONTINUE;
-
-        if (event.dwProcessId == m_pid && event.dwDebugEventCode == CREATE_PROCESS_DEBUG_EVENT) {
-            arm_thread(event.u.CreateProcessInfo.hThread, true); // the main thread
-            if (event.u.CreateProcessInfo.hFile) CloseHandle(event.u.CreateProcessInfo.hFile);
-        } else if (event.dwProcessId == m_pid && event.dwDebugEventCode == CREATE_THREAD_DEBUG_EVENT) {
-            arm_thread(event.u.CreateThread.hThread, true); // another (or new) thread
-        } else if (event.dwProcessId == m_pid && event.dwDebugEventCode == EXCEPTION_DEBUG_EVENT) {
-            const DWORD code = event.u.Exception.ExceptionRecord.ExceptionCode;
-            if (code == EXCEPTION_SINGLE_STEP) {
-                record_hit(event.dwThreadId); // a hardware data breakpoint reports as a single-step exception
-            } else if (code != EXCEPTION_BREAKPOINT) {
-                status = DBG_EXCEPTION_NOT_HANDLED; // leave real exceptions to the target
-            }
-        } else if (event.dwDebugEventCode == EXIT_PROCESS_DEBUG_EVENT && event.dwProcessId == m_pid) {
-            ContinueDebugEvent(event.dwProcessId, event.dwThreadId, DBG_CONTINUE);
-            break;
-        }
-        ContinueDebugEvent(event.dwProcessId, event.dwThreadId, status);
     }
 
-    DebugActiveProcessStop(m_pid);
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = std::find_if(m_hits.begin(), m_hits.end(), [&](const AccessHit& h) { return h.instruction == writer_addr; });
+    if (it != m_hits.end()) {
+        ++it->count;
+        it->registers = regs;
+    } else {
+        AccessHit hit;
+        hit.instruction = writer_addr;
+        hit.location = locate(writer_addr, m_modules);
+        hit.disassembly = decoded.mnemonic + (decoded.operands.empty() ? "" : " " + decoded.operands);
+        hit.bytes = decoded.bytes;
+        hit.registers = regs;
+        hit.count = 1;
+        find_base(decoded, hit.base_register, hit.base_offset);
+        m_hits.push_back(std::move(hit));
+    }
 }
 
 std::vector<AccessHit> AccessWatcher::hits() const {
@@ -267,4 +239,3 @@ void AccessWatcher::clear() {
 }
 
 } // namespace nce::debugger
-#endif // _WIN32

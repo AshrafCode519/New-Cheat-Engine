@@ -53,6 +53,8 @@ static int64_t g_gold = 5000000000LL;
 static float g_mana = 250.5f;
 static double g_speed = 12.3456;
 static char g_player_name[32] = "CyberWarrior";
+struct Vector3 { float x, y, z; };
+static Vector3 g_player_pos{ 100.0f, 50.0f, 25.0f };
 static PlayerStats g_stats;
 static ObfuscatedValue g_obfuscated;
 
@@ -78,6 +80,8 @@ void print_addresses(uint32_t pid) {
               << std::dec << " = " << g_speed << "\n";
     std::cout << " [String ASCII]  g_player_name  @ 0x" << std::hex << reinterpret_cast<uintptr_t>(g_player_name) 
               << " = \"" << g_player_name << "\"\n";
+    std::cout << " [3D Vector]     g_player_pos   @ 0x" << std::hex << reinterpret_cast<uintptr_t>(&g_player_pos) 
+              << std::dec << " = (" << g_player_pos.x << ", " << g_player_pos.y << ", " << g_player_pos.z << ")\n";
     std::cout << "-------------------------------------------------------\n";
     std::cout << " [Grouped Scan]  g_stats        @ 0x" << std::hex << reinterpret_cast<uintptr_t>(&g_stats) << std::dec << "\n";
     std::cout << "                 .health        @ 0x" << std::hex << reinterpret_cast<uintptr_t>(&g_stats.health) 
@@ -180,6 +184,7 @@ int main(int argc, char** argv) {
               << "  [3] Modify Mana (-25.0)\n"
               << "  [4] Toggle Auto-Decay (Simulate game ticks)\n"
               << "  [5] Print Current State & Memory Check\n"
+              << "  [6] Move Player (+5.0 X, +2.5 Y)\n"
               << "  [q] Quit\n";
 
     std::string input;
@@ -206,6 +211,10 @@ int main(int argc, char** argv) {
             std::cout << ">> Auto-decay is now: " << (g_auto_decay ? "ON" : "OFF") << "\n";
         } else if (input == "5") {
             print_addresses(pid);
+        } else if (input == "6" || input == "m") {
+            g_player_pos.x += 5.0f;
+            g_player_pos.y += 2.5f;
+            std::cout << ">> Player moved to: (" << g_player_pos.x << ", " << g_player_pos.y << ", " << g_player_pos.z << ")\n";
         } else if (input == "q" || input == "quit" || input == "exit") {
             break;
         }

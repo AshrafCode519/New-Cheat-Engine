@@ -251,6 +251,7 @@ StructLayout StructureDissector::dissect(uintptr_t address, size_t size, std::ve
                     if (text.size() >= 4) {
                         f.type = "char*";
                         f.value = utils::format_address(target);
+                        f.child_pointer = target;
                         f.note = "\"" + (text.size() > 32 ? text.substr(0, 32) + "..." : text) + "\"";
                         layout.fields.push_back(f);
                         off += 8;
@@ -263,6 +264,7 @@ StructLayout StructureDissector::dissect(uintptr_t address, size_t size, std::ve
                     if (auto cls = class_from_vtable(static_cast<uintptr_t>(*inner_vptr), modules)) {
                         f.type = *cls + "*";
                         f.value = utils::format_address(target);
+                        f.child_pointer = target;
                         f.note = "points to a " + *cls;
                         layout.fields.push_back(f);
                         off += 8;
@@ -272,6 +274,7 @@ StructLayout StructureDissector::dissect(uintptr_t address, size_t size, std::ve
 
                 f.type = "void*";
                 f.value = utils::format_address(target);
+                f.child_pointer = target;
                 const std::string where = module_offset(target, modules);
                 f.note = where.empty() ? "-> " + utils::format_address(target) : "-> " + where;
                 layout.fields.push_back(f);
@@ -382,6 +385,177 @@ std::string StructLayout::to_cpp() const {
     }
     out << "};\n";
     return out.str();
+}
+
+bool read_formatted_value(const hal::IProcess& process,
+                          uintptr_t field_addr,
+                          const std::string& type,
+                          size_t size,
+                          const std::vector<hal::ModuleInfo>& modules,
+                          std::string& value_out,
+                          uintptr_t* child_ptr_out = nullptr,
+                          std::string* note_out = nullptr) {
+    if (type == "float") {
+        if (auto v = read<float>(process, field_addr)) {
+            std::ostringstream ss; ss << *v;
+            value_out = ss.str();
+            return true;
+        }
+    } else if (type == "double") {
+        if (auto v = read<double>(process, field_addr)) {
+            std::ostringstream ss; ss << *v;
+            value_out = ss.str();
+            return true;
+        }
+    } else if (type == "int64_t") {
+        if (auto v = read<int64_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "uint64_t") {
+        if (auto v = read<uint64_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "int32_t") {
+        if (auto v = read<int32_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "uint32_t") {
+        if (auto v = read<uint32_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "int16_t") {
+        if (auto v = read<int16_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "uint16_t") {
+        if (auto v = read<uint16_t>(process, field_addr)) { value_out = std::to_string(*v); return true; }
+    } else if (type == "int8_t") {
+        if (auto v = read<int8_t>(process, field_addr)) { value_out = std::to_string(static_cast<int>(*v)); return true; }
+    } else if (type == "uint8_t") {
+        if (auto v = read<uint8_t>(process, field_addr)) { value_out = std::to_string(static_cast<unsigned int>(*v)); return true; }
+    } else if (type == "void*" || type == "void**" || (type.size() > 1 && type.back() == '*')) {
+        uintptr_t ptr = 0;
+        bool ok = false;
+        if (process.pointer_size() == 4) {
+            if (auto p32 = read<uint32_t>(process, field_addr)) { ptr = *p32; ok = true; }
+        } else {
+            if (auto p64 = read<uint64_t>(process, field_addr)) { ptr = static_cast<uintptr_t>(*p64); ok = true; }
+        }
+        if (ok) {
+            if (child_ptr_out) *child_ptr_out = ptr;
+            value_out = utils::format_address(ptr);
+            if (note_out) {
+                std::string mod = module_offset(ptr, modules);
+                if (!mod.empty()) *note_out = "-> " + mod;
+            }
+            return true;
+        }
+    } else if (type.find("char[") == 0) {
+        std::string s = read_cstr(process, field_addr, size);
+        value_out = "\"" + s + "\"";
+        return true;
+    }
+    return false;
+}
+
+void StructLayout::refresh_values(const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules) {
+    for (auto& f : fields) {
+        std::string old_val = f.value;
+        read_formatted_value(process, address + f.offset, f.type, f.size, modules, f.value, &f.child_pointer, &f.note);
+        f.changed = (f.value != old_val);
+    }
+}
+
+void StructComparison::refresh(const hal::IProcess& process, const std::vector<hal::ModuleInfo>& modules) {
+    for (auto& row : rows) {
+        row.values.assign(addresses.size(), "??");
+        std::string baseline;
+        bool has_baseline = false;
+        bool any_diff = false;
+        for (size_t idx = 0; idx < addresses.size(); ++idx) {
+            std::string val;
+            if (read_formatted_value(process, addresses[idx] + row.offset, row.type, row.size, modules, val)) {
+                row.values[idx] = val;
+                if (!has_baseline) {
+                    baseline = val;
+                    has_baseline = true;
+                } else if (val != baseline) {
+                    any_diff = true;
+                }
+            }
+        }
+        row.differs = any_diff;
+        row.all_equal = !any_diff;
+    }
+}
+
+std::string StructComparison::to_report(bool only_differences) const {
+    std::ostringstream ss;
+    ss << "Offset\tType\tName";
+    for (const auto& lbl : labels) ss << "\t" << lbl;
+    ss << "\tStatus\n";
+    for (const auto& r : rows) {
+        if (only_differences && !r.differs) continue;
+        ss << "+0x" << std::hex << std::uppercase << r.offset << std::dec
+           << "\t" << r.type << "\t" << (r.name.empty() ? "-" : r.name);
+        for (const auto& v : r.values) ss << "\t" << v;
+        ss << "\t" << (r.differs ? "DIFF" : "SAME") << "\n";
+    }
+    return ss.str();
+}
+
+StructComparison StructureDissector::compare(const std::vector<uintptr_t>& addresses,
+                                             size_t size,
+                                             std::vector<hal::ModuleInfo> modules,
+                                             bool only_differences) const {
+    StructComparison cmp;
+    if (!m_process || !m_process->is_attached() || addresses.empty()) return cmp;
+    if (modules.empty()) modules = m_process->get_modules();
+
+    cmp.addresses = addresses;
+    cmp.size = size;
+
+    StructLayout primary = dissect(addresses[0], size, modules);
+    for (size_t i = 0; i < addresses.size(); ++i) {
+        std::string cls;
+        if (i == 0) {
+            cls = primary.class_name;
+        } else {
+            uintptr_t vptr = 0;
+            bool ok = false;
+            if (m_process->pointer_size() == 4) {
+                if (auto p32 = read<uint32_t>(*m_process, addresses[i])) { vptr = *p32; ok = true; }
+            } else {
+                if (auto p64 = read<uint64_t>(*m_process, addresses[i])) { vptr = static_cast<uintptr_t>(*p64); ok = true; }
+            }
+            if (ok && user_address(vptr)) {
+                if (auto c = class_from_vtable(vptr, modules)) cls = *c;
+            }
+        }
+        std::string lbl = "#" + std::to_string(i + 1) + " (" + utils::format_address(addresses[i]) + ")";
+        if (!cls.empty()) lbl = cls + " @ " + utils::format_address(addresses[i]);
+        cmp.labels.push_back(std::move(lbl));
+    }
+
+    cmp.rows.reserve(primary.fields.size());
+    for (const auto& f : primary.fields) {
+        StructCompareRow row;
+        row.offset = f.offset;
+        row.size = f.size;
+        row.type = f.type;
+        row.name = f.name;
+        cmp.rows.push_back(std::move(row));
+    }
+
+    cmp.refresh(*m_process, modules);
+    if (only_differences) {
+        cmp.rows.erase(
+            std::remove_if(cmp.rows.begin(), cmp.rows.end(), [](const StructCompareRow& r) { return !r.differs; }),
+            cmp.rows.end());
+    }
+    return cmp;
+}
+
+bool StructLayout::set_field_type(size_t field_index, const std::string& new_type, const hal::IProcess& process) {
+    if (field_index >= fields.size()) return false;
+    auto& f = fields[field_index];
+    f.type = new_type;
+    if (new_type == "int8_t" || new_type == "uint8_t") f.size = 1;
+    else if (new_type == "int16_t" || new_type == "uint16_t") f.size = 2;
+    else if (new_type == "int32_t" || new_type == "uint32_t" || new_type == "float") f.size = 4;
+    else if (new_type == "int64_t" || new_type == "uint64_t" || new_type == "double" || new_type == "void*") f.size = sizeof(uintptr_t);
+    refresh_values(process);
+    return true;
 }
 
 } // namespace nce::view

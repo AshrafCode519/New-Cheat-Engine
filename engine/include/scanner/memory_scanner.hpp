@@ -41,6 +41,27 @@ public:
         ScanProgressCallback progress = nullptr
     );
 
+    // Encrypted / XOR-obfuscated numeric scan: matches values whose stored bytes XORed with `xor_key` equal `target`.
+    [[nodiscard]] ScanResults first_scan_xor(
+        DataType type,
+        uint64_t xor_key,
+        const ScanValue& target,
+        size_t alignment = 4,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
+    // Paired XOR auto-discovery: finds [key][encrypted_val] or [encrypted_val][key] pairs where
+    // stored ^ *(raw + key_offset) == target (key_offset = -4 default, 0 checks both -4 and +4; key != 0).
+    [[nodiscard]] ScanResults first_scan_xor_auto(
+        DataType type,
+        const ScanValue& target,
+        int key_offset = -4,
+        size_t alignment = 4,
+        uint32_t region_filter = hal::FilterFlags::DefaultScanFilter,
+        ScanProgressCallback progress = nullptr
+    );
+
     // "Unknown initial value": copies the scanned memory so the next scan can compare against it.
     // Numeric types only; the snapshot is as large as the scanned memory.
     [[nodiscard]] MemorySnapshot first_scan_unknown(

@@ -1,6 +1,18 @@
 # New-Cheat-Engine (NCE)
 
-محرك حديث عابر للمنصات (Cross-Platform) لفحص وتعديل الذاكرة، مصمم وفق معايير هندسية متقدمة ليكون بديلاً خفيفاً وعالي الكفاءة لبرامج فحص الذاكرة التقليدية.
+[![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-180%20passed%20(2497%20assertions)-brightgreen.svg)](tests/)
+
+> **⚠️ تنويه وإخلاء مسؤولية (Disclaimer):** هذا المشروع مخصّص لأغراض **التعليم، الهندسة العكسية، البحث الأمني، وتعديل الألعاب الفردية (Offline/Single-Player)** فقط.
+> Intended strictly for **educational reverse engineering, security research, and single-player/offline game analysis**.
+
+محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
+
+### Quick Start (English Summary)
+- **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
+- **Linux (GCC / CMake):** `cmake -B build && cmake --build build -j 4` -> outputs `memscan_cli`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer`, `clock_gettime` speedhack).
+- **Third-Party Libraries Included (`third_party/`):** Dear ImGui (MIT), Lua 5.4.7 (MIT), doctest (MIT), nlohmann/json (MIT).
 
 ---
 
@@ -45,11 +57,23 @@
    * **مفكك الهياكل (StructureDissector):**
      * بيحوّل أي object أو pointer في اللعبة لـ C++ struct: بيلاقي الـ vtable ويعدّ دوالها، وبيطلّع اسم الكلاس من الـ RTTI (نظام MSVC اللي أغلب الألعاب عليه، ونظام GCC/Itanium)، وبيسمّي كل field بنوعه (float، int، char\*، pointer لـ object تاني باسم كلاسه).
      * بيصدّر `struct` جاهز تلزقه في header.
-   * **محرك الـ Auto-Assembler (AutoAssembler):**
-     * مترجم تعليمات x86-64 (و32-bit) من الصفر للتعليمات الشائعة (mov/lea، العمليات الحسابية، push/pop، jmp/call/jcc، db)، متحقَّق منه بايت-بايت قصاد GNU `as` على 70 تعليمة.
-     * بيشغّل سكربتات زي Cheat Engine: `[ENABLE]`/`[DISABLE]`، و`alloc` و`label` و`aobscanmodule` و`registersymbol`. بيفكّ تعبيرات `"module"+offset`، وبيترجم على مرحلتين عشان الـ labels تتظبط حتى لو اتذكرت قبل ما تتعرّف.
-     * بيسجّل كل byte غيّره وكل cave حجزه، فالسكربت اللي مالوش `[DISABLE]` بيرجّع نفسه، وأي فشل في النص بيرجّع الهدف زي ما كان.
-     * **تحذير:** السكربتات دي بتعدّل كود اللعبة نفسه، فاستخدمها مع ألعاب أوفلاين بس؛ أي anti-cheat بيعتبرها غش.
+   * **محرك الـ Auto-Assembler والمجمّع (`x86_assembler` + `AutoAssembler`):**
+     * مترجم تعليمات x86-64/x86 (MOV/LEA، العمليات الحسابية والمنطقية، SSE/SIMD، تحويلات الأرقام `cvtsi2ss`/`cvttss2si`، فحص البتات `bt`/`bts`/`btr`/`bsf`، `bswap`، القفزات والنداءات، `db`).
+     * تشغيل سكربتات `[ENABLE]`/`[DISABLE]` و`{$lua}` و`alloc` و`label` و`define` و`assert` و`aobscanmodule` و`registersymbol` مع استرجاع تلقائي عند التعطيل.
+   * **المنقح التفاعلي وكشف التسريع والمقارنة التفاضلية (`StepDebugger`, `DebugCoordinator`, `VEH`, `HookEngine`, `Speedhack`, `MemoryDiff`):**
+     * تنقيح تفاعلي متكامل بـ **Win32 Debug API** أو **وكيل VEH داخل العملية (`nce_veh.dll`)** أو **`ptrace` على Linux/Steam Deck** مع دعم `INT 3` ونقاط التوقف الشرطية (`ConditionEvaluator`) وتتبّع التنفيذ (`tracebp` / `tracelog`) وسجل المكدس (`CallStack`).
+     * محرك الحقن (`HookEngine`) لزرع Code Caves وDetours، ومحرك تسريع الوقت (`Speedhack`) على Windows (`QPC`/`GetTickCount64`/`timeGetTime`) وLinux (`clock_gettime`).
+     * أداة `MemoryDiff` لأخذ لقطتين للذاكرة ومقارنة البايتات المتغيرة، و`UltimapProfiler` لاصطياد الدوال التي تُستدعى عند تنفيذ حركة معينة داخل اللعبة، وعارض التدفق الرسومي (`Control-Flow Graph / CFG`) في المفكك.
+   * **محللات الثنائيات ومحركات الألعاب (`PEAnalyzer`, `ELFAnalyzer`, `EngineInspector`):**
+     * فحص ترويسات وأقسام وتصدير/استيراد ملفات **PE32/PE32+** على ويندوز و**ELF32/ELF64** على لينكس مع حقن أسماء الدوال في المفكك (`resolve_symbol`).
+     * فاحص **Unity (Mono / IL2CPP)** لقراءة `global-metadata.dat` من القرص أو من الذاكرة الحية مباشرةً (`0xFAB11BAF`) وتشريح الكائنات الحية (`Il2CppClass` + إزاحات الحقول)، وفاحص **Unreal Engine 4/5** مع البحث التلقائي عن `GNames` و`GUObjectArray` وتشريح `FField`/`UStruct` وقائمة `UWorld Actors` ثلاثية الأبعاد.
+   * **محرك سكربتات Lua 5.4.7 المدمج (`LuaEngine`):**
+     * واجهة Lua متوافقة مع Cheat Engine (`readInteger`/`Float`/`String`/`Bytes`، `write*`، `AOBScan*`، `autoAssemble`، `installHook`، `setBreakpoint`، `debugger_onBreakpoint`، `setSpeed`، `createTimer`، `createHotkey`، و`analyzePE`/`ELF` و`detectEngine`/`findUnrealGlobals`/`dumpUnrealActors`/`inspectUnityMemory`/`buildCFG`).
+   * **مولد المدرب المستقل (`StandaloneGenerator`):**
+     * تصدير جدول الغش إلى ملف C++ مستقل بدون مكتبات خارجية لـ **Win32 Console** أو **Win32 Native GUI** أو **Linux Console** (`process_vm_writev`).
+   * **دعم المنصات والمحاكي:**
+     * طبقة Linux في `LinuxProcess` (`/proc/<pid>/maps`, `process_vm_readv/writev`, `ptrace` `mmap`/`munmap`)، وحاقن `.so` عبر `dlopen`، ومفاتيح اختصار X11 (`libX11.so.6`).
+     * دعم القيم Big-Endian لألعاب محاكيات **Dolphin / RPCS3**.
    * **طبقة الجلسة (Session):**
      * كل اللي محتاجه هدف متصل في مكان واحد: العملية، الفحص الحالي مع الـ undo، خريطة الضوضاء، جدول الغش مع خيط التجميد (كل 100ms)، ومسارات المؤشرات.
      * الـ CLI والواجهة الاتنين واجهات عليها: منطق الفحص والـ attach وإعادة الاتصال والجدول مكتوب مرة واحدة وعليه اختبارات، والواجهات بتقرا الأوامر وتعرض النتايج بس.
@@ -81,8 +105,11 @@
    * تجميد القيم: `freeze <addr> <type> <val>` بيضيف العنوان لجدول الغش متجمد (فـ `table` و`tsave` و`tperm` بيشتغلوا عليه)، `frozen` بيعرض المتجمد، و`unfreeze [#|all]` بيفك التجميد.
    * استعراض الذاكرة بتنسيق Hex Dump (`dump <addr> [bytes]`).
    * الذاكرة حوالين قيمة (`view <addr>` أو `view #<result>` أو `view t<entry>`، أو تاب Memory في الواجهة): القيم اللي جنب القيمة اللي لقيتها غالباً من نفس الـ object (الـ max health، الذخيرة، المكان)، فبتضيفهم للجدول من غير فحص جديد. لو كتبت `view` تاني بيعلّم اللي اتغير من آخر مرة، وفي الواجهة العرض بيتحدّث 5 مرات في الثانية: الأصفر اتغير دلوقتي، والرمادي بيتغير لوحده. وزرار Go على أي pointer بيروح للمكان اللي بيشاور عليه، وBack بيرجّعك.
-   * تفكيك object لـ C++ struct (`dissect <addr|#result|t#> [bytes]`، أو تاب Dissect في الواجهة وزرار Copy C++): بيطلّع اسم الكلاس من الـ RTTI، الـ vtable وعدد دوالها، وكل field بنوعه. مفيد تعرف شكل الـ object اللي لقيت فيه قيمة عشان تلاقي باقي قيمه.
-   * سكربتات Auto-Assembler في الجدول (`script list | add <name> <file> | on <#> | off <#> | show <#> | del <#>`، أو تاب Scripts في الواجهة): بتتكتب بـ `[ENABLE]`/`[DISABLE]`، بتتحفظ مع الجدول، وبتشتغل وتتقفل زي التجميد. اللي محفوظ "on" بيترجع يشتغل لوحده لما تعمل attach، وبيتقفل لوحده لما تـ detach عشان اللعبة تفضل نضيفة. **لألعاب أوفلاين بس — بتعدّل كود اللعبة.**
+   * **المميزات الإضافية في الـ CLI والواجهة الرسومية (`nce_gui` + `memscan_cli`):**
+     * تبويبات كاملة بالواجهة الرسومية لـ **Pointer Scanner (مع حفظ ومقارنة `.ncem`)**, **Memory**, **Memory Map (Modules / Regions / Threads)**, **Hotkeys**, **Scripts**, **Dissect (RTTI + Nested Pointer Tree + JSON Export + Multi-Struct Compare)**, **Watch**, **Disasm (32/64-bit, x87 FPU, AVX/VEX, Step Debugger + Break & Trace + Pan/Zoom CFG Flow Graph + X-Refs + Ultimap Profiler + One-Click `AA` Code-Cave Gen)**, **Radar 3D (Float3 / UE5 Double3 + Unreal Actors Overlay)**, **Speedhack**, **Mem Diff**, **PE / ELF Tools**, **Engine Inspector (Unity IL2CPP/Mono + Unreal `GWorld`/Auto-Finder + Auto-Calibrate Offsets)**، **Lua 5.4 Script Studio**، ولوحة الأوامر السريعة **`Ctrl+K`**.
+     * أوامر الـ CLI الموسّعة: `disasm`, `xrefs`, `ptrmap <save|scan|cmp>`, `aobscript`, `cfg`, `ultimap`, `pe`, `elf`, `engine`, `unity <file|mem|obj>`, `unreal <find|names|objects|dissect|actors|calibrate>`, `lua`, `runlua`, `aobscan`, `aa`, `hook`, `detour`, `bp`, `tracebp`, `tracelog`, `dbgattach [win32|veh]`, `step`, `stepover`, `stepout`, `inject`, `gentrainer <out.cpp> [proc] [gui|linux]`.
+   * تفكيك object لـ C++ struct (`dissect <addr|#result|t#> [bytes]`، أو تاب Dissect في الواجهة مع أزرار Copy C++ / Copy JSON وفتح المؤشرات كشجرة متداخلة): بيطلّع اسم الكلاس من الـ RTTI، الـ vtable وعدد دوالها، وكل field بنوعه.
+   * سكربتات Auto-Assembler وتوليدها تلقائياً (`aobscript` / زر `AA` في المفكك / دالة Lua `generateAOBScript`): بتتكتب بـ `[ENABLE]`/`[DISABLE]`، بتتحفظ مع الجدول، وبتشتغل وتتقفل أوتوماتيكياً مع `attach`/`detach`. **لألعاب أوفلاين بس — بتعدّل كود اللعبة.**
 
 ---
 
@@ -107,9 +134,11 @@ cmake --build build
 
 ### تشغيل الاختبارات (doctest):
 ```powershell
+.\build\bin\engine_tests.exe
+# أو عبر CTest:
 ctest --test-dir build --output-on-failure
 ```
-الاختبارات في مجلد `tests/`: اختبارات للمحرك على عملية وهمية في الذاكرة (`FakeProcess`)، واختبار حي لـ `Win32Process` بيعمل attach على نفسه. لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
+تغطي الاختبارات (`180 test cases / 2,497 assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process`, `HookEngine`, `Speedhack`, `Lua 5.4`, `Disassembler` (`x64/x86/AVX/x87/X-Refs`), `PointerMap`, و`EngineInspector` (`Unity / Unreal`). لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
 
 ### التشغيل والاختبار:
 1. قم بتشغيل الهدف التجريبي:

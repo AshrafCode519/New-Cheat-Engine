@@ -148,9 +148,11 @@ void ValueTracker::observe_event(const Expectation& expected) {
 
 double ValueTracker::as_double(size_t lane, const uint8_t* bytes) const {
     double out = 0.0;
+    const bool is_be = is_big_endian(m_types[lane]);
     dispatch_numeric(m_types[lane], [&]<typename T>() {
         T value;
         std::memcpy(&value, bytes, sizeof(T));
+        if (is_be) value = swap_bytes(value);
         out = static_cast<double>(value);
     });
     return out;

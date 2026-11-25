@@ -25,14 +25,33 @@ std::string to_hex(uint64_t value) {
     return ss.str();
 }
 
+std::string to_signed_hex(int64_t value) {
+    if (value < 0) {
+        return "-" + to_hex(static_cast<uint64_t>(-value));
+    }
+    return to_hex(static_cast<uint64_t>(value));
+}
+
 template <typename T>
 std::optional<T> from_hex(const std::string& text) {
     std::string_view digits(text);
+    bool neg = false;
+    if constexpr (std::is_signed_v<T>) {
+        if (!digits.empty() && digits.front() == '-') {
+            neg = true;
+            digits.remove_prefix(1);
+        }
+    }
     if (digits.size() > 2 && digits[0] == '0' && (digits[1] == 'x' || digits[1] == 'X')) digits.remove_prefix(2);
-    T value{};
-    auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), value, 16);
-    if (ec != std::errc() || ptr != digits.data() + digits.size() || digits.empty()) return std::nullopt;
-    return value;
+    if (digits.empty()) return std::nullopt;
+    uint64_t raw = 0;
+    auto [ptr, ec] = std::from_chars(digits.data(), digits.data() + digits.size(), raw, 16);
+    if (ec != std::errc() || ptr != digits.data() + digits.size()) return std::nullopt;
+    if constexpr (std::is_signed_v<T>) {
+        if (neg) return static_cast<T>(-static_cast<int64_t>(raw));
+        return static_cast<T>(raw);
+    }
+    return static_cast<T>(raw);
 }
 
 bool read_pointer(const hal::IProcess& process, uintptr_t address, uintptr_t& out) {
@@ -57,7 +76,7 @@ void write_path(json& item, const scanner::PointerPath& path) {
     item["offset"] = to_hex(path.base_offset);
     if (!path.offsets.empty()) {
         json offsets = json::array();
-        for (const auto o : path.offsets) offsets.push_back(to_hex(static_cast<uint64_t>(o)));
+        for (const auto o : path.offsets) offsets.push_back(to_signed_hex(o));
         item["pointer"] = offsets;
     }
 }
@@ -380,6 +399,8 @@ std::string to_json(const CheatTable& table) {
         write_path(item, e.location);
         if (e.length > 0) item["length"] = e.length;
         if (e.frozen_value) item["freeze"] = *e.frozen_value;
+        if (!e.group.empty()) item["group"] = e.group;
+        if (!e.dropdown.empty()) item["dropdown"] = e.dropdown;
         if (!e.context.empty()) item["context"] = bytes_to_hex(e.context);
         if (!e.alternatives.empty()) {
             json alternatives = json::array();
@@ -414,6 +435,9 @@ std::string to_json(const CheatTable& table) {
             scripts.push_back({{"name", s.name}, {"body", s.body}, {"enabled", s.enabled}});
         }
         doc["scripts"] = scripts;
+    }
+    if (!table.lua_script.empty()) {
+        doc["lua_script"] = table.lua_script;
     }
     return doc.dump(2) + "\n";
 }
@@ -484,6 +508,13 @@ std::optional<CheatTable> from_json(const std::string& text) {
                 e.hotkeys.push_back(std::move(h));
             }
         }
+        e.group = item.value("group", "");
+        if (const auto dd = item.find("dropdown"); dd != item.end()) {
+            if (!dd->is_object()) return std::nullopt;
+            for (const auto& [k, v] : dd->items()) {
+                if (v.is_string()) e.dropdown[k] = v.get<std::string>();
+            }
+        }
 
         table.entries.push_back(std::move(e));
     }
@@ -499,6 +530,11 @@ std::optional<CheatTable> from_json(const std::string& text) {
             if (s.name.empty()) return std::nullopt;
             table.scripts.push_back(std::move(s));
         }
+    }
+
+    if (const auto lua_it = doc.find("lua_script"); lua_it != doc.end()) {
+        if (!lua_it->is_string()) return std::nullopt;
+        table.lua_script = lua_it->get<std::string>();
     }
 
     return table;

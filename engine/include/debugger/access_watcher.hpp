@@ -12,8 +12,10 @@
 
 namespace nce::debugger {
 
-// What to catch: a write to the address, or any access (read or write)
-enum class WatchKind { Write, Access };
+class DebugCoordinator;
+
+// What to catch: a write to the address, any read/write access, or instruction execution
+enum class WatchKind { Write, Access, Execute };
 
 struct Registers {
     uint64_t rax{0}, rbx{0}, rcx{0}, rdx{0}, rsi{0}, rdi{0}, rbp{0}, rsp{0}, rip{0};
@@ -29,16 +31,14 @@ struct AccessHit {
     std::vector<uint8_t> bytes;  // the instruction's bytes
     Registers registers;
     size_t count{0};             // how many times this instruction hit the address
-    // The register + offset that most likely forms the value's base pointer (from the memory operand),
-    // e.g. {"rcx", 0x10} for `mov [rcx+0x10], eax`. Empty name when the instruction has no [reg+disp] operand.
     std::string base_register;
     int64_t base_offset{0};
     [[nodiscard]] uintptr_t base_pointer() const; // registers.by_name(base_register) (0 if none)
 };
 
-// "Find what writes/accesses this address": sets a hardware breakpoint (debug registers) on the address in
-// every thread of the target and reports the instructions that hit it, with their registers, so a value can
-// be traced back to the code that changes it and to its base pointer. Windows only; needs debug access.
+// "Find what writes/accesses this address": sets a hardware breakpoint (debug registers DR0-DR3) on the
+// address in every thread of the target and reports the instructions that hit it, with their registers.
+// Shares a DebugCoordinator with StepDebugger when used inside a Session, eliminating dual-debugger conflicts.
 class AccessWatcher {
 public:
     AccessWatcher() = default;
@@ -46,14 +46,17 @@ public:
     AccessWatcher(const AccessWatcher&) = delete;
     AccessWatcher& operator=(const AccessWatcher&) = delete;
 
-    // Watches `size` bytes (1/2/4/8) at `address` for `kind`. The address should be aligned to its size,
-    // as the hardware requires. False if the debugger can't attach (another debugger is present, the
-    // process exited, or no permission). Replaces any current watch.
+    // Bind a shared DebugCoordinator (used by Session so StepDebugger and AccessWatcher coexist).
+    void set_coordinator(std::shared_ptr<DebugCoordinator> coordinator);
+
+    // Watches `size` bytes (1/2/4/8) at `address` for `kind`. Supports up to 4 concurrent addresses (DR0-DR3).
     bool start(std::shared_ptr<hal::IProcess> process, uintptr_t address, size_t size, WatchKind kind);
     void stop();
+    void stop_address(uintptr_t address);
 
     [[nodiscard]] bool watching() const noexcept { return m_active; }
     [[nodiscard]] uintptr_t address() const noexcept { return m_address; }
+    [[nodiscard]] std::vector<uintptr_t> watched_addresses() const;
     [[nodiscard]] size_t size() const noexcept { return m_size; }
     [[nodiscard]] WatchKind kind() const noexcept { return m_kind; }
 
@@ -62,21 +65,18 @@ public:
     void clear();
 
 private:
-    void run(std::promise<bool> attached);      // attaches, then the debug-event loop, on its own thread
-    void arm_thread(void* handle, bool enable) const; // sets or clears the breakpoint in one thread's context
-    void record_hit(uint32_t thread_id);        // reads the context at a breakpoint and stores the hit
+    void on_hw_hit(uint32_t thread_id, uintptr_t rip, const Registers& regs);
 
     std::shared_ptr<hal::IProcess> m_process;
+    std::shared_ptr<DebugCoordinator> m_shared_coordinator;
+    std::shared_ptr<DebugCoordinator> m_owned_coordinator;
     std::vector<hal::ModuleInfo> m_modules;
     uintptr_t m_address{0};
+    std::vector<uintptr_t> m_watched_addresses;
     size_t m_size{4};
     WatchKind m_kind{WatchKind::Write};
-    uint32_t m_pid{0};
 
     std::atomic<bool> m_active{false};
-    std::atomic<bool> m_stop{false};
-    std::thread m_thread;
-
     mutable std::mutex m_mutex;
     std::vector<AccessHit> m_hits;
 };

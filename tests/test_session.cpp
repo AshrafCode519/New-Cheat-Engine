@@ -290,3 +290,29 @@ TEST_CASE("a session's table survives a save and a load") {
     CHECK(s.table().entry(1)->description == "Speed");
     CHECK_FALSE(s.find_restart()); // the fake process has no name
 }
+
+TEST_CASE("session manages speedhack state") {
+    auto process = std::make_shared<FakeProcess>(0x10000);
+    session::Session s(process);
+
+    CHECK_FALSE(s.speedhack_installed());
+    CHECK_FALSE(s.speedhack_enabled());
+    CHECK(s.speedhack_speed() == 1.0);
+
+    // Speed operations when detached should fail gracefully
+    CHECK_FALSE(s.set_speed(2.0));
+    CHECK_FALSE(s.enable_speedhack());
+    CHECK_FALSE(s.disable_speedhack());
+
+    REQUIRE(s.attach(1).ok);
+    CHECK(s.speedhack() != nullptr);
+    CHECK_FALSE(s.speedhack_installed());
+
+    // When attached to FakeProcess, allocate_memory returns false so hooks won't install,
+    // but the API handles it gracefully without throwing or crashing
+    CHECK_FALSE(s.enable_speedhack());
+    CHECK(s.speedhack_speed() == 1.0);
+
+    s.detach();
+    CHECK_FALSE(s.speedhack_installed());
+}

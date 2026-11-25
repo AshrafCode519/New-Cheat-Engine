@@ -49,8 +49,13 @@ public:
 
     [[nodiscard]] const std::vector<PointerNode>& get_pointers() const noexcept { return m_pointers; }
 
-    // Find all pointers whose to_address is within [target_address - max_offset, target_address]
-    std::vector<std::pair<uintptr_t, int64_t>> find_predecessors(uintptr_t target_address, size_t max_offset) const;
+    // Find all pointers whose to_address is within [target_address - max_offset, target_address + max_negative_offset]
+    std::vector<std::pair<uintptr_t, int64_t>> find_predecessors(
+        uintptr_t target_address, size_t max_offset, size_t max_negative_offset = 0) const;
+
+    // Binary persistence ("NCEM" format) for instant reuse and cross-session comparison
+    bool save(const std::string& path) const;
+    bool load(const std::string& path);
 
 private:
     std::vector<PointerNode> m_pointers;
@@ -59,6 +64,7 @@ private:
 struct PointerScanOptions {
     size_t max_depth{4};
     size_t max_offset{0x800};
+    size_t max_negative_offset{0}; // non-zero enables negative offsets (e.g. linked-list / container_of links)
     size_t max_results{100000};
     std::string base_module; // only accept static bases in this module (case-insensitive); empty = any module
 };
@@ -80,6 +86,20 @@ public:
         uintptr_t target_address,
         const PointerScanOptions& options = {},
         std::function<void(size_t current_depth, size_t paths_found)> progress = nullptr
+    );
+
+    // Scans backwards using a previously built or loaded PointerMap (zero RAM rescan cost)
+    PointerScanResult scan_with_map(
+        const PointerMap& map,
+        uintptr_t target_address,
+        const PointerScanOptions& options = {},
+        std::function<void(size_t current_depth, size_t paths_found)> progress = nullptr
+    );
+
+    // Keeps only pointer paths present in both scans (e.g. comparing two saved .ncem PointerMaps)
+    static std::vector<PointerPath> intersect_paths(
+        const std::vector<PointerPath>& prev_paths,
+        const std::vector<PointerPath>& new_paths
     );
 
     // Keeps the paths that resolve to expected_target in the current process. Run it after the target

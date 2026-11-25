@@ -3,6 +3,7 @@
 #include "../hal/process.hpp"
 #include "../scanner/scan_types.hpp"
 #include "../scanner/pointer_scanner.hpp"
+#include <map>
 #include <memory>
 #include <optional>
 #include <string>
@@ -46,6 +47,8 @@ struct TableEntry {
     static constexpr size_t CONTEXT_RADIUS = 64;
 
     std::vector<Hotkey> hotkeys; // at most one per combo
+    std::string group;           // optional folder / category header
+    std::map<std::string, std::string> dropdown; // optional value -> label display list (e.g. "1" -> "Sword")
 
     [[nodiscard]] bool is_absolute() const noexcept { return location.module_name.empty(); }
 
@@ -68,6 +71,7 @@ struct CheatTable {
     std::string process_name;
     std::vector<TableEntry> entries;
     std::vector<TableScript> scripts;
+    std::string lua_script;
 };
 
 // Pointer paths that lead to the entry's current address, best first (scanned with small offsets

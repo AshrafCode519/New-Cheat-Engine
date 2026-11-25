@@ -1,6 +1,30 @@
+# Build directories
 build/
+out/
+cmake-build-*/
 .vs/
 .vscode/
+.idea/
+
+# Compiled binaries, libraries & debug symbols
 *.exe
+*.dll
+*.so
+*.dylib
 *.o
+*.obj
 *.a
+*.lib
+*.pdb
+*.ilk
+*.exp
+
+# Runtime dumps, cheat tables & exported artifacts
+*.ncem
+*.ct
+*.cea
+*.bmp
+*.log
+table.json
+pointers.ncem
+standalone_trainer_*.cpp

@@ -18,7 +18,24 @@ add_executable(engine_tests
     test_auto_assembler.cpp
     test_structure_dissector.cpp
     test_table_scripts.cpp
+    test_ce_table_format.cpp
+    test_strings_and_generator.cpp
     test_disassembler.cpp
+    test_simd_scanner.cpp
+    test_sig_and_vector.cpp
+    test_emulator_be.cpp
+    test_hook_speedhack.cpp
+    test_pe_and_diff.cpp
+    test_step_debugger.cpp
+    test_lua_engine.cpp
+    test_linux_hal.cpp
+    test_debug_phase1.cpp
+    test_phase2_scripting.cpp
+    test_phase3_re.cpp
+    test_phase4_platforms_engines.cpp
+    test_phase5_completeness.cpp
+    test_phase6_ux_tools.cpp
+    test_phase7_re_and_maps.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

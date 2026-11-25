@@ -8,6 +8,7 @@
 #include <cstring>
 #include <fstream>
 #include <sstream>
+#include <unordered_set>
 
 namespace nce::scanner {
 
@@ -49,7 +50,11 @@ std::string PointerPath::to_string() const {
     std::ostringstream ss;
     ss << "[" << module_name << " + 0x" << std::hex << std::uppercase << base_offset << "]";
     for (const auto& off : offsets) {
-        ss << " -> [0x" << std::hex << std::uppercase << off << "]";
+        if (off < 0) {
+            ss << " -> [-0x" << std::hex << std::uppercase << static_cast<uint64_t>(-off) << "]";
+        } else {
+            ss << " -> [0x" << std::hex << std::uppercase << static_cast<uint64_t>(off) << "]";
+        }
     }
     return ss.str();
 }
@@ -150,22 +155,68 @@ void PointerMap::build(
     std::sort(m_pointers.begin(), m_pointers.end());
 }
 
-std::vector<std::pair<uintptr_t, int64_t>> PointerMap::find_predecessors(uintptr_t target_address, size_t max_offset) const {
+std::vector<std::pair<uintptr_t, int64_t>> PointerMap::find_predecessors(
+    uintptr_t target_address, size_t max_offset, size_t max_negative_offset) const {
     std::vector<std::pair<uintptr_t, int64_t>> predecessors;
     if (m_pointers.empty()) return predecessors;
 
-    uintptr_t min_target = (target_address >= max_offset) ? (target_address - max_offset) : 0;
+    const uintptr_t min_target = (target_address >= max_offset) ? (target_address - max_offset) : 0;
+    const uintptr_t max_target = (target_address <= UINTPTR_MAX - max_negative_offset)
+        ? (target_address + max_negative_offset)
+        : UINTPTR_MAX;
 
     PointerNode dummy_min{min_target, 0};
     auto it = std::lower_bound(m_pointers.begin(), m_pointers.end(), dummy_min);
 
-    while (it != m_pointers.end() && it->to_address <= target_address) {
-        int64_t offset = static_cast<int64_t>(target_address - it->to_address);
+    while (it != m_pointers.end() && it->to_address <= max_target) {
+        const int64_t offset = (target_address >= it->to_address)
+            ? static_cast<int64_t>(target_address - it->to_address)
+            : -static_cast<int64_t>(it->to_address - target_address);
         predecessors.emplace_back(it->from_address, offset);
         ++it;
     }
 
     return predecessors;
+}
+
+bool PointerMap::save(const std::string& path) const {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    const char magic[4] = {'N', 'C', 'E', 'M'};
+    const uint32_t version = 1;
+    const uint64_t count = m_pointers.size();
+    out.write(magic, 4);
+    out.write(reinterpret_cast<const char*>(&version), sizeof(version));
+    out.write(reinterpret_cast<const char*>(&count), sizeof(count));
+    if (count > 0) {
+        out.write(reinterpret_cast<const char*>(m_pointers.data()),
+                  static_cast<std::streamsize>(count * sizeof(PointerNode)));
+    }
+    return static_cast<bool>(out);
+}
+
+bool PointerMap::load(const std::string& path) {
+    std::ifstream in(path, std::ios::binary);
+    if (!in) return false;
+    char magic[4]{};
+    uint32_t version = 0;
+    uint64_t count = 0;
+    if (!in.read(magic, 4) || std::memcmp(magic, "NCEM", 4) != 0) return false;
+    if (!in.read(reinterpret_cast<char*>(&version), sizeof(version)) || version != 1) return false;
+    if (!in.read(reinterpret_cast<char*>(&count), sizeof(count)) || count > 200'000'000ULL) return false;
+
+    std::vector<PointerNode> nodes(static_cast<size_t>(count));
+    if (count > 0) {
+        if (!in.read(reinterpret_cast<char*>(nodes.data()),
+                     static_cast<std::streamsize>(count * sizeof(PointerNode)))) {
+            return false;
+        }
+    }
+    if (!std::is_sorted(nodes.begin(), nodes.end())) {
+        std::sort(nodes.begin(), nodes.end());
+    }
+    m_pointers = std::move(nodes);
+    return true;
 }
 
 PointerScanner::PointerScanner(std::shared_ptr<hal::IProcess> process)
@@ -179,6 +230,19 @@ PointerScanResult PointerScanner::scan(
 ) {
     PointerScanResult result;
     if (!m_process || !m_process->is_attached()) return result;
+    PointerMap map;
+    map.build(*m_process, m_process->query_regions(), m_process->pointer_size());
+    return scan_with_map(map, target_address, options, std::move(progress));
+}
+
+PointerScanResult PointerScanner::scan_with_map(
+    const PointerMap& map,
+    uintptr_t target_address,
+    const PointerScanOptions& options,
+    std::function<void(size_t current_depth, size_t paths_found)> progress
+) {
+    PointerScanResult result;
+    if (!m_process || !m_process->is_attached()) return result;
 
     auto modules = m_process->get_modules();
     if (modules.empty()) return result;
@@ -186,8 +250,6 @@ PointerScanResult PointerScanner::scan(
     std::sort(modules.begin(), modules.end(),
         [](const hal::ModuleInfo& a, const hal::ModuleInfo& b) { return a.base_address < b.base_address; });
 
-    PointerMap map;
-    map.build(*m_process, m_process->query_regions(), m_process->pointer_size());
     result.pointer_map_size = map.size();
 
     // Breadth-first search backwards from the target. Each node is a pointer slot; it keeps its parent
@@ -230,7 +292,7 @@ PointerScanResult PointerScanner::scan(
             }
 
             if (depth == options.max_depth) continue;
-            for (const auto& [from_addr, offset] : map.find_predecessors(address, options.max_offset)) {
+            for (const auto& [from_addr, offset] : map.find_predecessors(address, options.max_offset, options.max_negative_offset)) {
                 if (nodes.size() >= MAX_SEARCH_NODES) {
                     result.truncated = true;
                     break;
@@ -250,7 +312,7 @@ PointerScanResult PointerScanner::scan(
     // small field offsets; chains that hop through allocator structures need large ones), then fewer levels
     auto offset_sum = [](const PointerPath& p) {
         int64_t sum = 0;
-        for (const auto o : p.offsets) sum += o;
+        for (const auto o : p.offsets) sum += (o < 0 ? -o : o);
         return sum;
     };
     std::stable_sort(result.paths.begin(), result.paths.end(), [&](const PointerPath& a, const PointerPath& b) {
@@ -283,6 +345,32 @@ std::vector<PointerPath> PointerScanner::verify_paths(
     return valid_paths;
 }
 
+std::vector<PointerPath> PointerScanner::intersect_paths(
+    const std::vector<PointerPath>& prev_paths,
+    const std::vector<PointerPath>& new_paths
+) {
+    auto key_of = [](const PointerPath& p) {
+        std::string k = p.module_name;
+        for (char& ch : k) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+        k.push_back(':');
+        k += std::to_string(p.base_offset);
+        for (int64_t off : p.offsets) {
+            k.push_back(',');
+            k += std::to_string(off);
+        }
+        return k;
+    };
+    std::unordered_set<std::string> prev_keys;
+    prev_keys.reserve(prev_paths.size());
+    for (const auto& p : prev_paths) prev_keys.insert(key_of(p));
+
+    std::vector<PointerPath> common;
+    for (const auto& p : new_paths) {
+        if (prev_keys.count(key_of(p))) common.push_back(p);
+    }
+    return common;
+}
+
 bool save_pointer_paths(const std::string& path, const std::vector<PointerPath>& paths) {
     std::ofstream out(path, std::ios::trunc);
     if (!out) return false;
@@ -292,7 +380,9 @@ bool save_pointer_paths(const std::string& path, const std::vector<PointerPath>&
         out << p.module_name << "\t" << std::hex << std::uppercase << p.base_offset << "\t";
         if (p.offsets.empty()) out << "-";
         for (size_t i = 0; i < p.offsets.size(); ++i) {
-            out << (i > 0 ? "," : "") << p.offsets[i];
+            out << (i > 0 ? "," : "");
+            if (p.offsets[i] < 0) out << "-" << static_cast<uint64_t>(-p.offsets[i]);
+            else out << static_cast<uint64_t>(p.offsets[i]);
         }
         out << std::dec << "\n";
     }

@@ -1,0 +1,43 @@
+name: Build & Test (Windows + Linux)
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+    branches: [ main, master ]
+
+jobs:
+  windows-mingw:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: false
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-make
+      - name: Configure
+        run: cmake -S . -B build -G "MinGW Makefiles"
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ./build/bin/engine_tests.exe
+
+  linux-gcc:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install -y cmake g++
+      - name: Configure
+        run: cmake -S . -B build
+      - name: Build
+        run: cmake --build build -j 4
+      - name: Test
+        run: ./build/bin/engine_tests

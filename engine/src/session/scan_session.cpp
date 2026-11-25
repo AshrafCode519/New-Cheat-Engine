@@ -131,10 +131,46 @@ Outcome ScanSession::first_scan(const std::string& type_name, const std::string&
 
     push_history();
     m_state.type = *type;
+    m_state.xor_key.reset();
     m_state.results = range
         ? m_scanner->first_scan(*type, scanner::ScanCondition::Between, range->first, range->second, alignment)
         : m_scanner->first_scan(*type, scanner::ScanCondition::ExactValue, *value, {}, alignment);
     return Outcome::success(note);
+}
+
+Outcome ScanSession::first_scan_xor(const std::string& type_name, const std::string& value_text, const std::string& key_text) {
+    if (auto refused = refuse()) return *refused;
+    auto type = utils::parse_data_type(type_name);
+    if (!type || !is_numeric(*type)) {
+        return Outcome::fail("XOR scan requires a numeric type (e.g. i32, u32, i64, u64, f32, f64).");
+    }
+    auto value = utils::parse_scan_value(*type, value_text);
+    if (!value) return Outcome::fail(invalid_value(value_text, *type));
+
+    const size_t alignment = scanner::get_data_type_size(*type);
+    if (key_text.empty() || key_text == "auto" || key_text == "?") {
+        push_history();
+        m_state.type = *type;
+        m_state.xor_key.reset();
+        m_state.results = m_scanner->first_scan_xor_auto(*type, *value, -static_cast<int>(alignment), alignment);
+        return Outcome::success("paired XOR auto-discovery (key @ -0x" +
+                                std::to_string(alignment) + ")");
+    }
+
+    uint64_t key = 0;
+    try {
+        size_t idx = 0;
+        key = std::stoull(key_text, &idx, 0);
+        if (idx != key_text.size()) return Outcome::fail("Invalid XOR key: '" + key_text + "'");
+    } catch (...) {
+        return Outcome::fail("Invalid XOR key: '" + key_text + "'");
+    }
+
+    push_history();
+    m_state.type = *type;
+    m_state.xor_key = key;
+    m_state.results = m_scanner->first_scan_xor(*type, key, *value, alignment);
+    return Outcome::success("XOR key scanned");
 }
 
 Outcome ScanSession::next_scan(const std::string& condition, const std::string& value1, const std::string& value2,
@@ -186,8 +222,29 @@ Outcome ScanSession::next_scan(const std::string& condition, const std::string& 
 void ScanSession::filter_into_current(const State& source, scanner::ScanCondition condition,
                                       const scanner::ScanValue& value1, const scanner::ScanValue& value2) {
     m_state.type = source.type;
+    m_state.xor_key = source.xor_key;
     if (!source.snapshot) {
-        m_state.results = m_scanner->next_scan(source.results, condition, value1, value2);
+        if (source.xor_key && condition == scanner::ScanCondition::ExactValue) {
+            scanner::ScanValue enc_val = value1;
+            const uint64_t k = *source.xor_key;
+            scanner::dispatch_numeric(source.type, [&]<typename T>() {
+                T plain = std::get<T>(value1.value);
+                if constexpr (sizeof(T) == 1) enc_val.value = static_cast<T>(static_cast<uint8_t>(plain) ^ k);
+                else if constexpr (sizeof(T) == 2) {
+                    uint16_t b = 0; std::memcpy(&b, &plain, 2); b ^= static_cast<uint16_t>(k);
+                    T enc{}; std::memcpy(&enc, &b, 2); enc_val.value = enc;
+                } else if constexpr (sizeof(T) == 4) {
+                    uint32_t b = 0; std::memcpy(&b, &plain, 4); b ^= static_cast<uint32_t>(k);
+                    T enc{}; std::memcpy(&enc, &b, 4); enc_val.value = enc;
+                } else if constexpr (sizeof(T) == 8) {
+                    uint64_t b = 0; std::memcpy(&b, &plain, 8); b ^= k;
+                    T enc{}; std::memcpy(&enc, &b, 8); enc_val.value = enc;
+                }
+            });
+            m_state.results = m_scanner->next_scan(source.results, condition, enc_val, value2);
+        } else {
+            m_state.results = m_scanner->next_scan(source.results, condition, value1, value2);
+        }
         return;
     }
 

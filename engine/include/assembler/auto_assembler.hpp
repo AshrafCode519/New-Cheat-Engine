@@ -1,8 +1,9 @@
 #pragma once
 
-#include "../hal/process.hpp"
 #include "x86_assembler.hpp"
+#include "../hal/process.hpp"
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <memory>
 #include <optional>
@@ -11,12 +12,11 @@
 
 namespace nce::assembler {
 
-// What a script changed, so it can be undone exactly: the bytes it overwrote, and the memory it allocated.
 struct ScriptEffect {
     struct Patch {
         uintptr_t address{0};
-        std::vector<uint8_t> original; // the bytes that were there before
-        std::vector<uint8_t> written;  // what the script put there
+        std::vector<uint8_t> original;
+        std::vector<uint8_t> written;
     };
     struct Allocation {
         uintptr_t address{0};
@@ -24,40 +24,36 @@ struct ScriptEffect {
     };
     std::vector<Patch> patches;
     std::vector<Allocation> allocations;
-    std::vector<std::string> symbols; // registersymbol names to drop on disable
+    std::vector<std::string> symbols;
 };
 
 struct AssembleResult {
     bool ok{false};
-    std::string message;    // the error when !ok; a short note (bytes written, caves) when ok
-    ScriptEffect effect;    // what to pass to disable() for a script that has no [DISABLE] of its own
+    std::string message;
+    ScriptEffect effect;
 };
 
-// Runs a Cheat-Engine-style Auto-Assembler script against an attached process: the small set of directives
-// games' tables use (alloc, label, aobscanmodule, registersymbol, db) plus the instructions X86Assembler
-// knows. Scripts inject or patch the game's OWN code, so this is for offline / single-player games you run
-// yourself; anti-cheat treats it as cheating. Symbols registered by one script are visible to the next.
+// Runs a Cheat-Engine-style Auto-Assembler script against an attached process:
+// Supports alloc, globalalloc, label, aobscan, aobscanmodule, aobscanregion, assert, define,
+// fullaccess, readmem, registersymbol, unregistersymbol, dealloc, db/dw/dd/dq/float/double,
+// {$lua}/{$asm} blocks, plus x86-64/32 instructions.
 class AutoAssembler {
 public:
+    using LuaRunner = std::function<bool(const std::string& lua_code, std::string& error_out)>;
+
     explicit AutoAssembler(std::shared_ptr<hal::IProcess> process);
 
-    // Runs the script's [ENABLE] section (or the whole script if it has no sections). On any failure every
-    // byte already written is put back and every cave freed, so the target is never left half-patched.
-    AssembleResult enable(const std::string& script);
+    void set_lua_runner(LuaRunner runner) { m_lua_runner = std::move(runner); }
 
-    // Undoes what enable() returned: runs the [DISABLE] section if the script has one, then restores the
-    // recorded bytes and frees the caves. A script with no [DISABLE] is undone from `effect` alone.
+    AssembleResult enable(const std::string& script);
     AssembleResult disable(const std::string& script, const ScriptEffect& effect);
 
-    // Global symbols, shared across scripts (registersymbol / a cheat table's own entries)
     void set_symbol(const std::string& name, uintptr_t address);
     void clear_symbol(const std::string& name);
     [[nodiscard]] std::optional<uintptr_t> symbol(const std::string& name) const;
 
-    // Resolves "game.exe"+0x1234, mysymbol+0x20, 0x7FF.., or a decimal, using the symbols and the modules
     [[nodiscard]] std::optional<uintptr_t> resolve(const std::string& expression) const;
 
-    // The two sections of a script ("" when absent); the whole body counts as ENABLE if neither is present
     struct Sections {
         std::string enable;
         std::string disable;
@@ -65,19 +61,30 @@ public:
     };
     [[nodiscard]] static Sections split_sections(const std::string& script);
 
+    /// Generates a complete [ENABLE]/[DISABLE] Auto-Assembler code-cave injection template
+    /// for `address`, using SignatureGenerator + Disassembler + X86Assembler validation.
+    [[nodiscard]] static std::string generate_aob_hook_script(
+        const hal::IProcess& proc,
+        uintptr_t address,
+        const std::string& label_name = "INJECT",
+        size_t min_bytes = 5);
+
 private:
-    struct Assembly; // one run's working state (labels, current address, buffered writes)
+    struct Assembly;
 
     bool run(const std::string& body, ScriptEffect& effect, std::string& error, bool committing);
     bool first_pass(Assembly& a, std::string& error);
     bool emit_pass(Assembly& a, ScriptEffect& effect, std::string& error);
     bool apply_directive(Assembly& a, const std::string& line, bool first, std::string& error);
     std::string substitute_symbols(const Assembly& a, const std::string& operands) const;
+    std::string apply_defines(const Assembly& a, const std::string& line) const;
 
     std::shared_ptr<hal::IProcess> m_process;
     X86Assembler m_encoder;
+    LuaRunner m_lua_runner;
     std::map<std::string, uintptr_t> m_symbols;
-    std::map<std::string, size_t> m_symbol_alloc_size; // caves, so disable can free by name if needed
+    std::map<std::string, size_t> m_symbol_alloc_size;
+    std::map<std::string, ScriptEffect::Allocation> m_global_allocs;
 };
 
 } // namespace nce::assembler

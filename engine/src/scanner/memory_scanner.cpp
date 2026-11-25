@@ -1,6 +1,7 @@
 #include "../../include/scanner/memory_scanner.hpp"
 #include "../../include/utils/hex_utils.hpp"
 #include "../../include/utils/text_encoding.hpp"
+#include "../../include/scanner/simd_scanner.hpp"
 #include "parallel.hpp"
 #include <thread>
 #include <mutex>
@@ -93,10 +94,14 @@ bool match_next_condition(T current, T previous, ScanCondition cond, T val1 = 0,
 
 // Same comparison on raw bytes (values read from memory are not necessarily aligned)
 template <typename T>
-bool match_next_bytes(const uint8_t* live, const uint8_t* prev, ScanCondition cond, T val1, T val2) {
+bool match_next_bytes(const uint8_t* live, const uint8_t* prev, ScanCondition cond, T val1, T val2, bool is_be = false) {
     T current, previous;
     std::memcpy(&current, live, sizeof(T));
     std::memcpy(&previous, prev, sizeof(T));
+    if (is_be) {
+        current = swap_bytes(current);
+        previous = swap_bytes(previous);
+    }
     return match_next_condition(current, previous, cond, val1, val2);
 }
 
@@ -148,11 +153,45 @@ void scan_chunk_typed(
     T target1,
     T target2,
     size_t alignment,
-    ScanResults& out
+    ScanResults& out,
+    bool is_be = false
 ) {
+    if (cond == ScanCondition::ExactValue && simd::cpu_supports_avx2()) {
+        const T search_target = is_be ? swap_bytes(target1) : target1;
+        if constexpr (std::is_same_v<T, int32_t>) {
+            if (simd::scan_chunk_exact_i32_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, uint32_t>) {
+            if (simd::scan_chunk_exact_u32_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, float>) {
+            if (simd::scan_chunk_exact_float_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, int64_t>) {
+            if (simd::scan_chunk_exact_i64_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, uint64_t>) {
+            if (simd::scan_chunk_exact_u64_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, double>) {
+            if (simd::scan_chunk_exact_double_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, int16_t>) {
+            if (simd::scan_chunk_exact_i16_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, uint16_t>) {
+            if (simd::scan_chunk_exact_u16_avx2(buffer, buffer_size, start_limit, chunk_base, search_target, alignment, out)) return;
+        }
+    } else if (!is_be && simd::cpu_supports_avx2() &&
+               (cond == ScanCondition::GreaterThan || cond == ScanCondition::LessThan || cond == ScanCondition::Between)) {
+        if constexpr (std::is_same_v<T, int32_t>) {
+            if (simd::scan_chunk_cond_i32_avx2(buffer, buffer_size, start_limit, chunk_base, cond, target1, target2, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, uint32_t>) {
+            if (simd::scan_chunk_cond_u32_avx2(buffer, buffer_size, start_limit, chunk_base, cond, target1, target2, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, float>) {
+            if (simd::scan_chunk_cond_float_avx2(buffer, buffer_size, start_limit, chunk_base, cond, target1, target2, alignment, out)) return;
+        } else if constexpr (std::is_same_v<T, double>) {
+            if (simd::scan_chunk_cond_double_avx2(buffer, buffer_size, start_limit, chunk_base, cond, target1, target2, alignment, out)) return;
+        }
+    }
+
     for (size_t offset = 0; offset < start_limit && offset + sizeof(T) <= buffer_size; offset += alignment) {
         T value;
         std::memcpy(&value, buffer + offset, sizeof(T));
+        if (is_be) value = swap_bytes(value);
 
         if (match_condition(value, cond, target1, target2)) {
             out.add(chunk_base + offset, buffer + offset, buffer + offset);
@@ -169,6 +208,12 @@ void scan_chunk_aob(
     size_t alignment,
     ScanResults& out
 ) {
+    if (simd::cpu_supports_avx2()) {
+        if (simd::scan_chunk_aob_avx2(buffer, buffer_size, start_limit, chunk_base, pattern, alignment, out)) {
+            return;
+        }
+    }
+
     const size_t pattern_size = pattern.bytes.size();
 
     for (size_t offset = 0; offset < start_limit && offset + pattern_size <= buffer_size; offset += alignment) {
@@ -199,8 +244,8 @@ ScanResults merge_parts(std::vector<ScanResults>& parts, DataType type, size_t v
     return merged;
 }
 
-// Splits the matching regions across worker threads and hands every 1 MB chunk to scan_chunk.
-// Results come back in address order (regions are queried in ascending order).
+// Splits matching regions across worker threads in uniform work chunks so every CPU core is fully utilized.
+// Results come back in address order (chunks are ordered in ascending memory order).
 template <typename ChunkScanner>
 ScanResults scan_regions(
     const hal::IProcess& process,
@@ -222,41 +267,55 @@ ScanResults scan_regions(
     for (const auto& r : regions) total_bytes += r.size;
 
     std::atomic<size_t> scanned_bytes{0};
-    std::vector<ScanResults> parts(regions.size(), ScanResults(type, value_size));
 
-    // Each chunk is read with value_size - 1 extra bytes, so a match that straddles two chunks is found
+    // Flatten all regions into uniform work chunks
+    struct ChunkTask {
+        uintptr_t base;
+        size_t chunk_len;
+        size_t to_read;
+        size_t region_offset;
+        size_t region_size;
+    };
+
     const size_t overlap = value_size - 1;
+    std::vector<ChunkTask> tasks;
+    for (const auto& reg : regions) {
+        for (size_t offset = 0; offset < reg.size; offset += CHUNK_SIZE) {
+            const uintptr_t base = reg.base_address + offset;
+            const size_t chunk = std::min(CHUNK_SIZE, reg.size - offset);
+            const size_t to_read = std::min(chunk + overlap, reg.size - offset);
+            tasks.push_back({base, chunk, to_read, offset, reg.size});
+        }
+    }
 
-    parallel_for(regions.size(), thread_count,
+    if (tasks.empty()) return ScanResults(type, value_size);
+
+    std::vector<ScanResults> parts(tasks.size(), ScanResults(type, value_size));
+
+    parallel_for(tasks.size(), thread_count,
         [&] { return std::vector<uint8_t>(CHUNK_SIZE + overlap); },
-        [&](std::vector<uint8_t>& buffer, size_t idx) {
-            const auto& reg = regions[idx];
-            auto& out = parts[idx];
+        [&](std::vector<uint8_t>& buffer, size_t task_idx) {
+            const auto& task = tasks[task_idx];
+            auto& out = parts[task_idx];
 
-            for (size_t offset = 0; offset < reg.size; offset += CHUNK_SIZE) {
-                const uintptr_t base = reg.base_address + offset;
-                const size_t chunk = std::min(CHUNK_SIZE, reg.size - offset);
-                const size_t to_read = std::min(chunk + overlap, reg.size - offset);
-
-                if (process.read_raw(base, buffer.data(), to_read)) {
-                    scan_chunk(buffer.data(), to_read, chunk, base, out);
-                } else {
-                    // Part of the chunk is unreadable (e.g. freed since query_regions): retry page by page
-                    for (size_t page = 0; page < chunk; page += PAGE_SIZE) {
-                        const size_t page_len = std::min(PAGE_SIZE, chunk - page);
-                        size_t page_read = std::min(page_len + overlap, reg.size - offset - page);
-                        if (!process.read_raw(base + page, buffer.data(), page_read)) {
-                            if (page_read == page_len || !process.read_raw(base + page, buffer.data(), page_len)) continue;
-                            page_read = page_len;
-                        }
-                        scan_chunk(buffer.data(), page_read, page_len, base + page, out);
+            if (process.read_raw(task.base, buffer.data(), task.to_read)) {
+                scan_chunk(buffer.data(), task.to_read, task.chunk_len, task.base, out);
+            } else {
+                // Part of the chunk is unreadable (e.g. freed since query_regions): retry page by page
+                for (size_t page = 0; page < task.chunk_len; page += PAGE_SIZE) {
+                    const size_t page_len = std::min(PAGE_SIZE, task.chunk_len - page);
+                    size_t page_read = std::min(page_len + overlap, task.region_size - task.region_offset - page);
+                    if (!process.read_raw(task.base + page, buffer.data(), page_read)) {
+                        if (page_read == page_len || !process.read_raw(task.base + page, buffer.data(), page_len)) continue;
+                        page_read = page_len;
                     }
+                    scan_chunk(buffer.data(), page_read, page_len, task.base + page, out);
                 }
+            }
 
-                scanned_bytes.fetch_add(chunk);
-                if (progress) {
-                    progress(scanned_bytes.load(), total_bytes, out.count());
-                }
+            scanned_bytes.fetch_add(task.chunk_len);
+            if (progress) {
+                progress(scanned_bytes.load(), total_bytes, out.count());
             }
         });
 
@@ -351,6 +410,7 @@ ScanResults MemoryScanner::first_scan(
 
     const size_t step = std::max<size_t>(1, alignment);
 
+    const bool is_be = is_big_endian(type);
     dispatch_numeric(type, [&]<typename T>() {
         // Read the targets here so a ScanValue of the wrong type throws on the caller's thread, not in a worker
         const T target1 = std::get<T>(val1.value);
@@ -358,7 +418,7 @@ ScanResults MemoryScanner::first_scan(
 
         results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
             [&](const uint8_t* buffer, size_t size, size_t limit, uintptr_t base, ScanResults& out) {
-                scan_chunk_typed<T>(buffer, size, limit, base, condition, target1, target2, step, out);
+                scan_chunk_typed<T>(buffer, size, limit, base, condition, target1, target2, step, out, is_be);
             });
     });
 
@@ -484,13 +544,14 @@ ScanResults MemoryScanner::next_scan(
     const bool uses_val1 = condition_uses_value(condition);
     const bool uses_val2 = (condition == ScanCondition::Between);
 
+    const bool is_be = is_big_endian(type);
     const bool is_numeric = dispatch_numeric(type, [&]<typename T>() {
         const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
         const T target2 = uses_val2 ? std::get<T>(val2.value) : T{};
 
         results = filter_results(*m_process, previous_results, m_thread_count, progress,
             [&](const uint8_t* live, const uint8_t* prev) {
-                return match_next_bytes<T>(live, prev, condition, target1, target2);
+                return match_next_bytes<T>(live, prev, condition, target1, target2, is_be);
             });
     });
 
@@ -522,6 +583,7 @@ ScanResults MemoryScanner::next_scan(
     const bool uses_val2 = (condition == ScanCondition::Between);
     const size_t step = std::max<size_t>(1, snapshot.alignment);
     const DataType type = snapshot.type;
+    const bool is_be = is_big_endian(type);
 
     dispatch_numeric(type, [&]<typename T>() {
         const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
@@ -540,7 +602,7 @@ ScanResults MemoryScanner::next_scan(
                 if (m_process->read_raw(block.base_address, live.data(), live.size())) {
                     for_each_alive_slot(block.alive, [&](size_t slot) {
                         const size_t offset = slot * step;
-                        if (match_next_bytes<T>(live.data() + offset, block.bytes.data() + offset, condition, target1, target2)) {
+                        if (match_next_bytes<T>(live.data() + offset, block.bytes.data() + offset, condition, target1, target2, is_be)) {
                             parts[i].add(block.base_address + offset, live.data() + offset, block.bytes.data() + offset);
                         }
                     });
@@ -575,6 +637,7 @@ MemorySnapshot MemoryScanner::filter_snapshot(
     const bool uses_val2 = (condition == ScanCondition::Between);
     const size_t step = std::max<size_t>(1, snapshot.alignment);
 
+    const bool is_be = is_big_endian(snapshot.type);
     dispatch_numeric(snapshot.type, [&]<typename T>() {
         const T target1 = uses_val1 ? std::get<T>(val1.value) : T{};
         const T target2 = uses_val2 ? std::get<T>(val2.value) : T{};
@@ -597,7 +660,7 @@ MemorySnapshot MemoryScanner::filter_snapshot(
                 size_t kept = 0;
                 for_each_alive_slot(block.alive, [&](size_t slot) {
                     const size_t offset = slot * step;
-                    if (match_next_bytes<T>(out.bytes.data() + offset, block.bytes.data() + offset, condition, target1, target2)) {
+                    if (match_next_bytes<T>(out.bytes.data() + offset, block.bytes.data() + offset, condition, target1, target2, is_be)) {
                         out.alive[slot / 64] |= uint64_t{1} << (slot % 64);
                         ++kept;
                     }
@@ -640,6 +703,123 @@ ScanResults MemoryScanner::snapshot_to_results(const MemorySnapshot& snapshot) {
             results.add(block.base_address + slot * step, value, value);
         });
     }
+    return results;
+}
+
+ScanResults MemoryScanner::first_scan_xor(
+    DataType type,
+    uint64_t xor_key,
+    const ScanValue& target,
+    size_t alignment,
+    uint32_t region_filter,
+    ScanProgressCallback progress
+) {
+    ScanResults results;
+    if (!m_process || !m_process->is_attached()) return results;
+    const size_t step = std::max<size_t>(1, alignment);
+    const bool is_be = is_big_endian(type);
+
+    dispatch_numeric(type, [&]<typename T>() {
+        const T target_val = std::get<T>(target.value);
+        results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
+            [&, target_val, is_be, xor_key, step](const uint8_t* buffer, size_t buffer_size, size_t start_limit,
+                                                  uintptr_t chunk_base, ScanResults& out) {
+                for (size_t offset = 0; offset < start_limit && offset + sizeof(T) <= buffer_size; offset += step) {
+                    if constexpr (sizeof(T) == 1) {
+                        uint8_t raw = buffer[offset];
+                        if (static_cast<uint8_t>(raw ^ xor_key) == static_cast<uint8_t>(target_val)) {
+                            out.add(chunk_base + offset, buffer + offset, buffer + offset);
+                        }
+                    } else if constexpr (sizeof(T) == 2) {
+                        uint16_t raw = 0;
+                        std::memcpy(&raw, buffer + offset, 2);
+                        if (is_be) raw = swap_bytes(raw);
+                        uint16_t dec_bits = raw ^ static_cast<uint16_t>(xor_key);
+                        T dec{};
+                        std::memcpy(&dec, &dec_bits, 2);
+                        if (dec == target_val) out.add(chunk_base + offset, buffer + offset, buffer + offset);
+                    } else if constexpr (sizeof(T) == 4) {
+                        uint32_t raw = 0;
+                        std::memcpy(&raw, buffer + offset, 4);
+                        if (is_be) raw = swap_bytes(raw);
+                        uint32_t dec_bits = raw ^ static_cast<uint32_t>(xor_key);
+                        T dec{};
+                        std::memcpy(&dec, &dec_bits, 4);
+                        if (match_condition(dec, ScanCondition::ExactValue, target_val)) {
+                            out.add(chunk_base + offset, buffer + offset, buffer + offset);
+                        }
+                    } else if constexpr (sizeof(T) == 8) {
+                        uint64_t raw = 0;
+                        std::memcpy(&raw, buffer + offset, 8);
+                        if (is_be) raw = swap_bytes(raw);
+                        uint64_t dec_bits = raw ^ xor_key;
+                        T dec{};
+                        std::memcpy(&dec, &dec_bits, 8);
+                        if (match_condition(dec, ScanCondition::ExactValue, target_val)) {
+                            out.add(chunk_base + offset, buffer + offset, buffer + offset);
+                        }
+                    }
+                }
+            });
+    });
+    return results;
+}
+
+ScanResults MemoryScanner::first_scan_xor_auto(
+    DataType type,
+    const ScanValue& target,
+    int key_offset,
+    size_t alignment,
+    uint32_t region_filter,
+    ScanProgressCallback progress
+) {
+    ScanResults results;
+    if (!m_process || !m_process->is_attached()) return results;
+    const size_t step = std::max<size_t>(1, alignment);
+    const bool is_be = is_big_endian(type);
+
+    dispatch_numeric(type, [&]<typename T>() {
+        const T target_val = std::get<T>(target.value);
+        if constexpr (sizeof(T) != 4 && sizeof(T) != 8) {
+            return;
+        } else {
+            using Bits = std::conditional_t<sizeof(T) == 4, uint32_t, uint64_t>;
+            const int default_off = static_cast<int>(sizeof(T));
+            results = scan_regions(*m_process, region_filter, m_noise.get(), m_thread_count, progress, type, sizeof(T),
+                [&, target_val, is_be, key_offset, default_off, step](
+                    const uint8_t* buffer, size_t buffer_size, size_t start_limit,
+                    uintptr_t chunk_base, ScanResults& out) {
+                    auto try_pair = [&](size_t off, int k_off) -> bool {
+                        const ptrdiff_t key_pos = static_cast<ptrdiff_t>(off) + k_off;
+                        if (key_pos < 0 || static_cast<size_t>(key_pos) + sizeof(T) > buffer_size) return false;
+                        Bits key_bits = 0, raw_bits = 0;
+                        std::memcpy(&raw_bits, buffer + off, sizeof(T));
+                        std::memcpy(&key_bits, buffer + key_pos, sizeof(T));
+                        if (is_be) {
+                            raw_bits = swap_bytes(raw_bits);
+                            key_bits = swap_bytes(key_bits);
+                        }
+                        if (key_bits == 0) return false; // skip unencrypted plain pairs [value, 0]
+                        const Bits dec_bits = raw_bits ^ key_bits;
+                        T dec{};
+                        std::memcpy(&dec, &dec_bits, sizeof(T));
+                        return match_condition(dec, ScanCondition::ExactValue, target_val);
+                    };
+
+                    for (size_t offset = 0; offset < start_limit && offset + sizeof(T) <= buffer_size; offset += step) {
+                        bool hit = false;
+                        if (key_offset != 0) {
+                            hit = try_pair(offset, key_offset);
+                        } else {
+                            hit = try_pair(offset, -default_off) || try_pair(offset, default_off);
+                        }
+                        if (hit) {
+                            out.add(chunk_base + offset, buffer + offset, buffer + offset);
+                        }
+                    }
+                });
+        }
+    });
     return results;
 }
 

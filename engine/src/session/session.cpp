@@ -1,5 +1,6 @@
 #include "../../include/session/session.hpp"
 #include "../../include/utils/hex_utils.hpp"
+#include "table/ce_table_format.hpp"
 #include <algorithm>
 #include <cctype>
 #include <charconv>
@@ -133,6 +134,7 @@ TableKeeper::AttachResult TableKeeper::attach(uint32_t pid) {
         m_active.clear();
         if (result.attached) {
             m_assembler = std::make_unique<assembler::AutoAssembler>(m_process);
+            if (m_lua_runner) m_assembler->set_lua_runner(m_lua_runner);
             result.scripts_note = reapply_scripts_locked();
         } else {
             m_assembler.reset();
@@ -324,12 +326,40 @@ Outcome TableKeeper::remove(size_t index) {
 Outcome TableKeeper::save(const std::string& path) {
     std::lock_guard<std::mutex> lock(m_mutex);
     if (m_table.process_name.empty() && !m_modules.empty()) m_table.process_name = m_modules.front().name;
+
+    std::string lower_path = lower(path);
+    if (lower_path.size() >= 3 && lower_path.compare(lower_path.size() - 3, 3, ".ct") == 0) {
+        std::string err;
+        if (!table::save_ce_table_file(path, m_table, err)) return Outcome::fail("Could not write Cheat Engine table to " + path + ": " + err);
+        return Outcome::success("Saved " + std::to_string(m_table.entries.size()) + " entries and " +
+                               std::to_string(m_table.scripts.size()) + " scripts to " + path + " (Cheat Engine .CT format).");
+    }
+
     if (!table::save_table(path, m_table)) return Outcome::fail("Could not write " + path + ".");
     return Outcome::success("Saved " + std::to_string(m_table.entries.size()) + " entries to " + path + ".");
 }
 
 Outcome TableKeeper::load(const std::string& path, std::vector<ReconcileLine>* reconciled) {
-    auto loaded = table::load_table(path);
+    std::string lower_path = lower(path);
+    std::optional<table::CheatTable> loaded;
+    if (lower_path.size() >= 3 && lower_path.compare(lower_path.size() - 3, 3, ".ct") == 0) {
+        table::CheatTable ce_table;
+        std::string err;
+        if (table::load_ce_table_file(path, ce_table, err)) {
+            loaded = std::move(ce_table);
+        } else {
+            return Outcome::fail("Could not read Cheat Engine table: " + err);
+        }
+    } else {
+        loaded = table::load_table(path);
+        if (!loaded) {
+            table::CheatTable ce_table;
+            std::string err;
+            if (table::load_ce_table_file(path, ce_table, err)) {
+                loaded = std::move(ce_table);
+            }
+        }
+    }
     if (!loaded) return Outcome::fail("Could not read a table from " + path + ".");
     std::string message;
     {
@@ -674,6 +704,22 @@ size_t TableKeeper::script_count() {
     return m_table.scripts.size();
 }
 
+void TableKeeper::set_lua_runner(assembler::AutoAssembler::LuaRunner runner) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_lua_runner = std::move(runner);
+    if (m_assembler) m_assembler->set_lua_runner(m_lua_runner);
+}
+
+std::string TableKeeper::lua_script() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    return m_table.lua_script;
+}
+
+void TableKeeper::set_lua_script(std::string script) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_table.lua_script = std::move(script);
+}
+
 void TableKeeper::set_library(std::filesystem::path folder) {
     std::lock_guard<std::mutex> lock(m_mutex);
     m_library = std::move(folder);
@@ -780,10 +826,33 @@ std::string describe_reconcile(const table::ReconcileResult& r) {
 Session::Session(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IHotkeys> hotkeys)
     : m_process(std::move(process))
     , m_table(std::make_unique<TableKeeper>(m_process, std::move(hotkeys)))
-{}
+    , m_lua(std::make_unique<script::LuaEngine>(this))
+{
+    m_table->set_lua_runner([this](const std::string& code, std::string& out_msg) -> bool {
+        const auto res = run_lua(code);
+        out_msg = res.success ? res.output : res.error;
+        return res.success;
+    });
+}
 
 Session::AttachReport Session::attach(uint32_t pid) {
     m_watcher.stop(); // belonged to the previous process
+    if (m_hook_engine) {
+        m_hook_engine->remove_all_hooks();
+        m_hook_engine.reset();
+    }
+    if (m_debugger) {
+        m_debugger->detach();
+        m_debugger.reset();
+    }
+    if (m_debug_coordinator) {
+        m_debug_coordinator->detach();
+        m_debug_coordinator.reset();
+    }
+    if (m_speedhack) {
+        m_speedhack->detach();
+        m_speedhack.reset();
+    }
     AttachReport report;
     const auto attached = m_table->attach(pid);
     report.ok = attached.attached;
@@ -800,6 +869,21 @@ Session::AttachReport Session::attach(uint32_t pid) {
 
     m_scanner = std::make_shared<scanner::MemoryScanner>(m_process);
     m_scans.set_scanner(m_scanner, m_process);
+    {
+        std::lock_guard<std::mutex> slock(m_sym_mutex);
+        m_pe_cache.clear();
+        m_elf_cache.clear();
+    }
+    m_ultimap.clear();
+    m_speedhack = std::make_unique<speedhack::Speedhack>(m_process);
+    m_debug_coordinator = std::make_shared<debugger::DebugCoordinator>(m_process);
+    m_debug_coordinator->set_breakpoint_callback([this](uint32_t tid, uintptr_t rip, debugger::Registers& regs) {
+        return m_lua ? m_lua->on_breakpoint_hit(tid, rip, regs) : false;
+    });
+    m_watcher.set_coordinator(m_debug_coordinator);
+    m_debugger = std::make_unique<debugger::StepDebugger>(m_process, m_debug_coordinator);
+    m_hook_engine = std::make_unique<debugger::HookEngine>(m_process);
+    if (m_lua) m_lua->set_session(this);
     report.read_only = !m_process->can_write();
     report.reconciled = attached.reconciled;
     return report;
@@ -807,11 +891,36 @@ Session::AttachReport Session::attach(uint32_t pid) {
 
 void Session::detach() {
     m_watcher.stop();
+    if (m_hook_engine) {
+        m_hook_engine->remove_all_hooks();
+        m_hook_engine.reset();
+    }
+    if (m_speedhack) {
+        m_speedhack->detach();
+        m_speedhack.reset();
+    }
+    if (m_debugger) {
+        m_debugger->detach();
+        m_debugger.reset();
+    }
+    if (m_debug_coordinator) {
+        m_debug_coordinator->detach();
+        m_debug_coordinator.reset();
+    }
+    m_watcher.set_coordinator(nullptr);
+    m_diff.clear();
     m_table->detach();
     m_scans.clear();
     m_scans.set_scanner(nullptr, nullptr);
     m_scanner.reset();
+    {
+        std::lock_guard<std::mutex> slock(m_sym_mutex);
+        m_pe_cache.clear();
+        m_elf_cache.clear();
+    }
+    m_ultimap.clear();
     m_noise.reset();
+    if (m_lua) m_lua->set_session(this);
 }
 
 bool Session::watch(uintptr_t address, size_t size, debugger::WatchKind kind) {
@@ -859,6 +968,357 @@ std::unique_ptr<scanner::ValueTracker> Session::new_tracker(std::vector<scanner:
 
 std::vector<scanner::PointerPath> Session::find_permanent_paths(const table::TableEntry& entry) {
     return table::find_permanent_paths(entry, m_process, m_table->modules());
+}
+
+bool Session::set_speed(double multiplier) {
+    if (!m_speedhack) return false;
+    if (!m_speedhack->is_installed()) {
+        if (!m_speedhack->attach()) return false;
+    }
+    return m_speedhack->set_speed(multiplier);
+}
+
+bool Session::enable_speedhack() {
+    if (!m_speedhack) return false;
+    if (!m_speedhack->is_installed()) {
+        if (!m_speedhack->attach()) return false;
+    }
+    return m_speedhack->enable();
+}
+
+bool Session::disable_speedhack() {
+    if (!m_speedhack) return false;
+    return m_speedhack->disable();
+}
+
+bool Session::speedhack_installed() const {
+    return m_speedhack && m_speedhack->is_installed();
+}
+
+bool Session::speedhack_enabled() const {
+    return m_speedhack && m_speedhack->is_enabled();
+}
+
+double Session::speedhack_speed() const {
+    return m_speedhack ? m_speedhack->get_speed() : 1.0;
+}
+
+bool Session::diff_snapshot_a(uintptr_t address, size_t size) {
+    if (!attached()) return false;
+    return m_diff.take_snapshot_a(*m_process, address, size);
+}
+
+bool Session::diff_snapshot_b() {
+    if (!attached()) return false;
+    return m_diff.take_snapshot_b(*m_process);
+}
+
+view::DiffSummary Session::diff_compare() const {
+    return m_diff.compare();
+}
+
+std::optional<debugger::PEInfo> Session::analyze_module(const std::string& module_name) {
+    if (!attached()) return std::nullopt;
+    for (const auto& mod : m_process->get_modules()) {
+        if (equals_ignore_case(mod.name, module_name)) {
+            return debugger::PEAnalyzer::analyze(*m_process, mod.base_address);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<debugger::PEInfo> Session::analyze_pe(uintptr_t base_address) {
+    if (!attached() || base_address == 0) return std::nullopt;
+    return debugger::PEAnalyzer::analyze(*m_process, base_address);
+}
+
+std::optional<debugger::ELFInfo> Session::analyze_module_elf(const std::string& module_name) {
+    if (!attached()) return std::nullopt;
+    for (const auto& mod : m_process->get_modules()) {
+        if (equals_ignore_case(mod.name, module_name)) {
+            return debugger::ELFAnalyzer::analyze(*m_process, mod.base_address);
+        }
+    }
+    return std::nullopt;
+}
+
+std::optional<debugger::ELFInfo> Session::analyze_elf(uintptr_t base_address) {
+    if (!attached() || base_address == 0) return std::nullopt;
+    return debugger::ELFAnalyzer::analyze(*m_process, base_address);
+}
+
+view::EngineDetection Session::detect_game_engine() const {
+    if (!attached()) return {};
+    return view::EngineInspector::detect(*m_process);
+}
+
+view::UnityMetadataReport Session::inspect_unity_metadata(
+    const std::string& file_path, const std::string& filter, size_t max_types) const
+{
+    return view::EngineInspector::parse_unity_metadata_file(file_path, filter, max_types);
+}
+
+std::vector<view::UnrealNameEntry> Session::scan_unreal_names(
+    uintptr_t fname_pool_addr, const view::UnrealOffsets& offsets,
+    uint32_t max_blocks, size_t max_names) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::scan_unreal_names(*m_process, fname_pool_addr, offsets, max_blocks, max_names);
+}
+
+std::vector<view::UnrealObjectInfo> Session::dump_unreal_objects(
+    uintptr_t guobject_array_addr, uintptr_t fname_pool_addr,
+    const view::UnrealOffsets& offsets, const std::string& filter,
+    size_t max_objects) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::dump_unreal_objects(
+        *m_process, guobject_array_addr, fname_pool_addr, offsets, filter, max_objects);
+}
+
+view::UnityMetadataReport Session::inspect_unity_metadata_memory(
+    uintptr_t metadata_addr, const std::string& filter, size_t max_types) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::parse_unity_metadata_memory(*m_process, metadata_addr, filter, max_types);
+}
+
+view::StructLayout Session::dissect_unity_object(
+    uintptr_t obj_addr, const view::Il2CppClassOffsets& offsets) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::dissect_unity_object(*m_process, obj_addr, offsets);
+}
+
+view::UnrealGlobalsResult Session::find_unreal_globals(uintptr_t module_base) const {
+    if (!attached()) return {};
+    return view::EngineInspector::find_unreal_globals(*m_process, module_base);
+}
+
+view::StructLayout Session::dissect_unreal_object(
+    uintptr_t uobject_addr, uintptr_t fname_pool_addr, const view::UnrealOffsets& offsets) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::dissect_unreal_object(*m_process, uobject_addr, fname_pool_addr, offsets);
+}
+
+std::vector<view::UnrealActorInfo> Session::dump_unreal_actors(
+    uintptr_t uworld_addr, uintptr_t fname_pool_addr, const view::UnrealOffsets& offsets, size_t max_actors) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::dump_unreal_actors(*m_process, uworld_addr, fname_pool_addr, offsets, max_actors);
+}
+
+debugger::ControlFlowGraph Session::build_cfg(uintptr_t entry_address, size_t max_insns, size_t max_blocks) const {
+    if (!attached()) return {};
+    return debugger::Disassembler::build_cfg(*m_process, entry_address, max_insns, max_blocks);
+}
+
+std::string Session::generate_aob_hook_script(
+    uintptr_t address, const std::string& label_name, size_t min_bytes) const
+{
+    if (!attached()) return {};
+    return assembler::AutoAssembler::generate_aob_hook_script(*m_process, address, label_name, min_bytes);
+}
+
+std::vector<debugger::CrossReference> Session::find_references(
+    uintptr_t target_address, uintptr_t module_base, size_t max_results) const
+{
+    if (!attached()) return {};
+    return debugger::Disassembler::find_references(*m_process, target_address, module_base, max_results);
+}
+
+view::UnrealCalibrationResult Session::calibrate_unreal_offsets(
+    uintptr_t world_or_actor_addr, uintptr_t fname_pool_addr, const view::UnrealOffsets& seed) const
+{
+    if (!attached()) return {};
+    return view::EngineInspector::calibrate_unreal_offsets(*m_process, world_or_actor_addr, fname_pool_addr, seed);
+}
+
+bool Session::build_and_save_pointer_map(const std::string& path) const {
+    if (!attached() || path.empty()) return false;
+    scanner::PointerMap map;
+    map.build(*m_process, m_process->query_regions(), m_process->pointer_size());
+    return map.save(path);
+}
+
+scanner::PointerScanResult Session::scan_saved_pointer_map(
+    const std::string& map_path, uintptr_t target_address, const scanner::PointerScanOptions& opts) const
+{
+    if (!attached() || map_path.empty()) return {};
+    scanner::PointerMap map;
+    if (!map.load(map_path)) return {};
+    scanner::PointerScanner ps(m_process);
+    return ps.scan_with_map(map, target_address, opts);
+}
+
+bool Session::dbg_attach(debugger::DebugBackend backend) {
+    if (!m_debugger) return false;
+    return m_debugger->attach(backend);
+}
+
+void Session::dbg_detach() {
+    if (m_debugger) m_debugger->detach();
+}
+
+bool Session::dbg_set_bp(uintptr_t addr, const std::string& note, const std::string& condition, bool is_tracepoint) {
+    if (!m_debugger) return false;
+    return m_debugger->set_breakpoint(addr, note, false, condition, is_tracepoint);
+}
+
+std::vector<hal::ThreadInfo> Session::list_threads() const {
+    if (!attached()) return {};
+    return hal::ProcessInjector::list_threads(m_process->get_pid());
+}
+
+bool Session::inject_dll(const std::string& dll_path, std::string& error_out) {
+    if (!attached()) {
+        error_out = "No target process attached.";
+        return false;
+    }
+    return hal::ProcessInjector::inject_dll(m_process->get_pid(), dll_path, error_out);
+}
+
+bool Session::dbg_remove_bp(uintptr_t addr) {
+    if (!m_debugger) return false;
+    return m_debugger->remove_breakpoint(addr);
+}
+
+bool Session::dbg_resume() {
+    if (!m_debugger) return false;
+    return m_debugger->resume();
+}
+
+bool Session::dbg_pause() {
+    if (!m_debugger) return false;
+    return m_debugger->pause();
+}
+
+bool Session::dbg_step_into() {
+    if (!m_debugger) return false;
+    return m_debugger->step_into();
+}
+
+bool Session::dbg_step_over() {
+    if (!m_debugger) return false;
+    return m_debugger->step_over();
+}
+
+bool Session::dbg_step_out() {
+    if (!m_debugger) return false;
+    return m_debugger->step_out();
+}
+
+script::ScriptResult Session::run_lua(const std::string& code) {
+    if (!m_lua) m_lua = std::make_unique<script::LuaEngine>(this);
+    return m_lua->execute_string(code);
+}
+
+script::ScriptResult Session::run_lua_file(const std::string& filepath) {
+    if (!m_lua) m_lua = std::make_unique<script::LuaEngine>(this);
+    return m_lua->execute_file(filepath);
+}
+
+void Session::reset_lua() {
+    if (m_lua) {
+        m_lua->reset();
+        m_lua->set_session(this);
+    }
+}
+
+std::optional<debugger::HookInfo> Session::hook_detour(uintptr_t target, uintptr_t destination) {
+    if (!m_hook_engine || !attached()) return std::nullopt;
+    if (!m_hook_engine->install_detour(target, destination)) return std::nullopt;
+    for (const auto& h : m_hook_engine->get_active_hooks()) {
+        if (h.target_address == target) return h;
+    }
+    return std::nullopt;
+}
+
+std::optional<debugger::HookInfo> Session::hook_payload(uintptr_t target, const std::vector<uint8_t>& payload) {
+    if (!m_hook_engine || !attached()) return std::nullopt;
+    return m_hook_engine->install_payload_hook(target, payload);
+}
+
+bool Session::unhook(uintptr_t target) {
+    if (!m_hook_engine) return false;
+    return m_hook_engine->remove_hook(target);
+}
+
+void Session::unhook_all() {
+    if (m_hook_engine) m_hook_engine->remove_all_hooks();
+}
+
+std::vector<debugger::HookInfo> Session::active_hooks() const {
+    if (!m_hook_engine) return {};
+    return m_hook_engine->get_active_hooks();
+}
+
+std::string Session::resolve_symbol(uintptr_t address) const {
+    if (address == 0 || !attached()) return {};
+    if (m_debug_coordinator) {
+        std::string dbg_sym = m_debug_coordinator->resolve_symbol(address);
+        // Only treat DebugCoordinator result as authoritative if it resolved a named symbol (contains '!')
+        // rather than a bare "mod+0x..." fallback, so PE exports can resolve exact DLL export names.
+        if (dbg_sym.find('!') != std::string::npos) return dbg_sym;
+    }
+
+    const auto mods = m_process->get_modules();
+    for (const auto& mod : mods) {
+        if (address >= mod.base_address && address < mod.base_address + mod.size) {
+            std::lock_guard<std::mutex> lock(m_sym_mutex);
+            if (debugger::ELFAnalyzer::is_elf_magic(*m_process, mod.base_address)) {
+                auto eit = m_elf_cache.find(mod.base_address);
+                if (eit == m_elf_cache.end()) {
+                    if (auto elf = debugger::ELFAnalyzer::analyze(*m_process, mod.base_address)) {
+                        eit = m_elf_cache.emplace(mod.base_address, std::move(*elf)).first;
+                    } else {
+                        eit = m_elf_cache.emplace(mod.base_address, debugger::ELFInfo{}).first;
+                    }
+                }
+                if (eit->second.is_valid) {
+                    if (const auto* sym = debugger::ELFAnalyzer::find_symbol_by_address(eit->second, address)) {
+                        if (address == sym->va) {
+                            return mod.name + "!" + sym->name;
+                        }
+                        std::ostringstream ss;
+                        ss << mod.name << "!" << sym->name << "+0x" << std::hex << std::uppercase << (address - sym->va);
+                        return ss.str();
+                    }
+                }
+            } else {
+                auto it = m_pe_cache.find(mod.base_address);
+                if (it == m_pe_cache.end()) {
+                    if (auto pe = debugger::PEAnalyzer::analyze(*m_process, mod.base_address)) {
+                        it = m_pe_cache.emplace(mod.base_address, std::move(*pe)).first;
+                    } else {
+                        it = m_pe_cache.emplace(mod.base_address, debugger::PEInfo{}).first;
+                    }
+                }
+                if (it->second.is_valid) {
+                    if (const auto* exp = debugger::PEAnalyzer::find_export_by_address(it->second, address)) {
+                        return mod.name + "!" + (exp->name.empty() ? ("#" + std::to_string(exp->ordinal)) : exp->name);
+                    }
+                }
+            }
+            std::ostringstream ss;
+            ss << mod.name << "+0x" << std::hex << std::uppercase << (address - mod.base_address);
+            return ss.str();
+        }
+    }
+    return {};
+}
+
+void Session::annotate_disassembly(std::vector<debugger::DecodedInstruction>& instructions) const {
+    if (!attached()) return;
+    for (auto& insn : instructions) {
+        if (insn.branch_target != 0) {
+            insn.resolved_symbol = resolve_symbol(insn.branch_target);
+        } else {
+            const std::string here = resolve_symbol(insn.address);
+            if (here.find('!') != std::string::npos) insn.resolved_symbol = here;
+        }
+    }
 }
 
 } // namespace nce::session

@@ -34,6 +34,7 @@ public:
         scanner::ScanResults results;
         std::shared_ptr<scanner::MemorySnapshot> snapshot; // after an unknown-value first scan
         scanner::DataType type{scanner::DataType::Int32};
+        std::optional<uint64_t> xor_key;                 // when set, candidate values are stored ^ xor_key
     };
 
     static constexpr size_t MAX_UNDO_STEPS = 5;
@@ -49,6 +50,9 @@ public:
     // type_name: "i8".."f64", "str", "wstr" or "aob". input: a number, "?" for an unknown initial value,
     // the text, or the AOB pattern. The previous state goes to the undo history.
     Outcome first_scan(const std::string& type_name, const std::string& input, scanner::FloatMatchMode float_mode);
+
+    // Encrypted / XOR scan: key_text can be hex ("0xA5A5A5A5"), decimal, or "auto" (adjacent key pair).
+    Outcome first_scan_xor(const std::string& type_name, const std::string& value_text, const std::string& key_text);
 
     // condition: a next_conditions() name. Values as typed (only the ones the condition needs).
     Outcome next_scan(const std::string& condition, const std::string& value1, const std::string& value2,
