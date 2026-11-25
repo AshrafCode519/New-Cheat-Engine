@@ -1,7 +1,9 @@
 #include "../../include/table/cheat_table.hpp"
+#include "../../include/debugger/disassembler.hpp"
 #include "../../include/hal/hotkeys.hpp"
 #include "../../include/scanner/scan_results.hpp"
 #include "../../include/utils/hex_utils.hpp"
+#include "../../include/utils/sig_generator.hpp"
 #include "../../include/utils/text_encoding.hpp"
 #include <nlohmann/json.hpp>
 #include <algorithm>
@@ -401,6 +403,18 @@ std::string to_json(const CheatTable& table) {
         if (e.frozen_value) item["freeze"] = *e.frozen_value;
         if (!e.group.empty()) item["group"] = e.group;
         if (!e.dropdown.empty()) item["dropdown"] = e.dropdown;
+        if (e.signature_anchor) {
+            const auto& sa = *e.signature_anchor;
+            item["signature_anchor"] = {
+                {"module", sa.module_name},
+                {"aob", sa.aob_pattern},
+                {"code_offset_hint", sa.code_offset_hint},
+                {"disp_offset", sa.disp_offset},
+                {"insn_length", sa.insn_length},
+                {"rip_relative", sa.is_rip_relative},
+                {"struct_offset", sa.struct_offset}
+            };
+        }
         if (!e.context.empty()) item["context"] = bytes_to_hex(e.context);
         if (!e.alternatives.empty()) {
             json alternatives = json::array();
@@ -515,6 +529,17 @@ std::optional<CheatTable> from_json(const std::string& text) {
                 if (v.is_string()) e.dropdown[k] = v.get<std::string>();
             }
         }
+        if (const auto sa_it = item.find("signature_anchor"); sa_it != item.end() && sa_it->is_object()) {
+            SignatureAnchor sa;
+            sa.module_name = sa_it->value("module", "");
+            sa.aob_pattern = sa_it->value("aob", "");
+            sa.code_offset_hint = sa_it->value("code_offset_hint", int64_t{0});
+            sa.disp_offset = sa_it->value("disp_offset", size_t{0});
+            sa.insn_length = sa_it->value("insn_length", size_t{0});
+            sa.is_rip_relative = sa_it->value("rip_relative", false);
+            sa.struct_offset = sa_it->value("struct_offset", int64_t{0});
+            if (!sa.aob_pattern.empty()) e.signature_anchor = std::move(sa);
+        }
 
         table.entries.push_back(std::move(e));
     }
@@ -553,6 +578,165 @@ std::optional<CheatTable> load_table(const std::string& path) {
     std::ostringstream ss;
     ss << in.rdbuf();
     return from_json(ss.str());
+}
+
+std::optional<SignatureAnchor> create_signature_anchor(
+    const hal::IProcess& process,
+    const std::vector<hal::ModuleInfo>& modules,
+    uintptr_t code_address,
+    int64_t struct_offset)
+{
+    if (!process.is_attached() || code_address == 0) return std::nullopt;
+    auto sig = utils::SignatureGenerator::generate(process, code_address, 64);
+    if (!sig || sig->pattern.empty()) return std::nullopt;
+
+    uint8_t insn_buf[16]{};
+    if (!process.read_raw(code_address, insn_buf, sizeof(insn_buf))) return std::nullopt;
+    const auto insn = debugger::Disassembler::decode(insn_buf, sizeof(insn_buf), code_address, process.pointer_size() == 8);
+
+    SignatureAnchor anchor;
+    anchor.aob_pattern = sig->pattern;
+    anchor.insn_length = insn.length;
+    anchor.struct_offset = struct_offset;
+
+    for (const auto& m : modules) {
+        if (code_address >= m.base_address && code_address < m.base_address + m.size) {
+            anchor.module_name = m.name;
+            anchor.code_offset_hint = static_cast<int64_t>(code_address - m.base_address);
+            break;
+        }
+    }
+
+    if (insn.operands.find("[rip") != std::string::npos && insn.branch_target != 0 && insn.bytes.size() >= 5) {
+        const size_t disp_off = insn.bytes.size() - 4;
+        int32_t disp = 0;
+        std::memcpy(&disp, insn.bytes.data() + disp_off, 4);
+        if (code_address + insn.length + static_cast<int64_t>(disp) == insn.branch_target) {
+            anchor.is_rip_relative = true;
+            anchor.disp_offset = disp_off;
+        }
+    }
+    return anchor;
+}
+
+SignatureMigrationReport migrate_table_by_signatures(
+    CheatTable& table,
+    const hal::IProcess& process,
+    const std::vector<hal::ModuleInfo>& modules)
+{
+    SignatureMigrationReport report;
+    if (!process.is_attached()) return report;
+
+    std::map<std::string, std::pair<const hal::ModuleInfo*, std::vector<uint8_t>>> mod_cache;
+    auto get_module_bytes = [&](const std::string& name) -> std::pair<const hal::ModuleInfo*, const std::vector<uint8_t>*> {
+        auto it = mod_cache.find(name);
+        if (it != mod_cache.end()) {
+            return {it->second.first, it->second.second.empty() ? nullptr : &it->second.second};
+        }
+        const hal::ModuleInfo* found = nullptr;
+        for (const auto& m : modules) {
+            if (m.name == name) { found = &m; break; }
+        }
+        std::vector<uint8_t> buf;
+        if (found && found->size > 0 && found->size <= 256u * 1024u * 1024u) {
+            buf.resize(found->size);
+            if (!process.read_raw(found->base_address, buf.data(), buf.size())) buf.clear();
+        }
+        auto [ins_it, _] = mod_cache.emplace(name, std::make_pair(found, std::move(buf)));
+        return {ins_it->second.first, ins_it->second.second.empty() ? nullptr : &ins_it->second.second};
+    };
+
+    for (size_t i = 0; i < table.entries.size(); ++i) {
+        auto& entry = table.entries[i];
+        if (!entry.signature_anchor) continue;
+        ++report.total_anchored;
+
+        const auto& sa = *entry.signature_anchor;
+        SignatureMigrationItem item;
+        item.index = i;
+        item.description = entry.description;
+
+        const auto pat = utils::parse_aob_pattern(sa.aob_pattern);
+        if (!pat || pat->bytes.empty()) {
+            ++report.failed;
+            item.note = "Invalid AOB pattern";
+            report.items.push_back(std::move(item));
+            continue;
+        }
+
+        const auto [mod, mod_bytes] = get_module_bytes(sa.module_name);
+        if (!mod || !mod_bytes || mod_bytes->size() < pat->bytes.size()) {
+            ++report.failed;
+            item.note = "Host module '" + sa.module_name + "' not loaded or unreadable";
+            report.items.push_back(std::move(item));
+            continue;
+        }
+
+        size_t hits = 0;
+        size_t match_off = 0;
+        const size_t limit = mod_bytes->size() - pat->bytes.size();
+        for (size_t off = 0; off <= limit; ++off) {
+            bool ok = true;
+            for (size_t j = 0; j < pat->bytes.size(); ++j) {
+                if (pat->mask[j] && (*mod_bytes)[off + j] != pat->bytes[j]) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) {
+                ++hits;
+                match_off = off;
+                if (hits > 1) break;
+            }
+        }
+
+        if (hits != 1) {
+            ++report.failed;
+            item.note = (hits == 0) ? "AOB pattern not found" : "AOB pattern matched multiple locations";
+            report.items.push_back(std::move(item));
+            continue;
+        }
+
+        const uintptr_t code_va = mod->base_address + match_off;
+        item.resolved_code_va = code_va;
+
+        if (sa.is_rip_relative && sa.insn_length >= 5 && match_off + sa.insn_length <= mod_bytes->size()) {
+            int32_t disp = 0;
+            std::memcpy(&disp, mod_bytes->data() + match_off + sa.disp_offset, 4);
+            const uintptr_t target_va = code_va + sa.insn_length + static_cast<int64_t>(disp);
+
+            scanner::PointerPath new_loc;
+            new_loc.base_offset = target_va;
+            for (const auto& tm : modules) {
+                if (target_va >= tm.base_address && target_va < tm.base_address + tm.size) {
+                    new_loc.module_name = tm.name;
+                    new_loc.base_offset = target_va - tm.base_address;
+                    break;
+                }
+            }
+
+            if (new_loc.module_name != entry.location.module_name ||
+                new_loc.base_offset != entry.location.base_offset ||
+                !entry.location.offsets.empty()) {
+                entry.location = std::move(new_loc);
+                item.updated = true;
+                ++report.updated;
+                item.note = "Relocated via RIP-relative signature -> " + utils::format_address(target_va);
+            } else {
+                item.note = "Signature verified at " + utils::format_address(code_va);
+            }
+            item.verified = true;
+            ++report.verified;
+        } else {
+            item.verified = true;
+            ++report.verified;
+            item.note = "Instruction signature verified at " + utils::format_address(code_va);
+        }
+
+        report.items.push_back(std::move(item));
+    }
+
+    return report;
 }
 
 } // namespace nce::table

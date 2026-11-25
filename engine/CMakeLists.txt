@@ -4,6 +4,7 @@ project(engine LANGUAGES CXX)
 add_library(engine STATIC
     src/hal/process_win32.cpp
     src/hal/process_linux.cpp
+    src/hal/remote_process.cpp
     src/hal/injector_win32.cpp
     src/hal/hotkeys.cpp
     src/hal/hotkeys_win32.cpp
@@ -41,6 +42,8 @@ add_library(engine STATIC
     src/debugger/condition_eval.cpp
     src/debugger/debug_coordinator.cpp
     src/debugger/step_debugger.cpp
+    src/debugger/decompiler.cpp
+    src/debugger/causality_timeline.cpp
     src/script/lua_engine.cpp
 )
 
@@ -57,7 +60,7 @@ target_include_directories(engine PRIVATE
 target_link_libraries(engine PUBLIC lua)
 
 if (WIN32)
-    target_link_libraries(engine PUBLIC psapi dbghelp)
+    target_link_libraries(engine PUBLIC psapi dbghelp ws2_32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(engine PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)

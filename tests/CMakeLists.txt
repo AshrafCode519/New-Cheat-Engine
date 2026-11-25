@@ -36,6 +36,9 @@ add_executable(engine_tests
     test_phase5_completeness.cpp
     test_phase6_ux_tools.cpp
     test_phase7_re_and_maps.cpp
+    test_v2_decompiler_causality.cpp
+    test_v2_remote.cpp
+    test_v2_self_healing_and_hybrid.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

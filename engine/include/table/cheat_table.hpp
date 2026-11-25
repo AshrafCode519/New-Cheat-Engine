@@ -26,6 +26,18 @@ struct Hotkey {
     [[nodiscard]] std::string to_string() const;
 };
 
+// Code-signature anchor capturing the instruction that accesses or references a table entry,
+// allowing automated table repair across game updates via AOB scanning.
+struct SignatureAnchor {
+    std::string module_name;
+    std::string aob_pattern;
+    int64_t code_offset_hint{0};
+    size_t disp_offset{0};
+    size_t insn_length{0};
+    bool is_rip_relative{false};
+    int64_t struct_offset{0};
+};
+
 // One remembered value. Its location is kept in a form that survives a restart of the target when
 // possible: a static address (module + offset) or a pointer path (module + offset + offsets).
 // Memory that belongs to no module is stored as an absolute address, valid only in the current run.
@@ -49,6 +61,7 @@ struct TableEntry {
     std::vector<Hotkey> hotkeys; // at most one per combo
     std::string group;           // optional folder / category header
     std::map<std::string, std::string> dropdown; // optional value -> label display list (e.g. "1" -> "Sword")
+    std::optional<SignatureAnchor> signature_anchor; // optional self-healing AOB anchor
 
     [[nodiscard]] bool is_absolute() const noexcept { return location.module_name.empty(); }
 
@@ -118,6 +131,36 @@ TableEntry make_entry(const scanner::PointerPath& path, scanner::DataType type, 
 // The entry's current value; nullopt if it can't be resolved or read
 std::optional<scanner::ScanValue> read_entry(const TableEntry& entry, const hal::IProcess& process,
                                              const std::vector<hal::ModuleInfo>& modules);
+
+struct SignatureMigrationItem {
+    size_t index{0};
+    std::string description;
+    bool updated{false};
+    bool verified{false};
+    uintptr_t resolved_code_va{0};
+    std::string note;
+};
+
+struct SignatureMigrationReport {
+    size_t total_anchored{0};
+    size_t updated{0};
+    size_t verified{0};
+    size_t failed{0};
+    std::vector<SignatureMigrationItem> items;
+};
+
+[[nodiscard]] std::optional<SignatureAnchor> create_signature_anchor(
+    const hal::IProcess& process,
+    const std::vector<hal::ModuleInfo>& modules,
+    uintptr_t code_address,
+    int64_t struct_offset = 0
+);
+
+SignatureMigrationReport migrate_table_by_signatures(
+    CheatTable& table,
+    const hal::IProcess& process,
+    const std::vector<hal::ModuleInfo>& modules
+);
 
 // Parses value_text for the entry's type and writes it. Text must fit the entry's length
 // (str / wstr); aob entries are read-only. False if parsing, resolving or writing fails.

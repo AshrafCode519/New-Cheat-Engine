@@ -44,6 +44,7 @@ public:
 
     ScriptResult execute_string(const std::string& code);
     ScriptResult execute_file(const std::string& filepath);
+    ScriptResult eval_expression(const std::string& expr);
 
     // Invoked when a software breakpoint hits. Exports RAX..R15/RIP/EFLAGS/THREADID, runs
     // global `debugger_onBreakpoint()` if defined, copies mutated registers back into `regs`,

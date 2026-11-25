@@ -17,6 +17,21 @@ std::string read_null_term_string(hal::IProcess& proc, uintptr_t address, size_t
 
 } // anonymous namespace
 
+bool PEAnalyzer::is_pe_magic(const hal::IProcess& proc, uintptr_t module_base) {
+    if (!proc.is_attached() || module_base == 0) return false;
+    uint8_t dos[64]{};
+    if (!proc.read_raw(module_base, dos, sizeof(dos))) return false;
+    uint16_t mz = 0;
+    std::memcpy(&mz, &dos[0], 2);
+    if (mz != 0x5A4D) return false;
+    int32_t lfanew = 0;
+    std::memcpy(&lfanew, &dos[0x3C], 4);
+    if (lfanew < 64 || lfanew > 0x1000) return false;
+    uint32_t nt_sig = 0;
+    if (!proc.read_raw(module_base + static_cast<uintptr_t>(lfanew), &nt_sig, 4)) return false;
+    return nt_sig == 0x00004550u;
+}
+
 std::optional<PEInfo> PEAnalyzer::analyze(hal::IProcess& proc, uintptr_t module_base) {
     if (!proc.is_attached() || module_base == 0) {
         return std::nullopt;

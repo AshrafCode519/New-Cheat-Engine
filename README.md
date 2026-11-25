@@ -3,7 +3,7 @@
 [![Build & Test](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-184%2B%20passed%20(17k%2B%20assertions)-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-191%20passed%20(17.8k%2B%20assertions)-brightgreen.svg)](tests/)
 
 > **⚠️ تنويه وإخلاء مسؤولية (Disclaimer):** هذا المشروع مخصّص لأغراض **التعليم، الهندسة العكسية، البحث الأمني، وتعديل الألعاب الفردية (Offline/Single-Player)** فقط.
 > Intended strictly for **educational reverse engineering, security research, and single-player/offline game analysis**.
@@ -11,9 +11,9 @@
 محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز و**SDL2 + OpenGL 3** على لينكس) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
 
 ### Quick Start (English Summary)
-- **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`nce_gui`, `memscan_cli`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
-- **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
-- **Linux (GCC / CMake):** `sudo apt install libsdl2-dev libgl-dev && cmake -B build && cmake --build build -j 4` -> outputs `nce_gui`, `memscan_cli`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer` + DWARF, `clock_gettime` speedhack).
+- **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_server.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`nce_gui`, `memscan_cli`, `nce_server`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
+- **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_server.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
+- **Linux (GCC / CMake):** `sudo apt install libsdl2-dev libgl-dev && cmake -B build && cmake --build build -j 4` -> outputs `nce_gui`, `memscan_cli`, `nce_server`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer` + DWARF, `clock_gettime` speedhack).
 - **Third-Party Libraries Included (`third_party/`):** Dear ImGui (MIT), Lua 5.4.7 (MIT), doctest (MIT), nlohmann/json (MIT).
 - **Contributing:** See [CONTRIBUTING.md](CONTRIBUTING.md) for local build instructions and cross-platform PR guidelines.
 
@@ -92,8 +92,14 @@
    * **دعم المنصات والمحاكي:**
      * طبقة Linux في `LinuxProcess` (`/proc/<pid>/maps`, `process_vm_readv/writev`, `ptrace` `mmap`/`munmap`)، وحاقن `.so` عبر `dlopen`، ومفاتيح اختصار X11 (`libX11.so.6`).
      * دعم القيم Big-Endian لألعاب محاكيات **Dolphin / RPCS3**.
-   * **طبقة الجلسة (Session):**
+   * **طبقة الجلسة (Session) وربط الأهداف البعيدة (`RemoteServer` / `nce_server`):**
      * كل اللي محتاجه هدف متصل في مكان واحد: العملية، الفحص الحالي مع الـ undo، خريطة الضوضاء، جدول الغش مع خيط التجميد (كل 100ms)، ومسارات المؤشرات.
+     * دعم العمل الشبكي عبر **`RemoteProcess`** وخادم **`nce_server`** (`NCE2` TCP Protocol مع رمز توثيق `--token`) لفحص وتعديل العمليات عن بُعد (Windows ↔ Linux / WSL / Steam Deck / LAN).
+   * **محرك v2.0 للتحليل المتقدم (Next-Gen RE Suite):**
+     * **المفكك العكسي (`PseudoCDecompiler`):** يحوّل رسوم التدفق (`CFG`) إلى كود **Pseudo-C** مقروء مع تعويض أسماء الدوال وأسماء حقول الهياكل تلقائياً (`rcx->health`) وكشف الحلقات والشرطيات.
+     * **الخط الزمني السببي (`CausalityTimeline`):** تسجيل متسلسل لنبضات التنفيذ وتغير السجلات والذاكرة مع إمكانية الرجوع والتقديم الزمني ومقارنة اللقطات (`Time-Travel Debugging`).
+     * **الجداول ذاتية الإصلاح (`SignatureAnchor`):** ربط عناصر الجدول ببصمة تعليمات AOB مع إزاحة `[rip + disp32]` لإعادة توجيه العناوين تلقائياً بعد تحديثات اللعبة (`migrate_table_by_signatures`).
+     * **محلل Proton / Wine الهجين (`inspect_hybrid_modules`):** فحص ثنائيات PE المعيّنة داخل عمليات Linux بجانب مكتبات ELF في عرض موحد.
      * الـ CLI والواجهة الاتنين واجهات عليها: منطق الفحص والـ attach وإعادة الاتصال والجدول مكتوب مرة واحدة وعليه اختبارات، والواجهات بتقرا الأوامر وتعرض النتايج بس.
 
 3. **`memscan_cli` (أداة سطر الأوامر التفاعلية):**
@@ -129,6 +135,15 @@
    * تفكيك object لـ C++ struct (`dissect <addr|#result|t#> [bytes]`، أو تاب Dissect في الواجهة مع أزرار Copy C++ / Copy JSON وفتح المؤشرات كشجرة متداخلة): بيطلّع اسم الكلاس من الـ RTTI، الـ vtable وعدد دوالها، وكل field بنوعه.
    * سكربتات Auto-Assembler وتوليدها تلقائياً (`aobscript` / زر `AA` في المفكك / دالة Lua `generateAOBScript`): بتتكتب بـ `[ENABLE]`/`[DISABLE]`، بتتحفظ مع الجدول، وبتشتغل وتتقفل أوتوماتيكياً مع `attach`/`detach`. **لألعاب أوفلاين بس — بتعدّل كود اللعبة.**
 
+4. **`nce_server` (خادم الأهداف البعيدة - Remote Target Daemon):**
+   * خادم TCP خفيف ببروتوكول `NCE2` الثنائي يتيح استكشاف وفحص وتعديل العمليات عن بُعد من `nce_gui` أو `memscan_cli`:
+   ```powershell
+   .\build\bin\nce_server.exe --host 0.0.0.0 --port 52736 --token mysecret
+   ```
+   * ثم الاتصال من الواجهة عبر زر **`Remote...`** أو من سطر الأوامر via `remote 192.168.1.10 52736 mysecret`.
+   * **أوامر CLI v2.0 الجديدة:** `remote`, `local`, `decompile`, `timeline`, `hybrid`, `tanchor`, `tmigrate`, `tlua`, `eval`.
+   * **نوافذ GUI v2.0 الجديدة:** وضع **Pseudo-C** و **Causality** داخل المفكك، شريط مناطق الذاكرة البصري `ImDrawList`، طرفية **Lua 5.4 REPL** وجدول **Live Watch Expressions** وبانر `<LuaScript>`، وأزرار **`Anchor AOB` / `Migrate Sigs` / `Scan Hybrid PE+ELF`**.
+
 ---
 
 ## 🚀 كيفية البناء والتشغيل
@@ -156,7 +171,7 @@ cmake --build build
 # أو عبر CTest:
 ctest --test-dir build --output-on-failure
 ```
-تغطي الاختبارات (`184+ test cases / 17,600+ assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process` و`LinuxProcess` (`ptrace` + `ELFAnalyzer` DWARF)، و`HookEngine`، و`Speedhack`، و`Lua 5.4`، و`Disassembler`/`X86Assembler` (`x64/x86/AVX/x87/X-Refs/Atomics/SSE2`)، و`ScanResults` (تفريغ القرص)، و`CETableFormat`، و`PointerMap`، و`EngineInspector` (`Unity / Unreal`). لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
+تغطي الاختبارات (`191 test cases / 17,807 assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process` و`LinuxProcess` (`ptrace` + `ELFAnalyzer` DWARF)، و`HookEngine`، و`Speedhack`، و`Lua 5.4`، و`Disassembler`/`X86Assembler` (`x64/x86/AVX/x87/X-Refs/Atomics/SSE2`)، و`ScanResults` (تفريغ القرص)، و`CETableFormat` (مع `SignatureAnchor`)، و`PointerMap`، و`EngineInspector` (`Unity / Unreal`)، بالإضافة لـ **`PseudoCDecompiler`** و**`CausalityTimeline`** و**`RemoteServer`/`RemoteProcess`** و**Hybrid PE+ELF**. لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
 
 ### التشغيل والاختبار:
 1. قم بتشغيل الهدف التجريبي:

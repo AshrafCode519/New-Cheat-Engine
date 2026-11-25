@@ -219,8 +219,16 @@ void TableKeeper::detach() {
     }
     m_active.clear();
     m_assembler.reset();
-    m_process->detach();
+    if (m_process) m_process->detach();
     m_modules.clear();
+}
+
+void TableKeeper::set_process(std::shared_ptr<hal::IProcess> process) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    m_active.clear();
+    m_assembler.reset();
+    m_modules.clear();
+    m_process = std::move(process);
 }
 
 std::vector<TableKeeper::ReconcileLine> TableKeeper::reconcile() {
@@ -919,6 +927,7 @@ void Session::detach() {
         m_elf_cache.clear();
     }
     m_ultimap.clear();
+    m_timeline.clear();
     m_noise.reset();
     if (m_lua) m_lua->set_session(this);
 }
@@ -1286,7 +1295,7 @@ std::string Session::resolve_symbol(uintptr_t address) const {
                         return ss.str();
                     }
                 }
-            } else {
+            } else if (debugger::PEAnalyzer::is_pe_magic(*m_process, mod.base_address)) {
                 auto it = m_pe_cache.find(mod.base_address);
                 if (it == m_pe_cache.end()) {
                     if (auto pe = debugger::PEAnalyzer::analyze(*m_process, mod.base_address)) {
@@ -1319,6 +1328,184 @@ void Session::annotate_disassembly(std::vector<debugger::DecodedInstruction>& in
             if (here.find('!') != std::string::npos) insn.resolved_symbol = here;
         }
     }
+}
+
+script::ScriptResult Session::eval_lua_expression(const std::string& expr) {
+    if (!m_lua) m_lua = std::make_unique<script::LuaEngine>(this);
+    m_lua->set_session(this);
+    return m_lua->eval_expression(expr);
+}
+
+Outcome Session::run_table_lua_script() {
+    std::string script_text;
+    if (m_table) script_text = m_table->lua_script();
+    if (script_text.empty()) return Outcome::fail("The loaded table has no embedded <LuaScript>.");
+    const auto res = run_lua(script_text);
+    if (!res.success) return Outcome::fail(res.error.empty() ? "Table Lua script failed." : res.error);
+    return Outcome::success(res.output.empty() ? "Executed table <LuaScript>." : res.output);
+}
+
+Outcome Session::connect_remote(const std::string& host, uint16_t port, const std::string& auth_token) {
+    auto remote = std::make_shared<hal::RemoteProcess>();
+    if (!remote->connect(host, port, auth_token)) {
+        const std::string err = remote->last_error();
+        return Outcome::fail(err.empty() ? "Could not connect to remote server." : err);
+    }
+    detach();
+    m_remote = remote;
+    m_process = remote;
+    if (m_table) m_table->set_process(remote);
+    std::string msg = "Connected to NCE2 remote " + host + ":" + std::to_string(port);
+    if (!remote->remote_os().empty()) {
+        msg += " (" + remote->remote_os() + ", " + std::to_string(remote->pointer_size() * 8) + "-bit)";
+    }
+    return Outcome::success(std::move(msg));
+}
+
+void Session::disconnect_remote() {
+    if (!m_remote) return;
+    detach();
+    m_remote->disconnect();
+    m_remote.reset();
+    auto local = hal::IProcess::create();
+    m_process = std::shared_ptr<hal::IProcess>(std::move(local));
+    if (m_table) m_table->set_process(m_process);
+}
+
+std::string Session::remote_endpoint() const {
+    if (!m_remote || !m_remote->is_connected()) return {};
+    return m_remote->host() + ":" + std::to_string(m_remote->port());
+}
+
+std::vector<hal::ProcessInfo> Session::list_processes() const {
+    if (m_remote && m_remote->is_connected()) {
+        return m_remote->list_remote_processes();
+    }
+    return hal::IProcess::list_processes();
+}
+
+debugger::DecompiledFunction Session::decompile_function(
+    uintptr_t entry_address, uintptr_t struct_address, size_t max_insns) const
+{
+    if (!attached() || entry_address == 0) return {};
+    const auto cfg = build_cfg(entry_address, max_insns, 48);
+    debugger::DecompileOptions opts;
+    if (struct_address != 0) {
+        view::StructureDissector dissector(m_process);
+        const auto layout = dissector.dissect(struct_address, 0x100, m_process->get_modules());
+        opts = debugger::DecompileOptions::from_struct(layout);
+    }
+    opts.symbol_resolver = [this](uintptr_t a) { return resolve_symbol(a); };
+#ifndef _WIN32
+    opts.sysv_abi = !is_proton_or_wine();
+#endif
+    return debugger::PseudoCDecompiler::decompile(cfg, opts);
+}
+
+size_t Session::capture_timeline_from_trace(uintptr_t watch_address, size_t watch_bytes_len) {
+    if (!m_debugger) return 0;
+    const auto entries = m_debugger->get_trace_log();
+    if (entries.empty()) return 0;
+    m_timeline.record_trace(entries, attached() ? m_process.get() : nullptr, watch_address, watch_bytes_len);
+    return entries.size();
+}
+
+size_t Session::capture_timeline_from_watch(uintptr_t watch_address, size_t watch_bytes_len) {
+    const auto hits = m_watcher.hits();
+    if (hits.empty()) return 0;
+    const uintptr_t addr = (watch_address != 0) ? watch_address : m_watcher.address();
+    m_timeline.record_hits(hits, attached() ? m_process.get() : nullptr, addr, watch_bytes_len);
+    return hits.size();
+}
+
+std::vector<Session::HybridModuleInfo> Session::inspect_hybrid_modules() const {
+    std::vector<HybridModuleInfo> out;
+    if (!attached()) return out;
+    const auto mods = m_process->get_modules();
+    out.reserve(mods.size());
+    for (const auto& mod : mods) {
+        HybridModuleInfo info;
+        info.name = mod.name;
+        info.path = mod.path;
+        info.base_address = mod.base_address;
+        info.size = mod.size;
+        info.format = "Unknown";
+
+        std::lock_guard<std::mutex> lock(m_sym_mutex);
+        if (debugger::ELFAnalyzer::is_elf_magic(*m_process, mod.base_address)) {
+            info.format = "ELF";
+            auto it = m_elf_cache.find(mod.base_address);
+            if (it == m_elf_cache.end()) {
+                if (auto elf = debugger::ELFAnalyzer::analyze(*m_process, mod.base_address)) {
+                    it = m_elf_cache.emplace(mod.base_address, std::move(*elf)).first;
+                } else {
+                    it = m_elf_cache.emplace(mod.base_address, debugger::ELFInfo{}).first;
+                }
+            }
+            if (it->second.is_valid) {
+                info.is_64bit = it->second.is_64bit;
+                info.export_or_symbol_count = it->second.symbols.size();
+                info.has_dwarf = it->second.has_dwarf;
+            }
+        } else if (debugger::PEAnalyzer::is_pe_magic(*m_process, mod.base_address)) {
+            info.format = "PE";
+            auto it = m_pe_cache.find(mod.base_address);
+            if (it == m_pe_cache.end()) {
+                if (auto pe = debugger::PEAnalyzer::analyze(*m_process, mod.base_address)) {
+                    it = m_pe_cache.emplace(mod.base_address, std::move(*pe)).first;
+                } else {
+                    it = m_pe_cache.emplace(mod.base_address, debugger::PEInfo{}).first;
+                }
+            }
+            if (it->second.is_valid) {
+                info.is_64bit = it->second.is_64bit;
+                info.export_or_symbol_count = it->second.exports.size();
+            }
+        }
+        out.push_back(std::move(info));
+    }
+    return out;
+}
+
+bool Session::is_proton_or_wine() const {
+    if (!attached()) return false;
+    bool has_pe = false;
+    bool has_elf = false;
+    for (const auto& mod : m_process->get_modules()) {
+        std::string ln = mod.name;
+        for (char& c : ln) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        if (ln.find("wine") != std::string::npos || ln.find("proton") != std::string::npos ||
+            ln.ends_with(".exe") || ln.ends_with(".dll")) {
+            if (debugger::PEAnalyzer::is_pe_magic(*m_process, mod.base_address)) has_pe = true;
+        }
+        if (ln.ends_with(".so") || debugger::ELFAnalyzer::is_elf_magic(*m_process, mod.base_address)) {
+            has_elf = true;
+        }
+        if (has_pe && has_elf) return true;
+    }
+    return false;
+}
+
+Outcome Session::anchor_entry_signature(size_t index, uintptr_t code_address, int64_t struct_offset) {
+    if (!attached()) return Outcome::fail("Not attached to any process.");
+    return m_table->with([&](table::CheatTable& t, const std::vector<hal::ModuleInfo>& mods) -> Outcome {
+        if (index >= t.entries.size()) {
+            return Outcome::fail("No table entry #" + std::to_string(index) + ".");
+        }
+        auto anchor = table::create_signature_anchor(*m_process, mods, code_address, struct_offset);
+        if (!anchor) return Outcome::fail("Could not generate unique code signature at " + utils::format_address(code_address));
+        const std::string pat = anchor->aob_pattern;
+        const bool is_rip = anchor->is_rip_relative;
+        t.entries[index].signature_anchor = std::move(*anchor);
+        return Outcome::success("Anchored #" + std::to_string(index) + (is_rip ? " [RIP-rel AOB]: " : " [AOB]: ") + pat);
+    });
+}
+
+table::SignatureMigrationReport Session::migrate_table_signatures() {
+    if (!attached()) return {};
+    return m_table->with([&](table::CheatTable& t, const std::vector<hal::ModuleInfo>& mods) {
+        return table::migrate_table_by_signatures(t, *m_process, mods);
+    });
 }
 
 } // namespace nce::session

@@ -189,7 +189,17 @@ void print_help() {
               << "                                    script file with [ENABLE]/[DISABLE]; 'on'/'off' apply and undo it\n"
               << "  freeze <addr> <type> <val>      - Add an address to the table, frozen at a value\n"
               << "  frozen                          - List the frozen table entries\n"
-              << "  unfreeze [#|all]                - Stop freezing a table entry (default: all)\n\n"
+              << "  unfreeze [#|all]                - Stop freezing a table entry (default: all)\n"
+              << "  tanchor <#> <code_addr> [off]   - Anchor table entry to an AOB code signature\n"
+              << "  tmigrate                        - Auto-repair anchored entries after target update\n"
+              << "  tlua                            - Run loaded table's embedded <LuaScript>\n\n"
+              << "v2.0 Next-Gen Commands:\n"
+              << "  remote <host> [port] [token]    - Connect to a remote nce_server host (default port 27055)\n"
+              << "  local                           - Disconnect remote server and switch back to local host\n"
+              << "  decompile <addr> [struct_addr]  - Lift function CFG to Pseudo-C (with optional struct types)\n"
+              << "  timeline [trace|watch|back|next|mut|clear] - Execution causality & memory delta scrubber\n"
+              << "  hybrid                          - Show hybrid PE + ELF module summary (Proton/Wine/native)\n"
+              << "  eval <lua_expr>                 - Evaluate Lua 5.4 expression (REPL)\n\n"
               << "  help                            - Show this help menu\n"
               << "  quit                            - Exit CLI\n\n";
 }
@@ -271,7 +281,7 @@ std::optional<size_t> parse_table_index(const std::string& text) {
 }
 
 void cmd_ps(const std::string& filter) {
-    auto procs = hal::IProcess::list_processes();
+    auto procs = ses().list_processes();
     std::string lower_filter = filter;
     std::transform(lower_filter.begin(), lower_filter.end(), lower_filter.begin(), ::tolower);
 
@@ -3060,6 +3070,111 @@ bool handle_command(const std::string& line) {
                           << " tramp=" << utils::format_address(list[i].trampoline_address)
                           << " stolen=" << list[i].stolen_bytes_count << "\n";
             }
+        }
+    } else if (cmd == "remote") {
+        std::string host;
+        uint16_t port = 27055;
+        std::string token;
+        if (!(iss >> host)) {
+            std::cout << "Usage: remote <host> [port=27055] [token]\n";
+        } else {
+            if (iss >> port) {
+                std::getline(iss >> std::ws, token);
+            }
+            report(ses().connect_remote(host, port, token));
+        }
+    } else if (cmd == "local") {
+        ses().disconnect_remote();
+        std::cout << "[+] Switched back to local process host.\n";
+    } else if (cmd == "decompile") {
+        if (!require_attached()) return true;
+        std::string addr_str, struct_str;
+        if (!(iss >> addr_str)) {
+            std::cout << "Usage: decompile <func_addr> [struct_addr]\n";
+        } else if (auto fn_addr = parse_address_arg(addr_str)) {
+            uintptr_t st_addr = 0;
+            if (iss >> struct_str) {
+                if (auto sa = parse_address_arg(struct_str)) st_addr = *sa;
+            }
+            const auto dec = ses().decompile_function(*fn_addr, st_addr);
+            std::cout << "\n" << dec.code << "\n";
+        }
+    } else if (cmd == "timeline") {
+        std::string sub;
+        iss >> sub;
+        if (sub == "trace") {
+            std::string w_str;
+            uintptr_t w_addr = 0;
+            if (iss >> w_str) { if (auto a = parse_address_arg(w_str)) w_addr = *a; }
+            const size_t n = ses().capture_timeline_from_trace(w_addr);
+            std::cout << "[+] Captured " << n << " trace event(s) into causality timeline.\n";
+        } else if (sub == "watch") {
+            const size_t n = ses().capture_timeline_from_watch();
+            std::cout << "[+] Captured " << n << " access hit(s) into causality timeline.\n";
+        } else if (sub == "back") {
+            if (ses().timeline().step_backward()) {
+                if (auto ev = ses().timeline().current()) std::cout << ev->summary << "\n";
+            } else std::cout << "[-] At earliest event.\n";
+        } else if (sub == "next") {
+            if (ses().timeline().step_forward()) {
+                if (auto ev = ses().timeline().current()) std::cout << ev->summary << "\n";
+            } else std::cout << "[-] At latest event.\n";
+        } else if (sub == "mut") {
+            const auto muts = ses().timeline().find_memory_mutations();
+            std::cout << "[*] Memory mutation frame indices (" << muts.size() << "):";
+            for (size_t idx : muts) std::cout << " #" << idx;
+            std::cout << "\n";
+        } else if (sub == "clear") {
+            ses().timeline().clear();
+            std::cout << "[+] Timeline cleared.\n";
+        } else {
+            std::cout << ses().timeline().format_report(0, 40);
+        }
+    } else if (cmd == "hybrid") {
+        if (!require_attached()) return true;
+        const auto mods = ses().inspect_hybrid_modules();
+        std::cout << "[*] Hybrid mode: " << (ses().is_proton_or_wine() ? "Proton/Wine (PE+ELF)" : "Native")
+                  << " (" << mods.size() << " modules)\n";
+        for (const auto& m : mods) {
+            std::cout << "  " << std::left << std::setw(28) << m.name
+                      << " [" << std::setw(7) << m.format << "] "
+                      << utils::format_address(m.base_address)
+                      << " syms=" << m.export_or_symbol_count
+                      << (m.has_dwarf ? " [DWARF]" : "") << "\n";
+        }
+    } else if (cmd == "tanchor") {
+        if (!require_attached()) return true;
+        std::string idx_str, code_str;
+        int64_t off = 0;
+        if (!(iss >> idx_str >> code_str)) {
+            std::cout << "Usage: tanchor <entry_index> <code_addr> [struct_offset]\n";
+        } else if (auto idx = parse_table_index(idx_str)) {
+            if (auto code_addr = parse_address_arg(code_str)) {
+                (void)(iss >> off);
+                report(ses().anchor_entry_signature(*idx, *code_addr, off));
+            }
+        }
+    } else if (cmd == "tmigrate") {
+        if (!require_attached()) return true;
+        const auto rep = ses().migrate_table_signatures();
+        std::cout << "[*] Signature migration: anchored=" << rep.total_anchored
+                  << " updated=" << rep.updated
+                  << " verified=" << rep.verified
+                  << " failed=" << rep.failed << "\n";
+        for (const auto& item : rep.items) {
+            std::cout << "  [" << item.index << "] " << item.description << ": " << item.note << "\n";
+        }
+    } else if (cmd == "tlua") {
+        report(ses().run_table_lua_script());
+    } else if (cmd == "eval") {
+        std::string expr;
+        std::getline(iss >> std::ws, expr);
+        if (expr.empty()) {
+            std::cout << "Usage: eval <lua_expression>\n";
+        } else {
+            const auto res = ses().eval_lua_expression(expr);
+            if (!res.output.empty()) std::cout << res.output << "\n";
+            if (!res.success) std::cout << "[-] Lua Eval Error: " << res.error << "\n";
         }
     } else {
         std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";

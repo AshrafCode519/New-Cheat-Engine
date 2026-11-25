@@ -417,9 +417,34 @@ struct App {
     bool hook_detour_mode = false;
     std::string hook_note;
 
-    // Lua Scripting Studio
+    // Lua Scripting Studio + REPL + Live Watches
     std::string lua_script = "-- New Cheat Engine Lua Script\nprint('Hello from Lua 5.4!')\n";
-    std::string lua_console_output = "[*] Lua 5.4 ready. Type code and click 'Run Script'.\n";
+    std::string lua_console_output = "[*] Lua 5.4 ready. Type code or use the REPL bar below.\n";
+    std::string lua_repl_input;
+    struct LuaWatchItem {
+        std::string expr;
+        std::string value;
+        bool ok{true};
+    };
+    std::string lua_watch_expr_input;
+    std::vector<LuaWatchItem> lua_watches;
+    std::chrono::steady_clock::time_point next_lua_watch_eval{};
+
+    // Remote Target Host (nce_server)
+    std::string remote_host = "127.0.0.1";
+    int remote_port = 27055;
+    std::string remote_token;
+
+    // Pseudo-C Decompiler & Causality Timeline
+    std::string decomp_struct_addr;
+    std::optional<debugger::DecompiledFunction> decomp_result;
+    std::string timeline_watch_addr;
+
+    // Hybrid PE + ELF cache & Self-Healing Table anchor prompt
+    std::vector<session::Session::HybridModuleInfo> hybrid_modules;
+    int anchor_row = -1;
+    std::string anchor_code_addr;
+    int anchor_struct_offset = 0;
 };
 
 scanner::DataType type_at(int index) {
@@ -487,7 +512,7 @@ void poll_job(App& app) {
 // ---- Actions -------------------------------------------------------------------------------------
 
 void refresh_processes(App& app) {
-    app.processes = hal::IProcess::list_processes();
+    app.processes = app.session.list_processes();
     std::sort(app.processes.begin(), app.processes.end(), [](const hal::ProcessInfo& a, const hal::ProcessInfo& b) {
         const size_t n = std::min(a.name.size(), b.name.size());
         for (size_t i = 0; i < n; ++i) {
@@ -813,6 +838,35 @@ void draw_process_bar(App& app) {
 
     ImGui::SameLine();
     ImGui::Checkbox("Auto re-attach", &app.auto_reattach);
+    ImGui::SameLine();
+    if (app.session.is_remote()) {
+        if (ImGui::SmallButton("Disconnect Remote")) {
+            app.session.disconnect_remote();
+            refresh_processes(app);
+            app.status = "Disconnected remote host; back on local processes.";
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.35f, 0.90f, 1.0f, 1.0f), "[REMOTE %s]", app.session.remote_endpoint().c_str());
+    } else {
+        if (ImGui::SmallButton("Remote...")) ImGui::OpenPopup("RemoteHostPopup");
+        if (ImGui::BeginPopup("RemoteHostPopup")) {
+            ImGui::TextUnformatted("Connect to nce_server (TCP):");
+            ImGui::SetNextItemWidth(em(12));
+            ImGui::InputText("Host", &app.remote_host);
+            ImGui::SetNextItemWidth(em(7));
+            ImGui::InputInt("Port", &app.remote_port);
+            ImGui::SetNextItemWidth(em(12));
+            ImGui::InputTextWithHint("Token", "optional auth secret", &app.remote_token);
+            if (ImGui::Button("Connect")) {
+                const uint16_t port = static_cast<uint16_t>(std::clamp(app.remote_port, 1, 65535));
+                const auto res = app.session.connect_remote(app.remote_host, port, app.remote_token);
+                show(app, res);
+                if (res.ok) refresh_processes(app);
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+    }
     ImGui::SameLine();
     if (is_attached(app)) ImGui::Text("Attached: %s", app.attached_label.c_str());
     else if (app.session.exited()) ImGui::TextColored(ImVec4(1.0f, 0.75f, 0.3f, 1.0f), "%s exited", app.session.process().name().c_str());
@@ -1143,6 +1197,53 @@ void draw_cheat_table(App& app) {
     ImGui::SameLine();
     if (ImGui::Button("Export Trainer")) {
         ImGui::OpenPopup("ExportTrainerPopup");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!is_attached(app));
+    if (ImGui::Button("Migrate Sigs")) {
+        const auto rep = app.session.migrate_table_signatures();
+        app.status = "Signature migration: anchored=" + std::to_string(rep.total_anchored) +
+                     " updated=" + std::to_string(rep.updated) +
+                     " verified=" + std::to_string(rep.verified) +
+                     " failed=" + std::to_string(rep.failed);
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+        ImGui::SetTooltip("Scan modules for AOB signature anchors and auto-repair shifted addresses after a patch.");
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Anchor AOB")) {
+        app.anchor_row = 0;
+        ImGui::OpenPopup("AnchorSigPopup");
+    }
+    ImGui::EndDisabled();
+    if (ImGui::BeginPopup("AnchorSigPopup")) {
+        ImGui::TextUnformatted("Bind entry to a code instruction AOB signature:");
+        ImGui::InputInt("Entry #", &app.anchor_row);
+        ImGui::InputTextWithHint("Code Addr", "0x... or module+offset", &app.anchor_code_addr);
+        ImGui::InputInt("Struct Offset", &app.anchor_struct_offset);
+        if (ImGui::Button("Create Anchor")) {
+            const uintptr_t ca = utils::parse_address(app.anchor_code_addr);
+            if (app.anchor_row >= 0 && ca != 0) {
+                show(app, app.session.anchor_entry_signature(
+                    static_cast<size_t>(app.anchor_row), ca, app.anchor_struct_offset));
+                ImGui::CloseCurrentPopup();
+            } else {
+                app.status = "Provide a valid entry index and instruction address.";
+            }
+        }
+        ImGui::EndPopup();
+    }
+    if (const std::string tbl_lua = keeper.lua_script(); !tbl_lua.empty()) {
+        ImGui::TextColored(ImVec4(1.0f, 0.85f, 0.35f, 1.0f), "Table carries <LuaScript> (%zu B).", tbl_lua.size());
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Run Table Lua")) {
+            show(app, app.session.run_table_lua_script());
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Inspect in Lua Studio")) {
+            app.lua_script = tbl_lua;
+            app.select_tab = Tab::LuaScript;
+        }
     }
     if (ImGui::BeginPopup("ExportTrainerPopup")) {
         ImGui::Text("Choose Trainer Target:");
@@ -3019,6 +3120,15 @@ void draw_disasm(App& app) {
             app.disasm_view_mode = 1;
         }
     }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Decompile")) {
+        const uintptr_t entry = utils::parse_address(app.disasm_input);
+        if (entry) {
+            const uintptr_t st = utils::parse_address(app.decomp_struct_addr);
+            app.decomp_result = app.session.decompile_function(entry, st, 256);
+            app.disasm_view_mode = 3;
+        }
+    }
     ImGui::EndDisabled();
 
     ImGui::SameLine();
@@ -3029,6 +3139,99 @@ void draw_disasm(App& app) {
     if (ImGui::RadioButton("CFG Graph", app.disasm_view_mode == 1)) app.disasm_view_mode = 1;
     ImGui::SameLine();
     if (ImGui::RadioButton("Ultimap", app.disasm_view_mode == 2)) app.disasm_view_mode = 2;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Pseudo-C", app.disasm_view_mode == 3)) app.disasm_view_mode = 3;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("Causality", app.disasm_view_mode == 4)) app.disasm_view_mode = 4;
+
+    if (app.disasm_view_mode == 3) {
+        ImGui::SeparatorText("Pseudo-C Decompiler (CFG -> Structured C + Struct Fields)");
+        ImGui::SetNextItemWidth(em(14));
+        ImGui::InputTextWithHint("##decomp_struct", "Optional Struct Ptr (0x...)", &app.decomp_struct_addr);
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!attached);
+        if (ImGui::Button("Refresh Decompile")) {
+            const uintptr_t entry = utils::parse_address(app.disasm_input);
+            if (entry) {
+                app.decomp_result = app.session.decompile_function(entry, utils::parse_address(app.decomp_struct_addr), 256);
+            }
+        }
+        ImGui::EndDisabled();
+        if (app.decomp_result) {
+            ImGui::SameLine();
+            if (ImGui::Button("Copy Pseudo-C")) ImGui::SetClipboardText(app.decomp_result->code.c_str());
+            ImGui::BeginChild("decomp_code_box", ImVec2(-1.0f, em(24)), true, ImGuiWindowFlags_HorizontalScrollbar);
+            ImGui::TextUnformatted(app.decomp_result->code.c_str());
+            ImGui::EndChild();
+        } else {
+            ImGui::TextDisabled("Enter a function address and click Decompile to lift assembly into Pseudo-C.");
+        }
+        return;
+    }
+
+    if (app.disasm_view_mode == 4) {
+        ImGui::SeparatorText("Execution Causality & Time-Travel Timeline");
+        ImGui::SetNextItemWidth(em(12));
+        ImGui::InputTextWithHint("##tl_watch", "Watch Mem Addr (0x...)", &app.timeline_watch_addr);
+        ImGui::SameLine();
+        if (ImGui::Button("Capture Trace")) {
+            const size_t n = app.session.capture_timeline_from_trace(utils::parse_address(app.timeline_watch_addr));
+            app.disasm_note = "Captured " + std::to_string(n) + " debugger trace events into timeline.";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Capture Watch Hits")) {
+            const size_t n = app.session.capture_timeline_from_watch(utils::parse_address(app.timeline_watch_addr));
+            app.disasm_note = "Captured " + std::to_string(n) + " AccessWatcher hits into timeline.";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("< Back")) app.session.timeline().step_backward();
+        ImGui::SameLine();
+        if (ImGui::Button("Next >")) app.session.timeline().step_forward();
+        ImGui::SameLine();
+        if (ImGui::Button("Clear##tl")) app.session.timeline().clear();
+
+        auto& tl = app.session.timeline();
+        if (tl.empty()) {
+            ImGui::TextDisabled("Timeline is empty. Capture debugger tracepoints or AccessWatcher hits.");
+        } else {
+            int cur_idx = static_cast<int>(tl.cursor());
+            const int max_idx = static_cast<int>(tl.count() - 1);
+            ImGui::SetNextItemWidth(-FLT_MIN);
+            if (ImGui::SliderInt("##tl_scrub", &cur_idx, 0, max_idx, "Event %d")) {
+                tl.seek(static_cast<size_t>(cur_idx));
+            }
+            if (auto ev = tl.current()) {
+                ImGui::TextColored(ImVec4(0.4f, 0.9f, 1.0f, 1.0f), "%s", ev->summary.c_str());
+                ImGui::Text("RAX=0x%llX  RBX=0x%llX  RCX=0x%llX  RDX=0x%llX  RSI=0x%llX  RDI=0x%llX",
+                            static_cast<unsigned long long>(ev->registers.rax),
+                            static_cast<unsigned long long>(ev->registers.rbx),
+                            static_cast<unsigned long long>(ev->registers.rcx),
+                            static_cast<unsigned long long>(ev->registers.rdx),
+                            static_cast<unsigned long long>(ev->registers.rsi),
+                            static_cast<unsigned long long>(ev->registers.rdi));
+                if (!ev->reg_deltas.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "Register Deltas vs previous step:");
+                    for (const auto& rd : ev->reg_deltas) {
+                        ImGui::BulletText("%s: 0x%llX -> 0x%llX", rd.name.c_str(),
+                                          static_cast<unsigned long long>(rd.before),
+                                          static_cast<unsigned long long>(rd.after));
+                    }
+                }
+                if (!ev->memory_deltas.empty()) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "Watched Memory Mutations:");
+                    for (const auto& md : ev->memory_deltas) {
+                        ImGui::BulletText("%s: 0x%02X -> 0x%02X", utils::format_address(md.address).c_str(),
+                                          static_cast<unsigned>(md.before), static_cast<unsigned>(md.after));
+                    }
+                }
+            }
+            const auto report = tl.format_report(0, 128);
+            ImGui::BeginChild("tl_list", ImVec2(-1.0f, em(12)), true);
+            ImGui::TextUnformatted(report.c_str());
+            ImGui::EndChild();
+        }
+        return;
+    }
 
     if (app.disasm_view_mode == 2) {
         ImGui::SeparatorText("Ultimap Execution Frequency Profiler");
@@ -4138,9 +4341,47 @@ void draw_pe_tools(App& app) {
         }
     }
 
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!attached);
+    if (ImGui::Button("Scan Hybrid PE+ELF")) {
+        app.hybrid_modules = app.session.inspect_hybrid_modules();
+        app.pe_status = std::string(app.session.is_proton_or_wine() ? "Proton/Wine hybrid mode: " : "Hybrid scan: ") +
+                        std::to_string(app.hybrid_modules.size()) + " modules inspected.";
+    }
+    ImGui::EndDisabled();
+
     if (!app.pe_status.empty()) {
         ImGui::Spacing();
         ImGui::TextColored(ImVec4(0.4f, 0.8f, 1.0f, 1.0f), "[*] %s", app.pe_status.c_str());
+    }
+
+    if (!app.hybrid_modules.empty()) {
+        if (ImGui::BeginTable("hybrid_mods", 5, ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter,
+                              ImVec2(0, em(8)))) {
+            ImGui::TableSetupScrollFreeze(0, 1);
+            ImGui::TableSetupColumn("Module", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Format", ImGuiTableColumnFlags_WidthFixed, em(5));
+            ImGui::TableSetupColumn("Base", ImGuiTableColumnFlags_WidthFixed, em(10));
+            ImGui::TableSetupColumn("Syms", ImGuiTableColumnFlags_WidthFixed, em(5));
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(5));
+            ImGui::TableHeadersRow();
+            for (size_t hi = 0; hi < app.hybrid_modules.size(); ++hi) {
+                const auto& hm = app.hybrid_modules[hi];
+                ImGui::TableNextRow();
+                ImGui::PushID(static_cast<int>(90000 + hi));
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(hm.name.c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%s%s", hm.format.c_str(), hm.has_dwarf ? "+DWARF" : "");
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(utils::format_address(hm.base_address).c_str());
+                ImGui::TableNextColumn(); ImGui::Text("%zu", hm.export_or_symbol_count);
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("Inspect")) {
+                    app.pe_module_input = hm.name;
+                    analyze_selected_binary(hm.name);
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
     }
 
     ImGui::Separator();
@@ -4506,6 +4747,39 @@ void draw_memory_map(App& app) {
     std::string flt = app.mem_map_filter;
     for (char& ch : flt) ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
 
+    // Compact visual allocation map bar across committed memory regions
+    {
+        const auto visual_regs = app.session.process().query_regions();
+        if (!visual_regs.empty()) {
+            const float bar_w = std::max(120.0f, ImGui::GetContentRegionAvail().x);
+            const float bar_h = em(1.4f);
+            const ImVec2 p0 = ImGui::GetCursorScreenPos();
+            ImDrawList* dl = ImGui::GetWindowDrawList();
+            dl->AddRectFilled(p0, ImVec2(p0.x + bar_w, p0.y + bar_h), IM_COL32(28, 28, 34, 255));
+            const size_t shown = std::min<size_t>(visual_regs.size(), 160);
+            const float slice = bar_w / static_cast<float>(shown);
+            for (size_t ri = 0; ri < shown; ++ri) {
+                const auto& r = visual_regs[ri];
+                ImU32 col = IM_COL32(110, 110, 125, 255);
+                if (r.is_executable && r.is_writable) col = IM_COL32(230, 75, 75, 255);
+                else if (r.is_executable) col = IM_COL32(75, 200, 110, 255);
+                else if (r.is_writable) col = IM_COL32(80, 150, 235, 255);
+                else if (r.is_guard) col = IM_COL32(235, 195, 65, 255);
+                const float x1 = p0.x + static_cast<float>(ri) * slice;
+                dl->AddRectFilled(ImVec2(x1, p0.y + 1), ImVec2(std::max(x1 + 1.0f, x1 + slice), p0.y + bar_h - 1), col);
+            }
+            dl->AddRect(p0, ImVec2(p0.x + bar_w, p0.y + bar_h), IM_COL32(85, 85, 100, 255));
+            ImGui::InvisibleButton("##memmap_vis", ImVec2(bar_w, bar_h));
+            if (ImGui::IsItemHovered()) {
+                const float rel = std::clamp((ImGui::GetIO().MousePos.x - p0.x) / bar_w, 0.0f, 0.9999f);
+                const auto& r = visual_regs[static_cast<size_t>(rel * static_cast<float>(shown))];
+                ImGui::SetTooltip("%s (%s) %s%s%s", utils::format_address(r.base_address).c_str(),
+                                  session::format_size(r.size).c_str(),
+                                  r.is_readable ? "R" : "", r.is_writable ? "W" : "", r.is_executable ? "X" : "");
+            }
+        }
+    }
+
     if (ImGui::BeginTabBar("memmap_subtabs")) {
         if (ImGui::BeginTabItem("Loaded Modules")) {
             const auto mods = app.session.process().get_modules();
@@ -4689,11 +4963,65 @@ void draw_lua_studio(App& app) {
 
     ImGui::Spacing();
     ImGui::Text("Lua Script Source:");
-    ImGui::InputTextMultiline("##lua_code", &app.lua_script, ImVec2(-1.0f, em(12)), ImGuiInputTextFlags_AllowTabInput);
+    ImGui::InputTextMultiline("##lua_code", &app.lua_script, ImVec2(-1.0f, em(9)), ImGuiInputTextFlags_AllowTabInput);
+
+    // Interactive REPL + Live Watch Expressions
+    ImGui::SetNextItemWidth(-em(7));
+    const bool repl_submit = ImGui::InputTextWithHint(
+        "##lua_repl", "Lua REPL > e.g. readInteger(0x...) or 10 + 20", &app.lua_repl_input,
+        ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if ((repl_submit || ImGui::Button("Eval##lua")) && !app.lua_repl_input.empty()) {
+        app.lua_console_output += "> " + app.lua_repl_input + "\n";
+        const auto res = app.session.eval_lua_expression(app.lua_repl_input);
+        if (!res.output.empty()) app.lua_console_output += res.output + "\n";
+        if (!res.success) app.lua_console_output += "[-] " + res.error + "\n";
+        app.lua_repl_input.clear();
+    }
+
+    ImGui::SetNextItemWidth(-em(7));
+    ImGui::InputTextWithHint("##lua_watch_in", "Live Lua watch expr (e.g. readFloat('game.exe+0x100'))", &app.lua_watch_expr_input);
+    ImGui::SameLine();
+    if (ImGui::Button("Watch##lua") && !app.lua_watch_expr_input.empty()) {
+        app.lua_watches.push_back({app.lua_watch_expr_input, "", true});
+        app.lua_watch_expr_input.clear();
+    }
+
+    if (!app.lua_watches.empty()) {
+        const auto now = std::chrono::steady_clock::now();
+        if (now >= app.next_lua_watch_eval) {
+            app.next_lua_watch_eval = now + std::chrono::milliseconds(250);
+            for (auto& w : app.lua_watches) {
+                const auto r = app.session.eval_lua_expression(w.expr);
+                w.ok = r.success;
+                w.value = r.success ? r.output : r.error;
+            }
+        }
+        if (ImGui::BeginTable("lua_watches_tbl", 3, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter, ImVec2(0, em(4.5f)))) {
+            ImGui::TableSetupColumn("Expression", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, em(14));
+            ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, em(3));
+            ImGui::TableHeadersRow();
+            int erase_idx = -1;
+            for (size_t wi = 0; wi < app.lua_watches.size(); ++wi) {
+                ImGui::TableNextRow();
+                ImGui::PushID(static_cast<int>(95000 + wi));
+                ImGui::TableNextColumn(); ImGui::TextUnformatted(app.lua_watches[wi].expr.c_str());
+                ImGui::TableNextColumn();
+                if (!app.lua_watches[wi].ok) ImGui::TextColored(ImVec4(1.0f, 0.45f, 0.45f, 1.0f), "%s", app.lua_watches[wi].value.c_str());
+                else ImGui::TextUnformatted(app.lua_watches[wi].value.c_str());
+                ImGui::TableNextColumn();
+                if (ImGui::SmallButton("X")) erase_idx = static_cast<int>(wi);
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+            if (erase_idx >= 0) app.lua_watches.erase(app.lua_watches.begin() + erase_idx);
+        }
+    }
 
     ImGui::Spacing();
     ImGui::Text("Script Console Output:");
-    ImGui::BeginChild("lua_output", ImVec2(-1.0f, em(10)), true, ImGuiWindowFlags_HorizontalScrollbar);
+    ImGui::BeginChild("lua_output", ImVec2(-1.0f, em(7)), true, ImGuiWindowFlags_HorizontalScrollbar);
     ImGui::TextUnformatted(app.lua_console_output.c_str());
     if (ImGui::GetScrollY() >= ImGui::GetScrollMaxY()) {
         ImGui::SetScrollHereY(1.0f);
@@ -4744,6 +5072,8 @@ void draw_ui(App& app) {
                 {"Disassembler & Debugger", "disasm asm step bp trace", Tab::Disasm, 0},
                 {"Interactive CFG Graph (Pan & Zoom)", "cfg graph blocks branch pan zoom", Tab::Disasm, 1},
                 {"Ultimap Profiler", "ultimap rank function hits", Tab::Disasm, 2},
+                {"Pseudo-C Decompiler", "decompile pseudo c struct", Tab::Disasm, 3},
+                {"Execution Causality Timeline", "timeline time travel trace diff", Tab::Disasm, 4},
                 {"3D Radar & Unreal Actors Overlay", "radar 3d coords actors waypoint", Tab::Radar, -1},
                 {"Speedhack Controller", "speed time scale", Tab::Speedhack, -1},
                 {"Memory Snapshot Diff", "diff snapshot compare", Tab::Diff, -1},

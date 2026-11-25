@@ -55,6 +55,8 @@ struct PEInfo {
 
 class PEAnalyzer {
 public:
+    static bool is_pe_magic(const hal::IProcess& proc, uintptr_t module_base);
+
     // Analyze PE headers and exports/imports of a module in the target process
     static std::optional<PEInfo> analyze(hal::IProcess& proc, uintptr_t module_base);
 

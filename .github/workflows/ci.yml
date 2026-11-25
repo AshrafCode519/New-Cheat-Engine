@@ -26,6 +26,8 @@ jobs:
         run: cmake -S . -B build -G "MinGW Makefiles"
       - name: Build
         run: cmake --build build -j 4
+      - name: Verify GUI and Server binaries
+        run: test -x ./build/bin/nce_gui.exe && ./build/bin/nce_server.exe --help
       - name: Test
         run: ./build/bin/engine_tests.exe
 
@@ -39,7 +41,7 @@ jobs:
         run: cmake -S . -B build
       - name: Build
         run: cmake --build build -j 4
-      - name: Verify GUI binary
-        run: test -x ./build/bin/nce_gui
+      - name: Verify GUI and Server binaries
+        run: test -x ./build/bin/nce_gui && test -x ./build/bin/nce_server && ./build/bin/nce_server --help
       - name: Test
         run: ./build/bin/engine_tests

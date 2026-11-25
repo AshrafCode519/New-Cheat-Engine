@@ -3,6 +3,7 @@
 #include "scan_session.hpp"
 #include "../hal/hotkeys.hpp"
 #include "../hal/process.hpp"
+#include "../hal/remote_process.hpp"
 #include "../scanner/noise_map.hpp"
 #include "../scanner/pointer_scanner.hpp"
 #include "../scanner/value_tracker.hpp"
@@ -19,6 +20,8 @@
 #include "../debugger/elf_analyzer.hpp"
 #include "../debugger/ultimap.hpp"
 #include "../debugger/step_debugger.hpp"
+#include "../debugger/decompiler.hpp"
+#include "../debugger/causality_timeline.hpp"
 #include "../hal/injector.hpp"
 #include "../script/lua_engine.hpp"
 #include <atomic>
@@ -128,6 +131,7 @@ public:
     Outcome set_script_body(size_t index, const std::string& body); // disables it first if it was on
     Outcome set_script_enabled(size_t index, bool on);
     Outcome remove_script(size_t index); // disables it first if it was on
+    void set_process(std::shared_ptr<hal::IProcess> process);
     [[nodiscard]] std::optional<table::TableScript> script(size_t index);
     [[nodiscard]] size_t script_count();
     void set_lua_runner(assembler::AutoAssembler::LuaRunner runner);
@@ -327,9 +331,44 @@ public:
     // Embedded Lua Scripting Engine
     script::ScriptResult run_lua(const std::string& code);
     script::ScriptResult run_lua_file(const std::string& filepath);
+    script::ScriptResult eval_lua_expression(const std::string& expr);
+    Outcome run_table_lua_script();
     void reset_lua();
     [[nodiscard]] script::LuaEngine* lua_engine() { return m_lua.get(); }
     [[nodiscard]] const script::LuaEngine* lua_engine() const { return m_lua.get(); }
+
+    // Remote Target Server connectivity (nce_server / RemoteProcess)
+    Outcome connect_remote(const std::string& host, uint16_t port, const std::string& auth_token = "");
+    void disconnect_remote();
+    [[nodiscard]] bool is_remote() const noexcept { return m_remote != nullptr; }
+    [[nodiscard]] std::string remote_endpoint() const;
+    [[nodiscard]] std::vector<hal::ProcessInfo> list_processes() const;
+
+    // Pseudo-C Decompiler & Execution Causality Timeline
+    [[nodiscard]] debugger::DecompiledFunction decompile_function(
+        uintptr_t entry_address, uintptr_t struct_address = 0, size_t max_insns = 256) const;
+    [[nodiscard]] debugger::CausalityTimeline& timeline() { return m_timeline; }
+    [[nodiscard]] const debugger::CausalityTimeline& timeline() const { return m_timeline; }
+    size_t capture_timeline_from_trace(uintptr_t watch_address = 0, size_t watch_bytes_len = 64);
+    size_t capture_timeline_from_watch(uintptr_t watch_address = 0, size_t watch_bytes_len = 64);
+
+    // Hybrid PE + ELF module inspection (including Wine/Proton mapped PE modules on Linux)
+    struct HybridModuleInfo {
+        std::string name;
+        std::string path;
+        uintptr_t base_address{0};
+        size_t size{0};
+        std::string format; // "PE", "ELF", or "Unknown"
+        bool is_64bit{false};
+        size_t export_or_symbol_count{0};
+        bool has_dwarf{false};
+    };
+    [[nodiscard]] std::vector<HybridModuleInfo> inspect_hybrid_modules() const;
+    [[nodiscard]] bool is_proton_or_wine() const;
+
+    // AOB Self-Healing Table anchors & migration
+    Outcome anchor_entry_signature(size_t index, uintptr_t code_address, int64_t struct_offset = 0);
+    table::SignatureMigrationReport migrate_table_signatures();
 
     [[nodiscard]] hal::IProcess& process() { return *m_process; }
     [[nodiscard]] const std::shared_ptr<hal::IProcess>& process_ptr() const { return m_process; }
@@ -354,6 +393,8 @@ private:
     mutable std::map<uintptr_t, debugger::PEInfo> m_pe_cache;
     mutable std::map<uintptr_t, debugger::ELFInfo> m_elf_cache;
     debugger::UltimapProfiler m_ultimap;
+    debugger::CausalityTimeline m_timeline;
+    std::shared_ptr<hal::RemoteProcess> m_remote;
     mutable std::mutex m_sym_mutex;
 };
 

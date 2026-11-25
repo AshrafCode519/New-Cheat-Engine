@@ -42,7 +42,7 @@ jobs:
           $tag = if ("${{ github.event_name }}" -eq "workflow_dispatch") { "${{ inputs.tag }}" } else { "${{ github.ref_name }}" }
           $dir = "NCE-$tag-windows-x64"
           New-Item -ItemType Directory -Force -Path $dir | Out-Null
-          Copy-Item build/bin/nce_gui.exe, build/bin/memscan_cli.exe, build/bin/nce_veh.dll, build/bin/target_dummy.exe, LICENSE, README.md -Destination $dir
+          Copy-Item build/bin/nce_gui.exe, build/bin/memscan_cli.exe, build/bin/nce_server.exe, build/bin/nce_veh.dll, build/bin/target_dummy.exe, LICENSE, README.md -Destination $dir
           Compress-Archive -Path $dir -DestinationPath "$dir.zip" -Force
       - uses: actions/upload-artifact@v6
         with:
@@ -70,7 +70,7 @@ jobs:
           fi
           DIR="NCE-${TAG}-linux-x64"
           mkdir -p "$DIR"
-          cp build/bin/nce_gui build/bin/memscan_cli build/bin/target_dummy LICENSE README.md "$DIR/"
+          cp build/bin/nce_gui build/bin/memscan_cli build/bin/nce_server build/bin/target_dummy LICENSE README.md "$DIR/"
           tar -czf "${DIR}.tar.gz" "$DIR"
       - uses: actions/upload-artifact@v6
         with:

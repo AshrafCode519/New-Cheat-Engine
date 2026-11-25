@@ -1521,6 +1521,66 @@ int l_calibrateUnrealOffsets(lua_State* L) {
     return 1;
 }
 
+int l_decompile(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_pushnil(L); return 1; }
+    const uintptr_t addr = parse_address(L, 1, &s->process());
+    const uintptr_t st_addr = (lua_gettop(L) >= 2 && !lua_isnil(L, 2)) ? parse_address(L, 2, &s->process()) : 0;
+    const size_t max_insns = (lua_gettop(L) >= 3 && lua_isinteger(L, 3)) ? static_cast<size_t>(lua_tointeger(L, 3)) : 256;
+    const auto res = s->decompile_function(addr, st_addr, max_insns);
+    lua_pushlstring(L, res.code.data(), res.code.size());
+    return 1;
+}
+
+int l_anchorEntry(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) {
+        lua_pushboolean(L, false);
+        lua_pushstring(L, "No process attached");
+        return 2;
+    }
+    const size_t idx = static_cast<size_t>(luaL_checkinteger(L, 1));
+    const uintptr_t code_addr = parse_address(L, 2, &s->process());
+    const int64_t off = (lua_gettop(L) >= 3 && lua_isinteger(L, 3)) ? static_cast<int64_t>(lua_tointeger(L, 3)) : 0;
+    const auto out = s->anchor_entry_signature(idx, code_addr, off);
+    lua_pushboolean(L, out.ok);
+    lua_pushstring(L, out.message.c_str());
+    return 2;
+}
+
+int l_migrateTable(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_pushnil(L); return 1; }
+    const auto rep = s->migrate_table_signatures();
+    lua_newtable(L);
+    lua_pushinteger(L, static_cast<lua_Integer>(rep.total_anchored)); lua_setfield(L, -2, "total");
+    lua_pushinteger(L, static_cast<lua_Integer>(rep.updated)); lua_setfield(L, -2, "updated");
+    lua_pushinteger(L, static_cast<lua_Integer>(rep.verified)); lua_setfield(L, -2, "verified");
+    lua_pushinteger(L, static_cast<lua_Integer>(rep.failed)); lua_setfield(L, -2, "failed");
+    return 1;
+}
+
+int l_timelineReport(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s) { lua_pushstring(L, ""); return 1; }
+    const size_t max_n = (lua_gettop(L) >= 1 && lua_isinteger(L, 1)) ? static_cast<size_t>(lua_tointeger(L, 1)) : 64;
+    const std::string text = s->timeline().format_report(0, max_n);
+    lua_pushlstring(L, text.data(), text.size());
+    return 1;
+}
+
+int l_connectRemote(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s) { lua_pushboolean(L, false); lua_pushstring(L, "No session"); return 2; }
+    const std::string host = luaL_checkstring(L, 1);
+    const uint16_t port = static_cast<uint16_t>(luaL_checkinteger(L, 2));
+    const std::string tok = (lua_gettop(L) >= 3 && lua_isstring(L, 3)) ? lua_tostring(L, 3) : "";
+    const auto out = s->connect_remote(host, port, tok);
+    lua_pushboolean(L, out.ok);
+    lua_pushstring(L, out.message.c_str());
+    return 2;
+}
+
 } // namespace
 
 LuaEngine::LuaEngine(session::Session* session)
@@ -1601,6 +1661,71 @@ ScriptResult LuaEngine::execute_string(const std::string& code) {
     }
 
     return ScriptResult{ true, slice_output(), "" };
+}
+
+ScriptResult LuaEngine::eval_expression(const std::string& expr) {
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    if (!m_L) return ScriptResult{false, "", "Lua state is not initialized"};
+
+    size_t start_pos = 0;
+    if (m_eval_depth == 0) {
+        m_output_buffer.str("");
+        m_output_buffer.clear();
+    } else {
+        start_pos = m_output_buffer.str().size();
+    }
+    struct DepthGuard {
+        int& d;
+        explicit DepthGuard(int& v) : d(v) { ++d; }
+        ~DepthGuard() { --d; }
+    } depth_guard(m_eval_depth);
+
+    const int base_top = lua_gettop(m_L);
+    auto slice_output = [&]() {
+        const std::string full = m_output_buffer.str();
+        return (start_pos <= full.size()) ? full.substr(start_pos) : full;
+    };
+
+    const std::string wrapped = "return " + expr;
+    int load_res = luaL_loadbuffer(m_L, wrapped.c_str(), wrapped.size(), "nce_repl");
+    if (load_res != LUA_OK) {
+        lua_settop(m_L, base_top);
+        load_res = luaL_loadbuffer(m_L, expr.c_str(), expr.size(), "nce_repl");
+        if (load_res != LUA_OK) {
+            std::string err = lua_tostring(m_L, -1);
+            lua_settop(m_L, base_top);
+            return ScriptResult{false, slice_output(), err};
+        }
+    }
+
+    if (lua_pcall(m_L, 0, LUA_MULTRET, 0) != LUA_OK) {
+        std::string err = lua_tostring(m_L, -1);
+        lua_settop(m_L, base_top);
+        return ScriptResult{false, slice_output(), err};
+    }
+
+    const int nret = lua_gettop(m_L) - base_top;
+    std::ostringstream vals;
+    for (int i = 1; i <= nret; ++i) {
+        const int idx = base_top + i;
+        if (i > 1) vals << ", ";
+        if (lua_isnil(m_L, idx)) vals << "nil";
+        else if (lua_isboolean(m_L, idx)) vals << (lua_toboolean(m_L, idx) ? "true" : "false");
+        else if (lua_isinteger(m_L, idx)) vals << lua_tointeger(m_L, idx);
+        else if (lua_isnumber(m_L, idx)) vals << lua_tonumber(m_L, idx);
+        else if (lua_isstring(m_L, idx)) vals << lua_tostring(m_L, idx);
+        else if (lua_istable(m_L, idx)) vals << "<table>";
+        else vals << "<" << luaL_typename(m_L, idx) << ">";
+    }
+    lua_settop(m_L, base_top);
+
+    std::string out = slice_output();
+    const std::string vstr = vals.str();
+    if (!vstr.empty()) {
+        if (!out.empty() && out.back() != '\n') out.push_back('\n');
+        out += vstr;
+    }
+    return ScriptResult{true, out, ""};
 }
 
 ScriptResult LuaEngine::execute_file(const std::string& filepath) {
@@ -1984,6 +2109,18 @@ void LuaEngine::register_nce_api() {
     lua_setglobal(m_L, "findXRefs");
     lua_pushcfunction(m_L, l_calibrateUnrealOffsets);
     lua_setglobal(m_L, "calibrateUnrealOffsets");
+
+    // NCE v2.0 Next-Gen APIs
+    lua_pushcfunction(m_L, l_decompile);
+    lua_setglobal(m_L, "decompile");
+    lua_pushcfunction(m_L, l_anchorEntry);
+    lua_setglobal(m_L, "anchorEntry");
+    lua_pushcfunction(m_L, l_migrateTable);
+    lua_setglobal(m_L, "migrateTable");
+    lua_pushcfunction(m_L, l_timelineReport);
+    lua_setglobal(m_L, "timelineReport");
+    lua_pushcfunction(m_L, l_connectRemote);
+    lua_setglobal(m_L, "connectRemote");
 }
 
 } // namespace nce::script
