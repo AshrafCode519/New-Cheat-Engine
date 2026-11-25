@@ -976,7 +976,7 @@ void draw_results(App& app) {
     }
 
     const auto& results = scans.state().results;
-    ImGui::Text("%zu results  (click: the memory around it, double-click or +: add to the cheat table)", results.count());
+    ImGui::TextWrapped("%zu results  (click: the memory around it, double-click or +: add to the cheat table)", results.count());
 
     const ImGuiTableFlags flags = ImGuiTableFlags_ScrollY | ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersOuter |
                                   ImGuiTableFlags_BordersV | ImGuiTableFlags_Resizable;
@@ -4681,11 +4681,12 @@ void draw_ui(App& app) {
 
     draw_process_bar(app);
     ImGui::SameLine();
-    if (ImGui::SmallButton("Ctrl+K Palette")) {
+    if (ImGui::SmallButton("Ctrl+K")) {
         app.cmd_palette_open = true;
         app.cmd_palette_filter.clear();
         ImGui::OpenPopup("Command Palette##nce_cmd_palette");
     }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("Open Command Palette (Ctrl+K)");
     if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K, false)) {
         app.cmd_palette_open = true;
         app.cmd_palette_filter.clear();
