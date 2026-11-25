@@ -616,6 +616,10 @@ std::unique_ptr<IProcess> IProcess::create() {
     return std::make_unique<LinuxProcess>();
 }
 
+std::vector<ProcessInfo> IProcess::list_processes() {
+    return LinuxProcess::list_processes();
+}
+
 #endif
 
 } // namespace nce::hal
