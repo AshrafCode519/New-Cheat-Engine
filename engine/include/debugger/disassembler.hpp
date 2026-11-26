@@ -57,7 +57,7 @@ public:
     static std::vector<DecodedInstruction> disassemble_range(const uint8_t* code, size_t size, uintptr_t base_address, size_t max_instructions = 16, bool is_64bit = true);
 
     static ControlFlowGraph build_cfg(const hal::IProcess& proc, uintptr_t entry_address, size_t max_instructions = 256, size_t max_blocks = 48);
-    static ControlFlowGraph build_cfg_from_bytes(const uint8_t* code, size_t size, uintptr_t entry_address, uintptr_t base_address = 0, size_t max_instructions = 256, size_t max_blocks = 48);
+    static ControlFlowGraph build_cfg_from_bytes(const uint8_t* code, size_t size, uintptr_t entry_address, uintptr_t base_address = 0, size_t max_instructions = 256, size_t max_blocks = 48, bool is_64bit = true);
 
     /// Scans committed executable regions (or a single module) for instructions referencing `target_address`.
     static std::vector<CrossReference> find_references(

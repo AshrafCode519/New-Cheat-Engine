@@ -35,7 +35,7 @@ void find_base(const DecodedInstruction& insn, std::string& base_reg, int64_t& b
     }
 }
 
-DecodedInstruction writer_before(const hal::IProcess& process, uintptr_t rip, uintptr_t& start_address) {
+DecodedInstruction writer_before(const hal::IProcess& process, uintptr_t rip, bool is_64bit, uintptr_t& start_address) {
     constexpr size_t window = 15;
     if (rip <= window) return {};
     uint8_t buf[window] = {0};
@@ -48,7 +48,7 @@ DecodedInstruction writer_before(const hal::IProcess& process, uintptr_t rip, ui
         bool clean = true;
         for (int guard = 0; cur < rip && guard < 16; ++guard) {
             const size_t offset = cur - (rip - window);
-            auto d = Disassembler::decode(buf + offset, window - offset, cur);
+            auto d = Disassembler::decode(buf + offset, window - offset, cur, is_64bit);
             if (d.length == 0 || d.mnemonic == "db") { clean = false; break; }
             last = d;
             cur += d.length;
@@ -191,19 +191,20 @@ std::vector<uintptr_t> AccessWatcher::watched_addresses() const {
 void AccessWatcher::on_hw_hit(uint32_t, uintptr_t rip, const Registers& regs) {
     if (!m_process) return;
 
+    const bool is_64 = (m_process->pointer_size() != 4);
     uintptr_t writer_addr = rip;
     DecodedInstruction decoded;
     if (m_kind == WatchKind::Execute) {
         uint8_t code[16] = {0};
         m_process->read_raw(rip, code, sizeof code);
-        decoded = Disassembler::decode(code, sizeof code, rip);
+        decoded = Disassembler::decode(code, sizeof code, rip, is_64);
         writer_addr = rip;
     } else {
-        decoded = writer_before(*m_process, rip, writer_addr);
+        decoded = writer_before(*m_process, rip, is_64, writer_addr);
         if (decoded.length == 0) {
             uint8_t code[16] = {0};
             m_process->read_raw(rip, code, sizeof code);
-            decoded = Disassembler::decode(code, sizeof code, rip);
+            decoded = Disassembler::decode(code, sizeof code, rip, is_64);
             writer_addr = rip;
         }
     }

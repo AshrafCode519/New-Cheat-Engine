@@ -66,6 +66,34 @@ void win32_ctx_from_regs(const Registers& r, CONTEXT& ctx) {
     ctx.EFlags = static_cast<DWORD>(r.eflags);
 }
 
+void regs_from_wow64_ctx(const WOW64_CONTEXT& wc, Registers& r) {
+    r.rax = wc.Eax; r.rbx = wc.Ebx; r.rcx = wc.Ecx; r.rdx = wc.Edx;
+    r.rsi = wc.Esi; r.rdi = wc.Edi; r.rbp = wc.Ebp; r.rsp = wc.Esp;
+    r.rip = wc.Eip;
+    r.r8 = r.r9 = r.r10 = r.r11 = r.r12 = r.r13 = r.r14 = r.r15 = 0;
+    r.eflags = wc.EFlags;
+}
+
+void wow64_ctx_from_regs(const Registers& r, WOW64_CONTEXT& wc) {
+    wc.Eax = static_cast<DWORD>(r.rax); wc.Ebx = static_cast<DWORD>(r.rbx);
+    wc.Ecx = static_cast<DWORD>(r.rcx); wc.Edx = static_cast<DWORD>(r.rdx);
+    wc.Esi = static_cast<DWORD>(r.rsi); wc.Edi = static_cast<DWORD>(r.rdi);
+    wc.Ebp = static_cast<DWORD>(r.rbp); wc.Esp = static_cast<DWORD>(r.rsp);
+    wc.Eip = static_cast<DWORD>(r.rip);
+    wc.EFlags = static_cast<DWORD>(r.eflags);
+}
+
+#ifndef STATUS_WX86_BREAKPOINT
+constexpr DWORD kStatusWx86Breakpoint = 0x4000001FUL;
+#else
+constexpr DWORD kStatusWx86Breakpoint = STATUS_WX86_BREAKPOINT;
+#endif
+#ifndef STATUS_WX86_SINGLE_STEP
+constexpr DWORD kStatusWx86SingleStep = 0x4000001EUL;
+#else
+constexpr DWORD kStatusWx86SingleStep = STATUS_WX86_SINGLE_STEP;
+#endif
+
 void regs_from_veh(const veh::VehRegisters& vr, Registers& r) {
     r.rax = vr.rax; r.rbx = vr.rbx; r.rcx = vr.rcx; r.rdx = vr.rdx;
     r.rsi = vr.rsi; r.rdi = vr.rdi; r.rbp = vr.rbp; r.rsp = vr.rsp;
@@ -121,6 +149,11 @@ DebugCoordinator::DebugCoordinator(std::shared_ptr<hal::IProcess> process)
 
 DebugCoordinator::~DebugCoordinator() {
     detach();
+}
+
+bool DebugCoordinator::is_target_64bit() const noexcept {
+    if (m_is_wow64) return false;
+    return !m_process || m_process->pointer_size() != 4;
 }
 
 bool DebugCoordinator::set_breakpoint(uintptr_t address, const std::string& note, bool temporary,
@@ -305,6 +338,8 @@ bool DebugCoordinator::attach(DebugBackend backend) {
     m_modules = m_process->get_modules();
     m_stop_requested = false;
     m_initial_bp_seen = false;
+    m_wow64_initial_bp_seen = false;
+    m_is_wow64 = (m_process->pointer_size() == 4);
     m_rearm_bp_addr = 0;
     m_silent_step = false;
     m_resume_pending = false;
@@ -314,6 +349,10 @@ bool DebugCoordinator::attach(DebugBackend backend) {
 #ifdef _WIN32
     m_sym_proc = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, m_pid);
     if (m_sym_proc) {
+        BOOL w64 = FALSE;
+        if (IsWow64Process(static_cast<HANDLE>(m_sym_proc), &w64) && w64) {
+            m_is_wow64 = true;
+        }
         SymSetOptions(SYMOPT_UNDNAME | SYMOPT_DEFERRED_LOADS);
         m_sym_initialized = (SymInitialize(static_cast<HANDLE>(m_sym_proc), nullptr, TRUE) == TRUE);
     }
@@ -425,12 +464,22 @@ void DebugCoordinator::detach() {
             HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, t.tid);
             if (!th) continue;
             if (SuspendThread(th) != static_cast<DWORD>(-1)) {
-                CONTEXT ctx{};
-                ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-                if (GetThreadContext(th, &ctx)) {
-                    ctx.Dr0 = ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = 0;
-                    ctx.Dr7 &= ~0xFFFF00FFULL;
-                    SetThreadContext(th, &ctx);
+                if (m_is_wow64) {
+                    WOW64_CONTEXT wctx{};
+                    wctx.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+                    if (Wow64GetThreadContext(th, &wctx)) {
+                        wctx.Dr0 = wctx.Dr1 = wctx.Dr2 = wctx.Dr3 = 0;
+                        wctx.Dr7 &= ~0xFFFF00FFUL;
+                        Wow64SetThreadContext(th, &wctx);
+                    }
+                } else {
+                    CONTEXT ctx{};
+                    ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
+                    if (GetThreadContext(th, &ctx)) {
+                        ctx.Dr0 = ctx.Dr1 = ctx.Dr2 = ctx.Dr3 = 0;
+                        ctx.Dr7 &= ~0xFFFF00FFULL;
+                        SetThreadContext(th, &ctx);
+                    }
                 }
                 ResumeThread(th);
             }
@@ -450,6 +499,7 @@ void DebugCoordinator::detach() {
 
     m_is_attached = false;
     m_state = DebuggerState::Detached;
+    m_is_wow64 = false;
     m_pid = 0;
 }
 
@@ -474,17 +524,30 @@ bool DebugCoordinator::pause() {
     if (!th) return false;
 
     if (SuspendThread(th) != static_cast<DWORD>(-1)) {
-        CONTEXT ctx{};
-        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-        if (GetThreadContext(th, &ctx)) {
-            if (m_backend == DebugBackend::Win32DebugAPI || m_backend == DebugBackend::VEH) {
-                ctx.EFlags |= 0x100UL; // Arm Trap Flag so thread cleanly hits debug loop on next instruction
-                SetThreadContext(th, &ctx);
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    m_user_step_requested = true;
-                    regs_from_win32_ctx(ctx, m_registers);
-                    m_active_thread_id = target_tid;
+        if (m_is_wow64) {
+            WOW64_CONTEXT wctx{};
+            wctx.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER;
+            if (Wow64GetThreadContext(th, &wctx)) {
+                wctx.EFlags |= 0x100UL;
+                Wow64SetThreadContext(th, &wctx);
+                std::lock_guard<std::mutex> lock(m_mutex);
+                m_user_step_requested = true;
+                regs_from_wow64_ctx(wctx, m_registers);
+                m_active_thread_id = target_tid;
+            }
+        } else {
+            CONTEXT ctx{};
+            ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+            if (GetThreadContext(th, &ctx)) {
+                if (m_backend == DebugBackend::Win32DebugAPI || m_backend == DebugBackend::VEH) {
+                    ctx.EFlags |= 0x100UL; // Arm Trap Flag so thread cleanly hits debug loop on next instruction
+                    SetThreadContext(th, &ctx);
+                    {
+                        std::lock_guard<std::mutex> lock(m_mutex);
+                        m_user_step_requested = true;
+                        regs_from_win32_ctx(ctx, m_registers);
+                        m_active_thread_id = target_tid;
+                    }
                 }
             }
         }
@@ -533,7 +596,7 @@ bool DebugCoordinator::step_over() {
 
     uint8_t code_buf[16]{};
     if (m_process->read_raw(rip, code_buf, sizeof(code_buf))) {
-        auto insn = Disassembler::decode(code_buf, sizeof(code_buf), rip);
+        auto insn = Disassembler::decode(code_buf, sizeof(code_buf), rip, is_target_64bit());
         if (StepDebugger::is_call_instruction(insn)) {
             uintptr_t ret_addr = rip + insn.length;
             set_breakpoint(ret_addr, "step-over-temp", true);
@@ -552,7 +615,15 @@ bool DebugCoordinator::step_out() {
     }
 
     uintptr_t ret_addr = 0;
-    if (m_process->read_raw(rsp, &ret_addr, sizeof(ret_addr)) && ret_addr > 0x10000) {
+    bool read_ok = false;
+    if (!is_target_64bit()) {
+        uint32_t ret32 = 0;
+        read_ok = m_process->read_raw(rsp, &ret32, sizeof(ret32));
+        ret_addr = ret32;
+    } else {
+        read_ok = m_process->read_raw(rsp, &ret_addr, sizeof(ret_addr));
+    }
+    if (read_ok && ret_addr > 0x1000) {
         set_breakpoint(ret_addr, "step-out-temp", true);
         return resume();
     }
@@ -567,24 +638,46 @@ std::vector<StackFrame> DebugCoordinator::get_call_stack(size_t max_frames) cons
     if (m_sym_proc && m_active_thread_id != 0 && is_paused()) {
         HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, m_active_thread_id);
         if (th) {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_FULL;
-            if (GetThreadContext(th, &ctx)) {
-                STACKFRAME64 sf{};
-                sf.AddrPC.Offset = ctx.Rip;
+            CONTEXT ctx64{};
+            WOW64_CONTEXT ctx32{};
+            STACKFRAME64 sf{};
+            void* ctx_ptr = nullptr;
+            DWORD machine = IMAGE_FILE_MACHINE_AMD64;
+            bool ctx_ok = false;
+
+            if (m_is_wow64) {
+                machine = IMAGE_FILE_MACHINE_I386;
+                ctx32.ContextFlags = WOW64_CONTEXT_FULL;
+                ctx_ok = (Wow64GetThreadContext(th, &ctx32) == TRUE);
+                if (ctx_ok) {
+                    sf.AddrPC.Offset = ctx32.Eip;
+                    sf.AddrFrame.Offset = ctx32.Ebp;
+                    sf.AddrStack.Offset = ctx32.Esp;
+                    ctx_ptr = &ctx32;
+                }
+            } else {
+                ctx64.ContextFlags = CONTEXT_FULL;
+                ctx_ok = (GetThreadContext(th, &ctx64) == TRUE);
+                if (ctx_ok) {
+                    sf.AddrPC.Offset = ctx64.Rip;
+                    sf.AddrFrame.Offset = ctx64.Rbp;
+                    sf.AddrStack.Offset = ctx64.Rsp;
+                    ctx_ptr = &ctx64;
+                }
+            }
+
+            if (ctx_ok) {
                 sf.AddrPC.Mode = AddrModeFlat;
-                sf.AddrFrame.Offset = ctx.Rbp;
                 sf.AddrFrame.Mode = AddrModeFlat;
-                sf.AddrStack.Offset = ctx.Rsp;
                 sf.AddrStack.Mode = AddrModeFlat;
 
                 std::vector<StackFrame> frames;
                 for (size_t i = 0; i < max_frames; ++i) {
-                    if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+                    if (!StackWalk64(machine,
                                      static_cast<HANDLE>(m_sym_proc),
                                      th,
                                      &sf,
-                                     &ctx,
+                                     ctx_ptr,
                                      nullptr,
                                      SymFunctionTableAccess64,
                                      SymGetModuleBase64,
@@ -646,7 +739,7 @@ std::vector<DecodedInstruction> DebugCoordinator::get_disassembly_around_rip(siz
     const size_t bytes_to_read = count * 15;
     std::vector<uint8_t> code(bytes_to_read, 0);
     if (!m_process->read_raw(m_registers.rip, code.data(), bytes_to_read)) return {};
-    auto insns = Disassembler::disassemble_range(code.data(), bytes_to_read, m_registers.rip, count);
+    auto insns = Disassembler::disassemble_range(code.data(), bytes_to_read, m_registers.rip, count, is_target_64bit());
     return insns;
 }
 
@@ -772,9 +865,29 @@ void DebugCoordinator::sync_veh_breakpoints() {
 
 #ifdef _WIN32
 void DebugCoordinator::arm_thread_hw(void* thread_handle) const {
+    HANDLE th = static_cast<HANDLE>(thread_handle);
+    if (m_is_wow64) {
+        WOW64_CONTEXT wctx{};
+        wctx.ContextFlags = WOW64_CONTEXT_DEBUG_REGISTERS;
+        if (!Wow64GetThreadContext(th, &wctx)) return;
+
+        uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr7 = wctx.Dr7;
+        {
+            std::lock_guard<std::mutex> lock(m_mutex);
+            apply_hw_slots_to_dr(m_hw_slots, dr0, dr1, dr2, dr3, dr7);
+        }
+        wctx.Dr0 = static_cast<DWORD>(dr0);
+        wctx.Dr1 = static_cast<DWORD>(dr1);
+        wctx.Dr2 = static_cast<DWORD>(dr2);
+        wctx.Dr3 = static_cast<DWORD>(dr3);
+        wctx.Dr7 = static_cast<DWORD>(dr7);
+        Wow64SetThreadContext(th, &wctx);
+        return;
+    }
+
     CONTEXT ctx{};
     ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-    if (!GetThreadContext(static_cast<HANDLE>(thread_handle), &ctx)) return;
+    if (!GetThreadContext(th, &ctx)) return;
 
     uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0, dr7 = ctx.Dr7;
     {
@@ -783,7 +896,7 @@ void DebugCoordinator::arm_thread_hw(void* thread_handle) const {
     }
     ctx.Dr0 = dr0; ctx.Dr1 = dr1; ctx.Dr2 = dr2; ctx.Dr3 = dr3;
     ctx.Dr7 = dr7;
-    SetThreadContext(static_cast<HANDLE>(thread_handle), &ctx);
+    SetThreadContext(th, &ctx);
 }
 
 void DebugCoordinator::sync_hw_registers_all_threads() {
@@ -807,18 +920,7 @@ void DebugCoordinator::sync_hw_registers_all_threads() {
         HANDLE th = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, t.tid);
         if (!th) continue;
         if (SuspendThread(th) != static_cast<DWORD>(-1)) {
-            CONTEXT ctx{};
-            ctx.ContextFlags = CONTEXT_DEBUG_REGISTERS;
-            if (GetThreadContext(th, &ctx)) {
-                uint64_t new_dr7 = ctx.Dr7;
-                {
-                    std::lock_guard<std::mutex> lock(m_mutex);
-                    apply_hw_slots_to_dr(m_hw_slots, dr0, dr1, dr2, dr3, new_dr7);
-                }
-                ctx.Dr0 = dr0; ctx.Dr1 = dr1; ctx.Dr2 = dr2; ctx.Dr3 = dr3;
-                ctx.Dr7 = new_dr7;
-                SetThreadContext(th, &ctx);
-            }
+            arm_thread_hw(th);
             ResumeThread(th);
         }
         CloseHandle(th);
@@ -837,7 +939,7 @@ void DebugCoordinator::append_trace(uint32_t thread_id, uintptr_t addr, const Re
     if (m_process && m_process->is_attached()) {
         uint8_t code[16]{};
         if (m_process->read_raw(addr, code, sizeof(code))) {
-            auto d = Disassembler::decode(code, sizeof(code), addr);
+            auto d = Disassembler::decode(code, sizeof(code), addr, is_target_64bit());
             entry.disassembly = d.mnemonic + (d.operands.empty() ? "" : " " + d.operands);
         }
     }
@@ -1028,14 +1130,39 @@ void DebugCoordinator::win32_debug_loop(std::promise<bool> start_promise) {
                     }
 
                     CONTEXT ctx{};
-                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
-                    if (!GetThreadContext(th, &ctx)) {
+                    WOW64_CONTEXT wctx{};
+                    bool ctx_ok = false;
+                    uint64_t dr6_val = 0;
+                    Registers regs{};
+
+                    if (m_is_wow64) {
+                        wctx.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER | WOW64_CONTEXT_DEBUG_REGISTERS;
+                        ctx_ok = (Wow64GetThreadContext(th, &wctx) == TRUE);
+                        if (ctx_ok) {
+                            regs_from_wow64_ctx(wctx, regs);
+                            dr6_val = wctx.Dr6;
+                        }
+                    } else {
+                        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER | CONTEXT_DEBUG_REGISTERS;
+                        ctx_ok = (GetThreadContext(th, &ctx) == TRUE);
+                        if (ctx_ok) {
+                            regs_from_win32_ctx(ctx, regs);
+                            dr6_val = ctx.Dr6;
+                        }
+                    }
+
+                    if (!ctx_ok) {
                         CloseHandle(th);
                         continue_status = DBG_EXCEPTION_NOT_HANDLED;
                         break;
                     }
 
-                    if (ex.ExceptionCode == EXCEPTION_BREAKPOINT) {
+                    const bool is_sw_bp_code = (ex.ExceptionCode == EXCEPTION_BREAKPOINT ||
+                                                ex.ExceptionCode == kStatusWx86Breakpoint);
+                    const bool is_step_code = (ex.ExceptionCode == EXCEPTION_SINGLE_STEP ||
+                                               ex.ExceptionCode == kStatusWx86SingleStep);
+
+                    if (is_sw_bp_code) {
                         const uintptr_t ex_addr = reinterpret_cast<uintptr_t>(ex.ExceptionAddress);
                         bool is_user_bp = false;
                         {
@@ -1043,33 +1170,45 @@ void DebugCoordinator::win32_debug_loop(std::promise<bool> start_promise) {
                             is_user_bp = (m_breakpoints.find(ex_addr) != m_breakpoints.end());
                         }
 
-                        if (!m_initial_bp_seen && !is_user_bp) {
-                            m_initial_bp_seen = true; // Ignore loader initial attach INT 3
+                        if (!is_user_bp && ex.ExceptionCode == EXCEPTION_BREAKPOINT && !m_initial_bp_seen) {
+                            m_initial_bp_seen = true; // Ignore 64-bit loader initial attach INT 3
+                            continue_status = DBG_CONTINUE;
+                        } else if (!is_user_bp && ex.ExceptionCode == kStatusWx86Breakpoint && !m_wow64_initial_bp_seen) {
+                            m_wow64_initial_bp_seen = true; // Ignore WOW64 32-bit loader initial INT 3
                             continue_status = DBG_CONTINUE;
                         } else if (is_user_bp) {
-                            ctx.Rip = ex_addr;
-                            Registers regs;
-                            regs_from_win32_ctx(ctx, regs);
+                            regs.rip = ex_addr;
                             bool req_tf = false;
                             should_pause = process_sw_breakpoint(ev.dwThreadId, ex_addr, regs, req_tf);
                             pause_rip = regs.rip;
-                            win32_ctx_from_regs(regs, ctx);
-                            if (req_tf) ctx.EFlags |= 0x100UL;
-                            SetThreadContext(th, &ctx);
+                            if (m_is_wow64) {
+                                wow64_ctx_from_regs(regs, wctx);
+                                if (req_tf) wctx.EFlags |= 0x100UL;
+                                Wow64SetThreadContext(th, &wctx);
+                            } else {
+                                win32_ctx_from_regs(regs, ctx);
+                                if (req_tf) ctx.EFlags |= 0x100UL;
+                                SetThreadContext(th, &ctx);
+                            }
                             continue_status = DBG_CONTINUE;
                         } else {
                             continue_status = DBG_EXCEPTION_NOT_HANDLED;
                         }
-                    } else if (ex.ExceptionCode == EXCEPTION_SINGLE_STEP) {
-                        Registers regs;
-                        regs_from_win32_ctx(ctx, regs);
+                    } else if (is_step_code) {
                         bool req_tf = false, req_rf = false;
-                        should_pause = process_single_step(ev.dwThreadId, static_cast<uintptr_t>(ctx.Rip), ctx.Dr6, regs, req_tf, req_rf);
-                        pause_rip = static_cast<uintptr_t>(ctx.Rip);
-                        ctx.Dr6 = 0;
-                        if (req_tf) ctx.EFlags |= 0x100UL;
-                        if (req_rf) ctx.EFlags |= 0x10000UL;
-                        SetThreadContext(th, &ctx);
+                        should_pause = process_single_step(ev.dwThreadId, static_cast<uintptr_t>(regs.rip), dr6_val, regs, req_tf, req_rf);
+                        pause_rip = static_cast<uintptr_t>(regs.rip);
+                        if (m_is_wow64) {
+                            wctx.Dr6 = 0;
+                            if (req_tf) wctx.EFlags |= 0x100UL;
+                            if (req_rf) wctx.EFlags |= 0x10000UL;
+                            Wow64SetThreadContext(th, &wctx);
+                        } else {
+                            ctx.Dr6 = 0;
+                            if (req_tf) ctx.EFlags |= 0x100UL;
+                            if (req_rf) ctx.EFlags |= 0x10000UL;
+                            SetThreadContext(th, &ctx);
+                        }
                         continue_status = DBG_CONTINUE;
                     } else {
                         continue_status = DBG_EXCEPTION_NOT_HANDLED;
@@ -1108,13 +1247,24 @@ void DebugCoordinator::win32_debug_loop(std::promise<bool> start_promise) {
                 }
                 HANDLE th = OpenThread(THREAD_GET_CONTEXT | THREAD_SET_CONTEXT, FALSE, ev.dwThreadId);
                 if (th) {
-                    CONTEXT ctx{};
-                    ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
-                    if (GetThreadContext(th, &ctx)) {
-                        win32_ctx_from_regs(updated_regs, ctx);
-                        ctx.Rip = new_rip;
-                        if (need_tf) ctx.EFlags |= 0x100UL; // Trap Flag TF = 1
-                        SetThreadContext(th, &ctx);
+                    if (m_is_wow64) {
+                        WOW64_CONTEXT wctx{};
+                        wctx.ContextFlags = WOW64_CONTEXT_CONTROL | WOW64_CONTEXT_INTEGER;
+                        if (Wow64GetThreadContext(th, &wctx)) {
+                            wow64_ctx_from_regs(updated_regs, wctx);
+                            wctx.Eip = static_cast<DWORD>(new_rip);
+                            if (need_tf) wctx.EFlags |= 0x100UL;
+                            Wow64SetThreadContext(th, &wctx);
+                        }
+                    } else {
+                        CONTEXT ctx{};
+                        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+                        if (GetThreadContext(th, &ctx)) {
+                            win32_ctx_from_regs(updated_regs, ctx);
+                            ctx.Rip = new_rip;
+                            if (need_tf) ctx.EFlags |= 0x100UL; // Trap Flag TF = 1
+                            SetThreadContext(th, &ctx);
+                        }
                     }
                     CloseHandle(th);
                 }
@@ -1128,6 +1278,10 @@ void DebugCoordinator::win32_debug_loop(std::promise<bool> start_promise) {
 }
 
 bool DebugCoordinator::veh_attach_impl() {
+    if (m_is_wow64) {
+        m_last_error = "In-process 64-bit VEH is not supported on 32-bit WOW64 targets; use Win32 DebugAPI.";
+        return false;
+    }
     const std::wstring map_name  = format_pid_str(L"Local\\NCE_VEH_MEM_", m_pid);
     const std::wstring hit_name  = format_pid_str(L"Local\\NCE_VEH_HIT_", m_pid);
     const std::wstring cont_name = format_pid_str(L"Local\\NCE_VEH_CONT_", m_pid);

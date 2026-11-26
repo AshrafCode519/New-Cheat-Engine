@@ -1105,7 +1105,8 @@ ControlFlowGraph build_cfg_core(
     const CodeReaderFn& reader,
     uintptr_t entry_address,
     size_t max_instructions,
-    size_t max_blocks)
+    size_t max_blocks,
+    bool is_64bit)
 {
     ControlFlowGraph cfg;
     cfg.entry_address = entry_address;
@@ -1133,7 +1134,7 @@ ControlFlowGraph build_cfg_core(
             const uintptr_t cur_addr = start + off;
             if (decoded_map.count(cur_addr)) break;
 
-            auto insn = Disassembler::decode(buf.data() + off, buf.size() - off, cur_addr);
+            auto insn = Disassembler::decode(buf.data() + off, buf.size() - off, cur_addr, is_64bit);
             if (insn.length == 0) break;
             decoded_map[cur_addr] = insn;
             ++total_decoded;
@@ -1276,12 +1277,12 @@ ControlFlowGraph Disassembler::build_cfg(
         out.resize(ok_bytes);
         return true;
     };
-    return build_cfg_core(reader, entry_address, max_instructions, max_blocks);
+    return build_cfg_core(reader, entry_address, max_instructions, max_blocks, proc.pointer_size() != 4);
 }
 
 ControlFlowGraph Disassembler::build_cfg_from_bytes(
     const uint8_t* code, size_t size, uintptr_t entry_address, uintptr_t base_address,
-    size_t max_instructions, size_t max_blocks)
+    size_t max_instructions, size_t max_blocks, bool is_64bit)
 {
     const uintptr_t base = (base_address != 0) ? base_address : entry_address;
     if (!code || size == 0 || entry_address < base) return {};
@@ -1292,7 +1293,7 @@ ControlFlowGraph Disassembler::build_cfg_from_bytes(
         out.assign(code + off, code + off + avail);
         return !out.empty();
     };
-    return build_cfg_core(reader, entry_address, max_instructions, max_blocks);
+    return build_cfg_core(reader, entry_address, max_instructions, max_blocks, is_64bit);
 }
 
 std::vector<CrossReference> Disassembler::find_references(

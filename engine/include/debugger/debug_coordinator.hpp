@@ -85,6 +85,8 @@ public:
     bool attach(DebugBackend backend = DebugBackend::Win32DebugAPI);
     void detach();
     [[nodiscard]] bool is_attached() const noexcept { return m_is_attached; }
+    [[nodiscard]] bool is_wow64() const noexcept { return m_is_wow64; }
+    [[nodiscard]] bool is_target_64bit() const noexcept;
     [[nodiscard]] DebugBackend backend() const noexcept { return m_backend; }
     [[nodiscard]] DebuggerState state() const noexcept { return m_state; }
     [[nodiscard]] bool is_paused() const noexcept {
@@ -176,6 +178,8 @@ private:
     bool m_user_step_requested{false};
     bool m_silent_step{false};
     bool m_initial_bp_seen{false};
+    bool m_wow64_initial_bp_seen{false};
+    bool m_is_wow64{false};
     uintptr_t m_rearm_bp_addr{0};
     BreakpointCallback m_bp_callback;
 

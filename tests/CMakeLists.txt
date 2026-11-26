@@ -39,6 +39,7 @@ add_executable(engine_tests
     test_v2_decompiler_causality.cpp
     test_v2_remote.cpp
     test_v2_self_healing_and_hybrid.cpp
+    test_wow64_debugger.cpp
 )
 
 target_include_directories(engine_tests PRIVATE

@@ -43,7 +43,8 @@ std::optional<size_t> find_modrm_rip_disp_offset(const std::vector<uint8_t>& ins
 std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
     const std::vector<uint8_t>& orig_bytes,
     uintptr_t orig_addr,
-    uintptr_t dst_base)
+    uintptr_t dst_base,
+    bool is_64bit)
 {
     std::vector<uint8_t> out;
     out.reserve(orig_bytes.size() + 32);
@@ -52,7 +53,7 @@ std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
     while (off < orig_bytes.size()) {
         const uintptr_t src_pc = orig_addr + off;
         const uintptr_t dst_pc = dst_base + out.size();
-        auto insn = Disassembler::decode(orig_bytes.data() + off, orig_bytes.size() - off, src_pc);
+        auto insn = Disassembler::decode(orig_bytes.data() + off, orig_bytes.size() - off, src_pc, is_64bit);
         if (insn.length == 0 || off + insn.length > orig_bytes.size()) {
             return std::nullopt;
         }
@@ -63,9 +64,24 @@ std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
             const auto* p = reinterpret_cast<const uint8_t*>(&v);
             out.insert(out.end(), p, p + 8);
         };
+        auto append_u32 = [&](uint32_t v) {
+            const auto* p = reinterpret_cast<const uint8_t*>(&v);
+            out.insert(out.end(), p, p + 4);
+        };
         auto append_i32 = [&](int32_t v) {
             const auto* p = reinterpret_cast<const uint8_t*>(&v);
             out.insert(out.end(), p, p + 4);
+        };
+        auto append_abs_jmp = [&](uintptr_t target) {
+            if (is_64bit) {
+                const uint8_t jq[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
+                out.insert(out.end(), std::begin(jq), std::end(jq));
+                append_u64(target);
+            } else {
+                out.push_back(0x68); // push imm32
+                append_u32(static_cast<uint32_t>(target));
+                out.push_back(0xC3); // ret
+            }
         };
 
         // 1. Direct JMP (E9 rel32, EB rel8)
@@ -75,9 +91,7 @@ std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
                 out.push_back(0xE9);
                 append_i32(static_cast<int32_t>(delta));
             } else {
-                const uint8_t jq[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-                out.insert(out.end(), std::begin(jq), std::end(jq));
-                append_u64(insn.branch_target);
+                append_abs_jmp(insn.branch_target);
             }
             off += insn.length;
             continue;
@@ -89,11 +103,13 @@ std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
             if (fits_i32(delta)) {
                 out.push_back(0xE8);
                 append_i32(static_cast<int32_t>(delta));
-            } else {
+            } else if (is_64bit) {
                 // call qword ptr [rip+2]; jmp short +8; dq target
                 const uint8_t ci[] = {0xFF, 0x15, 0x02, 0x00, 0x00, 0x00, 0xEB, 0x08};
                 out.insert(out.end(), std::begin(ci), std::end(ci));
                 append_u64(insn.branch_target);
+            } else {
+                return std::nullopt;
             }
             off += insn.length;
             continue;
@@ -110,19 +126,17 @@ std::optional<std::vector<uint8_t>> relocate_stolen_instructions(
                 out.push_back(static_cast<uint8_t>(0x80 | cond));
                 append_i32(static_cast<int32_t>(delta));
             } else {
-                // Inverse short jcc (+14 bytes) over absolute indirect jump
+                // Inverse short jcc over absolute jump
                 out.push_back(static_cast<uint8_t>(0x70 | (cond ^ 1)));
-                out.push_back(14);
-                const uint8_t jq[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-                out.insert(out.end(), std::begin(jq), std::end(jq));
-                append_u64(insn.branch_target);
+                out.push_back(is_64bit ? 14 : 6);
+                append_abs_jmp(insn.branch_target);
             }
             off += insn.length;
             continue;
         }
 
-        // 4. ModRM RIP-relative memory reference ([rip + disp32])
-        if (insn.branch_target != 0 && insn.operands.find("rip +") != std::string::npos) {
+        // 4. ModRM RIP-relative memory reference ([rip + disp32]) (x64 only)
+        if (is_64bit && insn.branch_target != 0 && insn.operands.find("rip +") != std::string::npos) {
             auto disp_off = find_modrm_rip_disp_offset(insn.bytes);
             if (!disp_off) return std::nullopt;
             const int64_t new_disp = static_cast<int64_t>(insn.branch_target) - static_cast<int64_t>(dst_pc + insn.length);
@@ -175,10 +189,12 @@ bool HookEngine::install_detour(
         return false;
     }
 
+    const bool is_64 = (m_process->pointer_size() != 4);
+
     // Determine if relative 32-bit jump can be used
     const int64_t diff = static_cast<int64_t>(destination_address) - static_cast<int64_t>(target_address + 5);
     const bool can_use_rel32 = (diff >= -0x7FFF0000LL && diff <= 0x7FFF0000LL);
-    const size_t min_bytes = can_use_rel32 ? 5 : 14;
+    const size_t min_bytes = can_use_rel32 ? 5 : (is_64 ? 14 : 6);
 
     // Read candidate instruction buffer from target
     constexpr size_t kReadBufSize = 64;
@@ -190,7 +206,7 @@ bool HookEngine::install_detour(
     // Disassemble instructions until boundary >= min_bytes
     size_t stolen_bytes = 0;
     while (stolen_bytes < min_bytes && stolen_bytes < kReadBufSize) {
-        auto inst = Disassembler::decode(buffer.data() + stolen_bytes, kReadBufSize - stolen_bytes, target_address + stolen_bytes);
+        auto inst = Disassembler::decode(buffer.data() + stolen_bytes, kReadBufSize - stolen_bytes, target_address + stolen_bytes, is_64);
         if (inst.length == 0) break;
         stolen_bytes += inst.length;
     }
@@ -208,23 +224,37 @@ bool HookEngine::install_detour(
         return false;
     }
 
-    auto relocated = relocate_stolen_instructions(original_bytes, target_address, tramp_addr);
+    auto relocated = relocate_stolen_instructions(original_bytes, target_address, tramp_addr, is_64);
     if (!relocated) {
         m_process->free_memory(tramp_addr);
         return false;
     }
 
-    // Build trampoline: relocated stolen instructions + 14-byte absolute jump back to (target_address + stolen_bytes)
+    // Build trampoline: relocated stolen instructions + jump back to (target_address + stolen_bytes)
     std::vector<uint8_t> tramp_code = std::move(*relocated);
     tramp_code.reserve(tramp_code.size() + 14);
 
-    // Absolute jump: FF 25 00 00 00 00 <8-byte target_address + stolen_bytes>
     const uint8_t jmp_qword[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-    tramp_code.insert(tramp_code.end(), std::begin(jmp_qword), std::end(jmp_qword));
-
     const uintptr_t return_addr = target_address + stolen_bytes;
-    const auto* ret_ptr = reinterpret_cast<const uint8_t*>(&return_addr);
-    tramp_code.insert(tramp_code.end(), ret_ptr, ret_ptr + sizeof(uintptr_t));
+    if (is_64) {
+        tramp_code.insert(tramp_code.end(), std::begin(jmp_qword), std::end(jmp_qword));
+        const auto* ret_ptr = reinterpret_cast<const uint8_t*>(&return_addr);
+        tramp_code.insert(tramp_code.end(), ret_ptr, ret_ptr + sizeof(uintptr_t));
+    } else {
+        const int64_t back_diff = static_cast<int64_t>(return_addr) - static_cast<int64_t>(tramp_addr + tramp_code.size() + 5);
+        if (back_diff >= -0x7FFF0000LL && back_diff <= 0x7FFF0000LL) {
+            const int32_t rel32 = static_cast<int32_t>(back_diff);
+            tramp_code.push_back(0xE9);
+            const auto* p = reinterpret_cast<const uint8_t*>(&rel32);
+            tramp_code.insert(tramp_code.end(), p, p + 4);
+        } else {
+            const uint32_t ret32 = static_cast<uint32_t>(return_addr);
+            tramp_code.push_back(0x68);
+            const auto* p = reinterpret_cast<const uint8_t*>(&ret32);
+            tramp_code.insert(tramp_code.end(), p, p + 4);
+            tramp_code.push_back(0xC3);
+        }
+    }
 
     // Write trampoline into target process
     if (!m_process->write_raw(tramp_addr, tramp_code.data(), tramp_code.size(), true)) {
@@ -238,9 +268,14 @@ bool HookEngine::install_detour(
         hook_bytes[0] = 0xE9;
         const int32_t rel32 = static_cast<int32_t>(diff);
         std::memcpy(&hook_bytes[1], &rel32, sizeof(int32_t));
-    } else {
+    } else if (is_64) {
         std::memcpy(hook_bytes.data(), jmp_qword, sizeof(jmp_qword));
         std::memcpy(hook_bytes.data() + sizeof(jmp_qword), &destination_address, sizeof(uintptr_t));
+    } else {
+        const uint32_t dst32 = static_cast<uint32_t>(destination_address);
+        hook_bytes[0] = 0x68;
+        std::memcpy(&hook_bytes[1], &dst32, 4);
+        hook_bytes[5] = 0xC3;
     }
 
     // Write hook jump to target_address
@@ -283,15 +318,15 @@ std::optional<HookInfo> HookEngine::install_payload_hook(
         return std::nullopt;
     }
 
-    // We will allocate a cave near target_address, so we can likely use rel32 (min 5 bytes) or abs (14 bytes)
-    // Assume 14 bytes safe boundary
+    const bool is_64 = (m_process->pointer_size() != 4);
+    const size_t min_stolen = is_64 ? 14 : 5;
     size_t stolen_bytes = 0;
-    while (stolen_bytes < 14 && stolen_bytes < kReadBufSize) {
-        auto inst = Disassembler::decode(buffer.data() + stolen_bytes, kReadBufSize - stolen_bytes, target_address + stolen_bytes);
+    while (stolen_bytes < min_stolen && stolen_bytes < kReadBufSize) {
+        auto inst = Disassembler::decode(buffer.data() + stolen_bytes, kReadBufSize - stolen_bytes, target_address + stolen_bytes, is_64);
         if (inst.length == 0) break;
         stolen_bytes += inst.length;
     }
-    if (stolen_bytes < 14) {
+    if (stolen_bytes < min_stolen) {
         return std::nullopt;
     }
 
@@ -308,7 +343,7 @@ std::optional<HookInfo> HookEngine::install_payload_hook(
     // 1. payload instructions
     // 2. relocated stolen original instructions
     // 3. jump back to target_address + stolen_bytes
-    auto relocated = relocate_stolen_instructions(original_bytes, target_address, cave_addr + payload.size());
+    auto relocated = relocate_stolen_instructions(original_bytes, target_address, cave_addr + payload.size(), is_64);
     if (!relocated) {
         m_process->free_memory(cave_addr);
         return std::nullopt;
@@ -320,11 +355,26 @@ std::optional<HookInfo> HookEngine::install_payload_hook(
     cave_code.insert(cave_code.end(), relocated->begin(), relocated->end());
 
     const uint8_t jmp_qword[] = {0xFF, 0x25, 0x00, 0x00, 0x00, 0x00};
-    cave_code.insert(cave_code.end(), std::begin(jmp_qword), std::end(jmp_qword));
-
     const uintptr_t return_addr = target_address + stolen_bytes;
-    const auto* ret_ptr = reinterpret_cast<const uint8_t*>(&return_addr);
-    cave_code.insert(cave_code.end(), ret_ptr, ret_ptr + sizeof(uintptr_t));
+    if (is_64) {
+        cave_code.insert(cave_code.end(), std::begin(jmp_qword), std::end(jmp_qword));
+        const auto* ret_ptr = reinterpret_cast<const uint8_t*>(&return_addr);
+        cave_code.insert(cave_code.end(), ret_ptr, ret_ptr + sizeof(uintptr_t));
+    } else {
+        const int64_t back_diff = static_cast<int64_t>(return_addr) - static_cast<int64_t>(cave_addr + cave_code.size() + 5);
+        if (back_diff >= -0x7FFF0000LL && back_diff <= 0x7FFF0000LL) {
+            const int32_t rel32 = static_cast<int32_t>(back_diff);
+            cave_code.push_back(0xE9);
+            const auto* p = reinterpret_cast<const uint8_t*>(&rel32);
+            cave_code.insert(cave_code.end(), p, p + 4);
+        } else {
+            const uint32_t ret32 = static_cast<uint32_t>(return_addr);
+            cave_code.push_back(0x68);
+            const auto* p = reinterpret_cast<const uint8_t*>(&ret32);
+            cave_code.insert(cave_code.end(), p, p + 4);
+            cave_code.push_back(0xC3);
+        }
+    }
 
     // Write cave code
     if (!m_process->write_raw(cave_addr, cave_code.data(), cave_code.size(), true)) {
@@ -339,9 +389,17 @@ std::optional<HookInfo> HookEngine::install_payload_hook(
         hook_bytes[0] = 0xE9;
         const int32_t rel32 = static_cast<int32_t>(diff);
         std::memcpy(&hook_bytes[1], &rel32, sizeof(int32_t));
-    } else {
+    } else if (is_64) {
         std::memcpy(hook_bytes.data(), jmp_qword, sizeof(jmp_qword));
         std::memcpy(hook_bytes.data() + sizeof(jmp_qword), &cave_addr, sizeof(uintptr_t));
+    } else if (stolen_bytes >= 6) {
+        const uint32_t dst32 = static_cast<uint32_t>(cave_addr);
+        hook_bytes[0] = 0x68;
+        std::memcpy(&hook_bytes[1], &dst32, 4);
+        hook_bytes[5] = 0xC3;
+    } else {
+        m_process->free_memory(cave_addr);
+        return std::nullopt;
     }
 
     if (!m_process->write_raw(target_address, hook_bytes.data(), hook_bytes.size(), true)) {
