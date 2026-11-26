@@ -1,10 +1,29 @@
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#else
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#endif
+
 #include <doctest/doctest.h>
 #include "test_helpers.hpp"
 #include "hal/remote_process.hpp"
 #include "scanner/memory_scanner.hpp"
 #include "session/session.hpp"
 
+#include <chrono>
+#include <cstring>
 #include <memory>
+#include <thread>
 #include <vector>
 
 using namespace nce;
@@ -176,6 +195,154 @@ TEST_CASE("RemoteServer and RemoteProcess expose IProcess and MemoryScanner over
 
         rses.disconnect_remote();
         restart_server.stop();
+    }
+
+    server.stop();
+    CHECK(!server.is_running());
+}
+
+TEST_CASE("RemoteServer hardening (F1-F3): thread reaping, max clients cap, pre-auth limit, constant-time auth") {
+    auto mem = std::make_shared<FakeProcess>(0x4000);
+    mem->set_name("hardened.exe");
+    mem->add_module("hardened.exe", 0, 0x2000);
+    mem->put<int32_t>(0x100, 777);
+
+    hal::RemoteServer::ProcessFactory factory = [mem]() -> std::unique_ptr<hal::IProcess> {
+        struct Adapter final : hal::IProcess {
+            std::shared_ptr<FakeProcess> inner;
+            explicit Adapter(std::shared_ptr<FakeProcess> p) : inner(std::move(p)) {}
+            bool attach(uint32_t pid) override { return inner->attach(pid); }
+            void detach() override { inner->detach(); }
+            bool is_attached() const noexcept override { return inner->is_attached(); }
+            uint32_t get_pid() const noexcept override { return inner->get_pid(); }
+            bool read_raw(uintptr_t a, void* b, size_t s) const override { return inner->read_raw(a, b, s); }
+            bool write_raw(uintptr_t a, const void* b, size_t s, bool f) const override { return inner->write_raw(a, b, s, f); }
+            std::vector<hal::MemoryRegion> query_regions(uint32_t fl) const override { return inner->query_regions(fl); }
+            std::vector<hal::ModuleInfo> get_modules() const override { return inner->get_modules(); }
+            uintptr_t allocate_memory(size_t s, uint32_t p, uintptr_t n) override { return inner->allocate_memory(s, p, n); }
+            bool free_memory(uintptr_t a, size_t s) override { return inner->free_memory(a, s); }
+            size_t pointer_size() const noexcept override { return inner->pointer_size(); }
+            bool can_write() const noexcept override { return inner->can_write(); }
+            std::string name() const override { return inner->name(); }
+            bool suspend() override { return inner->suspend(); }
+            bool resume() override { return inner->resume(); }
+        };
+        return std::make_unique<Adapter>(mem);
+    };
+
+    hal::RemoteServer server(factory, []() {
+        hal::ProcessInfo pi;
+        pi.pid = 1;
+        pi.name = "hardened.exe";
+        return std::vector<hal::ProcessInfo>{pi};
+    });
+    REQUIRE(server.start("127.0.0.1", 0, "topsecret_token"));
+    const uint16_t port = server.bound_port();
+    REQUIRE(port > 0);
+
+    // F1.1: Sequential connect/disconnect reaps worker threads cleanly (active_client_count drops to 0)
+    for (int i = 0; i < 8; ++i) {
+        hal::RemoteProcess c;
+        REQUIRE(c.connect("127.0.0.1", port, "topsecret_token"));
+        c.disconnect();
+    }
+    for (int w = 0; w < 50 && server.active_client_count() > 0; ++w) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(server.active_client_count() == 0);
+
+    // F1.2: Concurrent client cap rejects excess connections while preserving active clients
+    server.set_max_clients(2);
+    hal::RemoteProcess c1, c2, c3, c4;
+    REQUIRE(c1.connect("127.0.0.1", port, "topsecret_token"));
+    REQUIRE(c2.connect("127.0.0.1", port, "topsecret_token"));
+    CHECK(server.active_client_count() == 2);
+    CHECK(!c3.connect("127.0.0.1", port, "topsecret_token"));
+
+    REQUIRE(c1.attach(1));
+    int32_t v = 0;
+    REQUIRE(c1.read<int32_t>(FakeProcess::kBase + 0x100, v));
+    CHECK(v == 777);
+
+    c1.disconnect();
+    for (int w = 0; w < 50 && server.active_client_count() > 1; ++w) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    CHECK(server.active_client_count() <= 1);
+    REQUIRE(c4.connect("127.0.0.1", port, "topsecret_token"));
+    c2.disconnect();
+    c4.disconnect();
+    server.set_max_clients(hal::RemoteServer::kDefaultMaxClients);
+    for (int w = 0; w < 50 && server.active_client_count() > 0; ++w) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    // F2: Pre-auth oversized NCE2 frame header (16 MB > 4 KB cap) closes cleanly without OOM
+    {
+        auto raw_connect = [port]() {
+#ifdef _WIN32
+            WSADATA wsa{};
+            WSAStartup(MAKEWORD(2, 2), &wsa);
+            SOCKET s = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+#else
+            int s = ::socket(AF_INET, SOCK_STREAM, 0);
+#endif
+            struct sockaddr_in sa{};
+            sa.sin_family = AF_INET;
+            sa.sin_port = htons(port);
+            inet_pton(AF_INET, "127.0.0.1", &sa.sin_addr);
+            if (::connect(s, reinterpret_cast<struct sockaddr*>(&sa), sizeof(sa)) != 0) {
+#ifdef _WIN32
+                closesocket(s);
+                return INVALID_SOCKET;
+#else
+                close(s);
+                return -1;
+#endif
+            }
+            return s;
+        };
+
+        auto sock = raw_connect();
+#ifdef _WIN32
+        REQUIRE(sock != INVALID_SOCKET);
+#else
+        REQUIRE(sock >= 0);
+#endif
+        // Magic "NCE2" (0x3245434E LE), cmd=1 (HELLO), flags=0, seq=1, plen=16*1024*1024
+        const uint8_t bad_hdr[16] = {
+            0x4E, 0x43, 0x45, 0x32,
+            0x01, 0x00, 0x00, 0x00,
+            0x01, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x01 // 16 MB
+        };
+        ::send(sock, reinterpret_cast<const char*>(bad_hdr), sizeof(bad_hdr), 0);
+        char dump[16]{};
+        const auto rc = ::recv(sock, dump, sizeof(dump), 0);
+        CHECK(rc <= 0); // Server dropped unauthenticated oversized frame before reading/allocating 16 MB
+#ifdef _WIN32
+        closesocket(sock);
+#else
+        close(sock);
+#endif
+    }
+
+    // F3: Mismatched tokens (same-length, prefix, suffix, empty) must all fail cleanly
+    for (const char* bad_tok : {"topsecret_tokeX", "topsecret", "topsecret_token_extra", ""}) {
+        hal::RemoteProcess bad;
+        CHECK(!bad.connect("127.0.0.1", port, bad_tok));
+        CHECK(!bad.is_connected());
+    }
+
+    // Server still healthy after malformed & rejected probes
+    {
+        hal::RemoteProcess ok;
+        REQUIRE(ok.connect("127.0.0.1", port, "topsecret_token"));
+        REQUIRE(ok.attach(1));
+        int32_t check_v = 0;
+        REQUIRE(ok.read<int32_t>(FakeProcess::kBase + 0x100, check_v));
+        CHECK(check_v == 777);
+        ok.disconnect();
     }
 
     server.stop();

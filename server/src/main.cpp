@@ -65,6 +65,10 @@ int main(int argc, char** argv) {
 
     std::cout << "nce_server listening on " << host << ":" << server.bound_port()
               << (token.empty() ? " (open)" : " (token-protected)") << std::endl;
+    if (token.empty() && host != "127.0.0.1" && host != "localhost" && host != "::1") {
+        std::cerr << "[!] WARNING: Binding non-loopback address '" << host
+                  << "' without --token exposes target process memory without authentication!\n";
+    }
 
     while (!g_stop_requested.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));

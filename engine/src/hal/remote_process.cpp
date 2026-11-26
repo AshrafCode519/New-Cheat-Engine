@@ -13,6 +13,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 #endif
 
@@ -26,6 +27,7 @@ namespace {
 
 constexpr uint32_t kProtoMagic = 0x3245434Eu; // "NCE2"
 constexpr uint32_t kMaxPayloadBytes = 64u * 1024u * 1024u;
+constexpr uint32_t kPreAuthMaxPayload = 4096u; // 4 KB max frame before authentication completes
 
 enum ProtoCmd : uint16_t {
     CMD_HELLO = 1,
@@ -203,7 +205,13 @@ bool write_frame(NativeSock sock, uint16_t cmd, uint32_t seq, const std::vector<
     return payload.empty() || send_all(sock, payload.data(), payload.size());
 }
 
-bool read_frame(NativeSock sock, uint16_t& out_cmd, uint32_t& out_seq, std::vector<uint8_t>& out_payload) {
+bool read_frame(
+    NativeSock sock,
+    uint16_t& out_cmd,
+    uint32_t& out_seq,
+    std::vector<uint8_t>& out_payload,
+    size_t max_payload
+) {
     uint8_t hdr_bytes[16]{};
     if (!recv_all(sock, hdr_bytes, sizeof(hdr_bytes))) return false;
     ByteReader r{hdr_bytes, sizeof(hdr_bytes)};
@@ -212,9 +220,21 @@ bool read_frame(NativeSock sock, uint16_t& out_cmd, uint32_t& out_seq, std::vect
     (void)r.u16();
     out_seq = r.u32();
     const uint32_t plen = r.u32();
-    if (!r.ok || plen > kMaxPayloadBytes) return false;
+    if (!r.ok || plen > max_payload) return false;
     out_payload.resize(plen);
     return plen == 0 || recv_all(sock, out_payload.data(), plen);
+}
+
+bool constant_time_equals(const std::string& a, const std::string& b) noexcept {
+    const size_t min_work = std::max<size_t>(64, std::max(a.size(), b.size()));
+    uint8_t diff = static_cast<uint8_t>((a.size() ^ b.size()) != 0 ? 1 : 0);
+    for (size_t i = 0; i < min_work; ++i) {
+        const uint8_t ca = (i < a.size()) ? static_cast<uint8_t>(a[i]) : 0;
+        const uint8_t cb = (i < b.size()) ? static_cast<uint8_t>(b[i]) : 0;
+        diff = static_cast<uint8_t>(diff | static_cast<uint8_t>(ca ^ cb));
+    }
+    volatile uint8_t keep = diff;
+    return keep == 0;
 }
 
 void set_nodelay(NativeSock s) noexcept {
@@ -223,6 +243,18 @@ void set_nodelay(NativeSock s) noexcept {
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&one), sizeof(one));
 #else
     setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+}
+
+void set_recv_timeout(NativeSock s, uint32_t timeout_ms) noexcept {
+#ifdef _WIN32
+    DWORD ms = timeout_ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&ms), sizeof(ms));
+#else
+    struct timeval tv{};
+    tv.tv_sec = static_cast<long>(timeout_ms / 1000u);
+    tv.tv_usec = static_cast<long>((timeout_ms % 1000u) * 1000u);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
 #endif
 }
 
@@ -354,7 +386,7 @@ bool RemoteProcess::rpc(uint16_t cmd, const std::vector<uint8_t>& req, std::vect
     }
     uint16_t r_cmd = 0;
     uint32_t r_seq = 0;
-    if (!read_frame(s, r_cmd, r_seq, resp) || r_cmd != cmd || r_seq != seq) {
+    if (!read_frame(s, r_cmd, r_seq, resp, kMaxPayloadBytes) || r_cmd != cmd || r_seq != seq) {
         m_last_error = "Network receive/protocol error";
         close_socket_locked();
         return false;
@@ -620,6 +652,36 @@ bool RemoteServer::start(const std::string& bind_host, uint16_t port, const std:
     return true;
 }
 
+void RemoteServer::set_max_clients(size_t max_clients) {
+    std::lock_guard<std::mutex> lock(m_clients_mutex);
+    m_max_clients = std::max<size_t>(1, max_clients);
+}
+
+void RemoteServer::reap_finished_clients() const {
+    std::vector<std::thread> finished;
+    {
+        std::lock_guard<std::mutex> lock(m_clients_mutex);
+        auto it = m_clients.begin();
+        while (it != m_clients.end()) {
+            if (it->done && it->done->load(std::memory_order_acquire)) {
+                if (it->thread.joinable()) finished.push_back(std::move(it->thread));
+                it = m_clients.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+    for (auto& t : finished) {
+        if (t.joinable()) t.join();
+    }
+}
+
+size_t RemoteServer::active_client_count() const {
+    reap_finished_clients();
+    std::lock_guard<std::mutex> lock(m_clients_mutex);
+    return m_clients.size();
+}
+
 void RemoteServer::stop() {
     if (!m_running.exchange(false)) {
         if (m_accept_thread.joinable()) m_accept_thread.join();
@@ -630,19 +692,19 @@ void RemoteServer::stop() {
     m_listen_sock = from_native(kInvalidSock);
     close_native_sock(lsock);
 
+    std::vector<std::thread> threads;
     {
         std::lock_guard<std::mutex> lock(m_clients_mutex);
-        for (uintptr_t cs : m_client_socks) close_native_sock(to_native(cs));
-        m_client_socks.clear();
+        for (auto& w : m_clients) {
+            close_native_sock(to_native(w.sock));
+            w.sock = from_native(kInvalidSock);
+            if (w.thread.joinable()) threads.push_back(std::move(w.thread));
+        }
+        m_clients.clear();
     }
 
     if (m_accept_thread.joinable()) m_accept_thread.join();
 
-    std::vector<std::thread> threads;
-    {
-        std::lock_guard<std::mutex> lock(m_clients_mutex);
-        threads = std::move(m_client_threads);
-    }
     for (auto& t : threads) {
         if (t.joinable()) t.join();
     }
@@ -656,32 +718,42 @@ void RemoteServer::accept_loop() {
         NativeSock cs = ::accept(lsock, nullptr, nullptr);
         if (cs == kInvalidSock) break;
         set_nodelay(cs);
+
+        reap_finished_clients();
+
         std::lock_guard<std::mutex> lock(m_clients_mutex);
-        if (!m_running.load()) {
+        if (!m_running.load() || m_clients.size() >= m_max_clients) {
             close_native_sock(cs);
-            break;
+            if (!m_running.load()) break;
+            continue;
         }
         const uintptr_t h = from_native(cs);
-        m_client_socks.push_back(h);
-        m_client_threads.emplace_back([this, h] { handle_client(h); });
+        auto done = std::make_shared<std::atomic<bool>>(false);
+        ClientWorker w;
+        w.sock = h;
+        w.done = done;
+        w.thread = std::thread([this, h, done] { handle_client(h, done); });
+        m_clients.push_back(std::move(w));
     }
 }
 
-void RemoteServer::handle_client(uintptr_t client_sock) {
+void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::atomic<bool>> done) {
     const NativeSock sock = to_native(client_sock);
     std::unique_ptr<IProcess> proc = m_factory ? m_factory() : IProcess::create();
     bool authed = m_auth_token.empty();
+    if (!authed) set_recv_timeout(sock, 5000);
 
     uint16_t cmd = 0;
     uint32_t seq = 0;
     std::vector<uint8_t> req;
-    while (m_running.load() && read_frame(sock, cmd, seq, req)) {
+    while (m_running.load() && read_frame(sock, cmd, seq, req, authed ? kMaxPayloadBytes : kPreAuthMaxPayload)) {
         ByteWriter resp;
         if (cmd == CMD_HELLO) {
             ByteReader r{req.data(), req.size()};
             const std::string token = r.str();
-            const bool token_ok = m_auth_token.empty() || (r.ok && token == m_auth_token);
+            const bool token_ok = m_auth_token.empty() || (r.ok && constant_time_equals(token, m_auth_token));
             authed = token_ok;
+            if (token_ok) set_recv_timeout(sock, 0);
             resp.u32(token_ok ? 0u : 1u);
             resp.u32(static_cast<uint32_t>(sizeof(uintptr_t)));
             resp.str(host_os_label());
@@ -763,8 +835,12 @@ void RemoteServer::handle_client(uintptr_t client_sock) {
                 const uintptr_t addr = static_cast<uintptr_t>(r.u64());
                 const bool force = r.u8() != 0;
                 const uint32_t sz = r.u32();
+                if (!r.ok || !proc || !r.need(sz)) {
+                    resp.u8(0);
+                    break;
+                }
                 std::vector<uint8_t> tmp(sz);
-                const bool ok = r.ok && proc && r.read_bytes(tmp.data(), sz) && proc->write_raw(addr, tmp.data(), sz, force);
+                const bool ok = r.read_bytes(tmp.data(), sz) && proc->write_raw(addr, tmp.data(), sz, force);
                 resp.u8(ok ? 1 : 0);
                 break;
             }
@@ -811,12 +887,17 @@ void RemoteServer::handle_client(uintptr_t client_sock) {
     if (proc) proc->detach();
     {
         std::lock_guard<std::mutex> lock(m_clients_mutex);
-        auto it = std::find(m_client_socks.begin(), m_client_socks.end(), client_sock);
-        if (it != m_client_socks.end()) {
-            m_client_socks.erase(it);
-            close_native_sock(sock);
+        for (auto& w : m_clients) {
+            if (w.done == done) {
+                if (w.sock != from_native(kInvalidSock)) {
+                    close_native_sock(to_native(w.sock));
+                    w.sock = from_native(kInvalidSock);
+                }
+                break;
+            }
         }
     }
+    if (done) done->store(true, std::memory_order_release);
 }
 
 } // namespace nce::hal

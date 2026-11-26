@@ -99,13 +99,24 @@ public:
     bool start(const std::string& bind_host, uint16_t port, const std::string& auth_token = "");
     void stop();
 
+    static constexpr size_t kDefaultMaxClients = 64;
+    void set_max_clients(size_t max_clients);
+    [[nodiscard]] size_t active_client_count() const;
+
     [[nodiscard]] bool is_running() const noexcept { return m_running.load(); }
     [[nodiscard]] uint16_t bound_port() const noexcept { return m_bound_port.load(); }
     [[nodiscard]] std::string last_error() const;
 
 private:
+    struct ClientWorker {
+        uintptr_t sock{static_cast<uintptr_t>(-1)};
+        std::shared_ptr<std::atomic<bool>> done;
+        std::thread thread;
+    };
+
     void accept_loop();
-    void handle_client(uintptr_t client_sock);
+    void handle_client(uintptr_t client_sock, std::shared_ptr<std::atomic<bool>> done);
+    void reap_finished_clients() const;
 
     ProcessFactory m_factory;
     ProcessListFn m_list_fn;
@@ -117,8 +128,8 @@ private:
 
     std::thread m_accept_thread;
     mutable std::mutex m_clients_mutex;
-    std::vector<uintptr_t> m_client_socks;
-    std::vector<std::thread> m_client_threads;
+    mutable std::vector<ClientWorker> m_clients;
+    size_t m_max_clients{kDefaultMaxClients};
     mutable std::mutex m_err_mutex;
     std::string m_last_error;
 };
