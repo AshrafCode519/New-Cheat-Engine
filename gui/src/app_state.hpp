@@ -14,6 +14,7 @@
 #include "view/vector_detector.hpp"
 #include "utils/sig_generator.hpp"
 #include "utils/hex_utils.hpp"
+#include "utils/updater.hpp"
 
 #include <algorithm>
 #include <cctype>
@@ -321,6 +322,11 @@ struct App {
     bool workspace_dark_theme = true;
     float workspace_font_scale = 1.0f;
     float dpi_scale = 1.0f;
+
+    bool updater_popup_open = false;
+    bool updater_checked = false;
+    std::string updater_status;
+    utils::UpdateInfo updater_info;
 };
 
 // Common helpers (app_common.cpp)

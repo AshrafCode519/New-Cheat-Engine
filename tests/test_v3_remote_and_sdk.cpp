@@ -3,6 +3,7 @@
 #include "debugger/pdb_reader.hpp"
 #include "view/engine_inspector.hpp"
 #include "session/session.hpp"
+#include "utils/updater.hpp"
 
 #include <cstring>
 #include <filesystem>
@@ -279,4 +280,42 @@ TEST_CASE("PluginManager discovers, enables, dispatches hooks, and invokes custo
 
     CHECK(pm.disable_plugin("demo_ext"));
     fs::remove_all(pdir, ec);
+}
+
+TEST_CASE("Updater compares SemVer tags cleanly and parses GitHub Release JSON") {
+    CHECK(utils::Updater::is_newer_version("v3.0.1", "3.0.0"));
+    CHECK(utils::Updater::is_newer_version("v3.1.0", "v3.0.9"));
+    CHECK(utils::Updater::is_newer_version("v4.0.0", "3.9.9"));
+    CHECK(!utils::Updater::is_newer_version("v3.0.0", "3.0.0"));
+    CHECK(!utils::Updater::is_newer_version("v2.9.9", "3.0.0"));
+    CHECK(!utils::Updater::is_newer_version("v3.0.0-rc1", "3.0.0"));
+    CHECK(utils::Updater::is_newer_version("v3.0.0", "3.0.0-rc1"));
+
+    const char* sample_json = R"({
+        "tag_name": "v3.1.0",
+        "html_url": "https://github.com/AshrafCode519/New-Cheat-Engine/releases/tag/v3.1.0",
+        "body": "Performance & v3.1 fixes",
+        "assets": [
+            { "name": "NCE-v3.1.0-linux-x64.tar.gz", "size": 123456, "browser_download_url": "https://example.com/linux.tar.gz" },
+            { "name": "NCE-v3.1.0-windows-x64.zip", "size": 234567, "browser_download_url": "https://example.com/win.zip" }
+        ]
+    })";
+
+    const auto win_info = utils::Updater::parse_github_release_json(sample_json, "3.0.0", true);
+    CHECK(win_info.ok);
+    CHECK(win_info.update_available);
+    CHECK(win_info.latest_version == "3.1.0");
+    CHECK(win_info.asset_name == "NCE-v3.1.0-windows-x64.zip");
+    CHECK(win_info.asset_url == "https://example.com/win.zip");
+
+    const auto lin_info = utils::Updater::parse_github_release_json(sample_json, "3.0.0", false);
+    CHECK(lin_info.ok);
+    CHECK(lin_info.asset_name == "NCE-v3.1.0-linux-x64.tar.gz");
+
+    const auto up_to_date = utils::Updater::parse_github_release_json(sample_json, "3.1.0", true);
+    CHECK(up_to_date.ok);
+    CHECK(!up_to_date.update_available);
+
+    const auto bad = utils::Updater::parse_github_release_json("not json", "3.0.0", true);
+    CHECK(!bad.ok);
 }

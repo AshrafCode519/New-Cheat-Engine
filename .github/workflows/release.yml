@@ -34,8 +34,8 @@ jobs:
         run: |
           cmake -S . -B build -G "MinGW Makefiles" -DNCE_BUILD_TESTS=ON
           cmake --build build -j 4
-      - name: Run Unit Tests
-        run: ./build/bin/engine_tests.exe
+      - name: Run Unit & Live Tests
+        run: ./build/bin/engine_tests.exe && ./build/bin/engine_live_tests.exe
       - name: Package Windows Binaries
         shell: pwsh
         run: |
@@ -59,8 +59,8 @@ jobs:
         run: |
           cmake -S . -B build -DNCE_BUILD_TESTS=ON
           cmake --build build -j 4
-      - name: Run Unit Tests
-        run: ./build/bin/engine_tests
+      - name: Run Unit & Live Tests
+        run: ./build/bin/engine_tests && ./build/bin/engine_live_tests
       - name: Package Linux Binaries
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then

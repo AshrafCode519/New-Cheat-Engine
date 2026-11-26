@@ -395,6 +395,99 @@ void draw_ui(App& app) {
         }
         ImGui::EndPopup();
     }
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Updates")) {
+        app.updater_popup_open = true;
+        ImGui::OpenPopup("Check for Updates##nce_updater");
+        if (!app.updater_checked && !job_running(app)) {
+            app.updater_status = "Querying GitHub Releases...";
+            start_job(app, "Checking for NCE updates", [&app]() -> ApplyResult {
+                auto info = utils::Updater::check_for_updates();
+                return [&app, info = std::move(info)]() mutable {
+                    app.updater_checked = true;
+                    app.updater_info = std::move(info);
+                    if (!app.updater_info.ok) {
+                        app.updater_status = "Update check failed: " + app.updater_info.error;
+                    } else if (app.updater_info.update_available) {
+                        app.updater_status = "Update available: " + app.updater_info.tag_name +
+                                             " (current v" + std::string(utils::kNceVersion) + ")";
+                    } else {
+                        app.updater_status = "Up to date (v" + std::string(utils::kNceVersion) +
+                                             ", latest GitHub " + app.updater_info.tag_name + ").";
+                    }
+                    app.status = app.updater_status;
+                    app.status_timed = false;
+                };
+            });
+        }
+    }
+    if (app.updater_popup_open) {
+        ImGui::SetNextWindowSize(ImVec2(em(30), em(17)), ImGuiCond_Appearing);
+        if (ImGui::BeginPopupModal("Check for Updates##nce_updater", &app.updater_popup_open)) {
+            ImGui::Text("Installed Version: v%s", utils::kNceVersion);
+            if (!app.updater_status.empty()) {
+                ImGui::TextWrapped("%s", app.updater_status.c_str());
+            }
+            ImGui::Spacing();
+            ImGui::BeginDisabled(job_running(app));
+            if (ImGui::Button("Check Now")) {
+                app.updater_status = "Querying GitHub Releases...";
+                start_job(app, "Checking for NCE updates", [&app]() -> ApplyResult {
+                    auto info = utils::Updater::check_for_updates();
+                    return [&app, info = std::move(info)]() mutable {
+                        app.updater_checked = true;
+                        app.updater_info = std::move(info);
+                        if (!app.updater_info.ok) {
+                            app.updater_status = "Update check failed: " + app.updater_info.error;
+                        } else if (app.updater_info.update_available) {
+                            app.updater_status = "Update available: " + app.updater_info.tag_name;
+                        } else {
+                            app.updater_status = "You are on the latest version (latest GitHub: " + app.updater_info.tag_name + ").";
+                        }
+                        app.status = app.updater_status;
+                        app.status_timed = false;
+                    };
+                });
+            }
+            if (app.updater_info.ok && !app.updater_info.asset_url.empty()) {
+                ImGui::SameLine();
+                const std::string dl_label = "Download " + app.updater_info.asset_name;
+                if (ImGui::Button(dl_label.c_str())) {
+                    const std::string dl_url = app.updater_info.asset_url;
+                    const std::string dl_name = app.updater_info.asset_name;
+                    app.updater_status = "Downloading " + dl_name + "...";
+                    start_job(app, "Downloading release package", [&app, dl_url, dl_name]() -> ApplyResult {
+                        std::string err;
+                        const bool ok = utils::Updater::download_file(dl_url, dl_name, err);
+                        return [&app, ok, dl_name, err]() {
+                            app.updater_status = ok ? ("Downloaded package to ./" + dl_name) : ("Download failed: " + err);
+                            app.status = app.updater_status;
+                            app.status_timed = ok;
+                        };
+                    });
+                }
+            }
+            ImGui::EndDisabled();
+            if (app.updater_info.ok && !app.updater_info.release_url.empty()) {
+                ImGui::SameLine();
+                if (ImGui::Button("Open Releases Page")) {
+                    (void)utils::Updater::open_url_in_browser(app.updater_info.release_url);
+                }
+            } else {
+                ImGui::SameLine();
+                if (ImGui::Button("Open Releases Page")) {
+                    (void)utils::Updater::open_url_in_browser("https://github.com/AshrafCode519/New-Cheat-Engine/releases");
+                }
+            }
+            if (!app.updater_info.release_notes.empty()) {
+                ImGui::Separator();
+                ImGui::BeginChild("upd_notes", ImVec2(0, 0), true);
+                ImGui::TextWrapped("%s", app.updater_info.release_notes.c_str());
+                ImGui::EndChild();
+            }
+            ImGui::EndPopup();
+        }
+    }
 
     if (ImGui::GetIO().KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_K, false)) {
         app.cmd_palette_open = true;

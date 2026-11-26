@@ -38,6 +38,7 @@
 #include "assembler/x86_assembler.hpp"
 #include <fstream>
 #include "utils/hex_utils.hpp"
+#include "utils/updater.hpp"
 
 using namespace nce;
 
@@ -206,6 +207,7 @@ void print_help() {
               << "  pdb <mod> [file] | pdb search q - Load local MSF 7.00 .pdb symbols or search\n"
               << "  sdkdump [filter] [out.hpp]      - Generate C++20 SDK.hpp from Unity/Unreal runtime\n"
               << "  plugins [scan|enable|disable]   - Manage plugins/*.lua and custom plugin commands\n"
+              << "  update [download [out_file]]    - Check GitHub Releases (current v" << utils::kNceVersion << ") & download\n"
               << "  eval <lua_expr>                 - Evaluate Lua 5.4 expression (REPL)\n\n"
               << "  help                            - Show this help menu\n"
               << "  quit                            - Exit CLI\n\n";
@@ -3303,6 +3305,32 @@ bool handle_command(const std::string& line) {
             for (const auto& p : pls) {
                 std::cout << "  " << p.id << " [" << (p.loaded ? "loaded" : (p.enabled ? "enabled" : "off"))
                           << "] v" << p.version << " - " << p.name << "\n";
+            }
+        }
+    } else if (cmd == "update") {
+        std::string sub, out_file;
+        (void)(iss >> sub >> out_file);
+        std::cout << "[*] Installed NCE version: v" << utils::kNceVersion << " — checking GitHub Releases...\n";
+        const auto info = utils::Updater::check_for_updates();
+        if (!info.ok) {
+            std::cout << "[-] Update check failed: " << info.error << "\n";
+        } else {
+            std::cout << "[*] Latest release: " << info.tag_name
+                      << (info.update_available ? " [UPDATE AVAILABLE]" : " [UP TO DATE]") << "\n";
+            if (!info.release_url.empty()) std::cout << "    URL  : " << info.release_url << "\n";
+            if (!info.asset_url.empty())   std::cout << "    Asset: " << info.asset_name << " (" << info.asset_url << ")\n";
+            if (sub == "download") {
+                if (info.asset_url.empty()) {
+                    std::cout << "[-] No platform release archive asset found.\n";
+                } else {
+                    const std::string dest = out_file.empty() ? info.asset_name : out_file;
+                    std::string dl_err;
+                    if (utils::Updater::download_file(info.asset_url, dest, dl_err)) {
+                        std::cout << "[+] Downloaded " << dest << "\n";
+                    } else {
+                        std::cout << "[-] Download failed: " << dl_err << "\n";
+                    }
+                }
             }
         }
     } else {

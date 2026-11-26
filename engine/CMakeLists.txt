@@ -20,6 +20,7 @@ add_library(engine STATIC
     src/utils/hex_utils.cpp
     src/utils/text_encoding.cpp
     src/utils/sig_generator.cpp
+    src/utils/updater.cpp
     src/view/vector_detector.cpp
     src/table/cheat_table.cpp
     src/table/ce_table_format.cpp
@@ -64,7 +65,7 @@ target_include_directories(engine PRIVATE
 target_link_libraries(engine PUBLIC lua)
 
 if (WIN32)
-    target_link_libraries(engine PUBLIC psapi dbghelp ws2_32)
+    target_link_libraries(engine PUBLIC psapi dbghelp ws2_32 winhttp shell32)
 else()
     find_package(Threads REQUIRED)
     target_link_libraries(engine PUBLIC ${CMAKE_DL_LIBS} Threads::Threads)
