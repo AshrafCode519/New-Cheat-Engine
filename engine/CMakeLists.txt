@@ -44,7 +44,11 @@ add_library(engine STATIC
     src/debugger/step_debugger.cpp
     src/debugger/decompiler.cpp
     src/debugger/causality_timeline.cpp
+    src/debugger/micro_emulator.cpp
+    src/debugger/protection_inspector.cpp
+    src/debugger/pdb_reader.cpp
     src/script/lua_engine.cpp
+    src/script/plugin_manager.cpp
 )
 
 target_include_directories(engine PUBLIC

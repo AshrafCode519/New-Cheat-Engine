@@ -199,6 +199,13 @@ void print_help() {
               << "  decompile <addr> [struct_addr]  - Lift function CFG to Pseudo-C (with optional struct types)\n"
               << "  timeline [trace|watch|back|next|mut|clear] - Execution causality & memory delta scrubber\n"
               << "  hybrid                          - Show hybrid PE + ELF module summary (Proton/Wine/native)\n"
+              << "  gwatch <addr> [size]            - Stealth PAGE_GUARD watch (leaves DR0-DR3 clean)\n"
+              << "  emulate <addr> [steps]          - Safe copy-on-write micro-emulator dry-run\n"
+              << "  taint <entry> <sink> <reg>      - Backward register taint data-flow trace\n"
+              << "  protect                         - Inspect anti-debug APIs, IAT hooks, and RWX caves\n"
+              << "  pdb <mod> [file] | pdb search q - Load local MSF 7.00 .pdb symbols or search\n"
+              << "  sdkdump [filter] [out.hpp]      - Generate C++20 SDK.hpp from Unity/Unreal runtime\n"
+              << "  plugins [scan|enable|disable]   - Manage plugins/*.lua and custom plugin commands\n"
               << "  eval <lua_expr>                 - Evaluate Lua 5.4 expression (REPL)\n\n"
               << "  help                            - Show this help menu\n"
               << "  quit                            - Exit CLI\n\n";
@@ -3184,8 +3191,129 @@ bool handle_command(const std::string& line) {
             if (!res.output.empty()) std::cout << res.output << "\n";
             if (!res.success) std::cout << "[-] Lua Eval Error: " << res.error << "\n";
         }
+    } else if (cmd == "gwatch") {
+        if (!require_attached()) return true;
+        std::string addr_str;
+        size_t sz = 4;
+        if (!(iss >> addr_str)) {
+            std::cout << "Usage: gwatch <addr> [size]\n";
+        } else if (auto addr = parse_address_arg(addr_str)) {
+            (void)(iss >> sz);
+            if (ses().watch(*addr, sz, debugger::WatchKind::GuardPage)) {
+                std::cout << "[+] Stealth PAGE_GUARD watch armed at " << utils::format_address(*addr)
+                          << " (" << sz << " bytes).\n";
+            } else {
+                std::cout << "[-] Guard-page watch failed (Win32 DebugAPI required).\n";
+            }
+        }
+    } else if (cmd == "emulate") {
+        if (!require_attached()) return true;
+        std::string addr_str;
+        size_t steps = 64;
+        if (!(iss >> addr_str)) {
+            std::cout << "Usage: emulate <addr> [max_steps]\n";
+        } else if (auto addr = parse_address_arg(addr_str)) {
+            (void)(iss >> steps);
+            debugger::Registers regs{};
+            const auto res = ses().emulate_code(*addr, regs, steps);
+            std::cout << "[*] Micro-Emulator: steps=" << res.steps_executed
+                      << " completed=" << (res.completed ? "yes" : "no")
+                      << (res.fault_reason.empty() ? "" : (" stop=" + res.fault_reason)) << "\n"
+                      << "    RAX=" << utils::format_address(res.final_regs.rax)
+                      << " RBX=" << utils::format_address(res.final_regs.rbx)
+                      << " RCX=" << utils::format_address(res.final_regs.rcx)
+                      << " RDX=" << utils::format_address(res.final_regs.rdx)
+                      << " RIP=" << utils::format_address(res.final_regs.rip) << "\n";
+            for (const auto& t : res.trace) {
+                std::cout << "    " << utils::format_address(t.address) << "  " << t.disassembly
+                          << "  ; RAX=0x" << std::hex << t.rax_after << std::dec << "\n";
+            }
+        }
+    } else if (cmd == "taint") {
+        if (!require_attached()) return true;
+        std::string entry_s, sink_s, reg_s;
+        if (!(iss >> entry_s >> sink_s >> reg_s)) {
+            std::cout << "Usage: taint <entry_addr> <sink_addr> <reg>\n";
+        } else if (auto entry_a = parse_address_arg(entry_s)) {
+            if (auto sink_a = parse_address_arg(sink_s)) {
+                const auto steps = ses().trace_backward_taint(*entry_a, *sink_a, reg_s);
+                std::cout << "[*] Backward Taint (" << steps.size() << " step(s)):\n";
+                for (const auto& s : steps) {
+                    std::cout << "  " << utils::format_address(s.address) << "  " << s.instruction;
+                    if (!s.origin_note.empty()) std::cout << "  [" << s.origin_note << "]";
+                    std::cout << "\n";
+                }
+            }
+        }
+    } else if (cmd == "protect") {
+        if (!require_attached()) return true;
+        const auto rep = ses().inspect_protections();
+        std::cout << "[*] " << rep.summary << "\n";
+        for (const auto& f : rep.findings) {
+            std::cout << "  [" << f.severity << "] " << f.category << " @ "
+                      << utils::format_address(f.address) << " (" << f.module_name << "): "
+                      << f.description << "\n";
+        }
+    } else if (cmd == "pdb") {
+        if (!require_attached()) return true;
+        std::string arg1;
+        if (!(iss >> arg1)) {
+            std::cout << "Usage: pdb <module> [pdb_path] | pdb search <query>\n";
+        } else if (arg1 == "search") {
+            std::string q;
+            std::getline(iss >> std::ws, q);
+            const auto hits = ses().search_pdb_symbols(q, 50);
+            std::cout << "[*] PDB matches (" << hits.size() << "):\n";
+            for (const auto& [mname, sym] : hits) {
+                std::cout << "  " << mname << "!" << sym.name << " +0x" << std::hex << sym.rva << std::dec << "\n";
+            }
+        } else {
+            std::string path;
+            std::getline(iss >> std::ws, path);
+            std::string msg;
+            if (ses().load_pdb(arg1, path, msg)) std::cout << "[+] " << msg << "\n";
+            else std::cout << "[-] " << msg << "\n";
+        }
+    } else if (cmd == "sdkdump") {
+        if (!require_attached()) return true;
+        std::string filter, out_path;
+        (void)(iss >> filter >> out_path);
+        const std::string hdr = ses().dump_sdk_header(filter, 256);
+        if (!out_path.empty()) {
+            std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+            if (f) std::cout << "[+] Saved SDK header (" << hdr.size() << " bytes) to " << out_path << "\n";
+            else std::cout << "[-] Failed writing to " << out_path << "\n";
+            if (f) f << hdr;
+        } else {
+            std::cout << hdr.substr(0, std::min<size_t>(hdr.size(), 4000)) << "\n";
+        }
+    } else if (cmd == "plugins") {
+        std::string sub, id;
+        (void)(iss >> sub >> id);
+        if (sub == "scan") {
+            const size_t n = ses().plugins().scan_plugins();
+            std::cout << "[*] Discovered " << n << " plugin(s).\n";
+        } else if (sub == "enable" && !id.empty()) {
+            std::cout << (ses().plugins().enable_plugin(id) ? "[+] Enabled plugin " : "[-] Failed enabling ") << id << "\n";
+        } else if (sub == "disable" && !id.empty()) {
+            std::cout << (ses().plugins().disable_plugin(id) ? "[+] Disabled plugin " : "[-] Not found ") << id << "\n";
+        } else {
+            const auto& pls = ses().plugins().plugins();
+            std::cout << "[*] Plugins (" << pls.size() << "):\n";
+            for (const auto& p : pls) {
+                std::cout << "  " << p.id << " [" << (p.loaded ? "loaded" : (p.enabled ? "enabled" : "off"))
+                          << "] v" << p.version << " - " << p.name << "\n";
+            }
+        }
     } else {
-        std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";
+        std::string rest;
+        std::getline(iss >> std::ws, rest);
+        std::string pout;
+        if (ses().plugins().invoke_command(cmd, rest, pout)) {
+            if (!pout.empty()) std::cout << pout << "\n";
+        } else {
+            std::cout << "[!] Unknown command: '" << cmd << "'. Type 'help' for command list.\n";
+        }
     }
     return true;
 }

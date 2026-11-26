@@ -18,16 +18,24 @@
 #endif
 
 #include "../../include/hal/remote_process.hpp"
+#include "../../include/debugger/access_watcher.hpp"
+#include "../../include/debugger/debug_coordinator.hpp"
+#include "../../include/speedhack/speedhack.hpp"
 #include <algorithm>
+#include <array>
+#include <chrono>
 #include <cstring>
+#include <random>
 
 namespace nce::hal {
 
 namespace {
 
-constexpr uint32_t kProtoMagic = 0x3245434Eu; // "NCE2"
+constexpr uint32_t kProtoMagic = 0x3245434Eu; // "NCE2" (compatible with NCE3 flags)
 constexpr uint32_t kMaxPayloadBytes = 64u * 1024u * 1024u;
 constexpr uint32_t kPreAuthMaxPayload = 4096u; // 4 KB max frame before authentication completes
+constexpr uint16_t kFlagEncrypted = 0x0001u;
+constexpr size_t kTagBytes = 16;
 
 enum ProtoCmd : uint16_t {
     CMD_HELLO = 1,
@@ -43,6 +51,19 @@ enum ProtoCmd : uint16_t {
     CMD_SUSPEND = 11,
     CMD_RESUME = 12,
     CMD_LIST_THREADS = 13,
+    // NCE3 Extensions
+    CMD_WATCH_START = 20,
+    CMD_WATCH_POLL = 21,
+    CMD_WATCH_STOP = 22,
+    CMD_WATCH_CLEAR = 23,
+    CMD_SPEED_SET = 24,
+    CMD_SPEED_RESET = 25,
+    CMD_DBG_ATTACH = 26,
+    CMD_DBG_DETACH = 27,
+    CMD_DBG_SET_BP = 28,
+    CMD_DBG_REMOVE_BP = 29,
+    CMD_DBG_CONTINUE = 30,
+    CMD_DBG_STATE = 31,
 };
 
 #ifdef _WIN32
@@ -193,16 +214,239 @@ struct ByteReader {
     }
 };
 
-bool write_frame(NativeSock sock, uint16_t cmd, uint32_t seq, const std::vector<uint8_t>& payload) {
+struct Sha256 {
+    uint32_t state[8]{
+        0x6a09e667u, 0xbb67ae85u, 0x3c6ef372u, 0xa54ff53au,
+        0x510e527fu, 0x9b05688cu, 0x1f83d9abu, 0x5be0cd19u
+    };
+    uint64_t total_bits{0};
+    uint8_t buf[64]{};
+    size_t buf_len{0};
+
+    static uint32_t rotr(uint32_t x, uint32_t n) noexcept {
+        return (x >> n) | (x << (32u - n));
+    }
+
+    void compress(const uint8_t blk[64]) noexcept {
+        static constexpr uint32_t k[64] = {
+            0x428a2f98u, 0x71374491u, 0xb5c0fbcfu, 0xe9b5dba5u, 0x3956c25bu, 0x59f111f1u, 0x923f82a4u, 0xab1c5ed5u,
+            0xd807aa98u, 0x12835b01u, 0x243185beu, 0x550c7dc3u, 0x72be5d74u, 0x80deb1feu, 0x9bdc06a7u, 0xc19bf174u,
+            0xe49b69c1u, 0xefbe4786u, 0x0fc19dc6u, 0x240ca1ccu, 0x2de92c6fu, 0x4a7484aau, 0x5cb0a9dcu, 0x76f988dau,
+            0x983e5152u, 0xa831c66du, 0xb00327c8u, 0xbf597fc7u, 0xc6e00bf3u, 0xd5a79147u, 0x06ca6351u, 0x14292967u,
+            0x27b70a85u, 0x2e1b2138u, 0x4d2c6dfcu, 0x53380d13u, 0x650a7354u, 0x766a0abbu, 0x81c2c92eu, 0x92722c85u,
+            0xa2bfe8a1u, 0xa81a664bu, 0xc24b8b70u, 0xc76c51a3u, 0xd192e819u, 0xd6990624u, 0xf40e3585u, 0x106aa070u,
+            0x19a4c116u, 0x1e376c08u, 0x2748774cu, 0x34b0bcb5u, 0x391c0cb3u, 0x4ed8aa4au, 0x5b9cca4fu, 0x682e6ff3u,
+            0x748f82eeu, 0x78a5636fu, 0x84c87814u, 0x8cc70208u, 0x90befffau, 0xa4506cebu, 0xbef9a3f7u, 0xc67178f2u
+        };
+        uint32_t w[64]{};
+        for (size_t i = 0; i < 16; ++i) {
+            w[i] = (static_cast<uint32_t>(blk[i * 4]) << 24) |
+                   (static_cast<uint32_t>(blk[i * 4 + 1]) << 16) |
+                   (static_cast<uint32_t>(blk[i * 4 + 2]) << 8) |
+                   static_cast<uint32_t>(blk[i * 4 + 3]);
+        }
+        for (size_t i = 16; i < 64; ++i) {
+            const uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+            const uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+            w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+        }
+        uint32_t a = state[0], b = state[1], c = state[2], d = state[3];
+        uint32_t e = state[4], f = state[5], g = state[6], h = state[7];
+        for (size_t i = 0; i < 64; ++i) {
+            const uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+            const uint32_t ch = (e & f) ^ ((~e) & g);
+            const uint32_t t1 = h + s1 + ch + k[i] + w[i];
+            const uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+            const uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+            const uint32_t t2 = s0 + maj;
+            h = g; g = f; f = e; e = d + t1;
+            d = c; c = b; b = a; a = t1 + t2;
+        }
+        state[0] += a; state[1] += b; state[2] += c; state[3] += d;
+        state[4] += e; state[5] += f; state[6] += g; state[7] += h;
+    }
+
+    void update(const void* data, size_t len) noexcept {
+        const auto* p = static_cast<const uint8_t*>(data);
+        total_bits += static_cast<uint64_t>(len) * 8u;
+        size_t i = 0;
+        if (buf_len > 0) {
+            const size_t take = std::min(len, size_t{64} - buf_len);
+            std::memcpy(buf + buf_len, p, take);
+            buf_len += take;
+            i += take;
+            if (buf_len == 64) {
+                compress(buf);
+                buf_len = 0;
+            }
+        }
+        while (i + 64 <= len) {
+            compress(p + i);
+            i += 64;
+        }
+        if (i < len) {
+            buf_len = len - i;
+            std::memcpy(buf, p + i, buf_len);
+        }
+    }
+
+    std::array<uint8_t, 32> finish() noexcept {
+        buf[buf_len++] = 0x80u;
+        if (buf_len > 56) {
+            while (buf_len < 64) buf[buf_len++] = 0;
+            compress(buf);
+            buf_len = 0;
+        }
+        while (buf_len < 56) buf[buf_len++] = 0;
+        for (int s = 7; s >= 0; --s) {
+            buf[56 + static_cast<size_t>(7 - s)] = static_cast<uint8_t>((total_bits >> (s * 8)) & 0xFFu);
+        }
+        compress(buf);
+        std::array<uint8_t, 32> out{};
+        for (size_t i = 0; i < 8; ++i) {
+            out[i * 4] = static_cast<uint8_t>((state[i] >> 24) & 0xFFu);
+            out[i * 4 + 1] = static_cast<uint8_t>((state[i] >> 16) & 0xFFu);
+            out[i * 4 + 2] = static_cast<uint8_t>((state[i] >> 8) & 0xFFu);
+            out[i * 4 + 3] = static_cast<uint8_t>(state[i] & 0xFFu);
+        }
+        return out;
+    }
+};
+
+std::array<uint8_t, 32> hmac_sha256(
+    const uint8_t key[32],
+    uint8_t dir,
+    uint16_t cmd,
+    uint32_t seq,
+    const uint8_t* data,
+    size_t len
+) {
+    uint8_t ipad[64]{};
+    uint8_t opad[64]{};
+    for (size_t i = 0; i < 64; ++i) {
+        const uint8_t kbyte = (i < 32) ? key[i] : 0;
+        ipad[i] = static_cast<uint8_t>(kbyte ^ 0x36u);
+        opad[i] = static_cast<uint8_t>(kbyte ^ 0x5cu);
+    }
+    uint8_t ad[7]{
+        dir,
+        static_cast<uint8_t>(cmd & 0xFFu),
+        static_cast<uint8_t>((cmd >> 8) & 0xFFu),
+        static_cast<uint8_t>(seq & 0xFFu),
+        static_cast<uint8_t>((seq >> 8) & 0xFFu),
+        static_cast<uint8_t>((seq >> 16) & 0xFFu),
+        static_cast<uint8_t>((seq >> 24) & 0xFFu)
+    };
+    Sha256 inner;
+    inner.update(ipad, 64);
+    inner.update(ad, sizeof(ad));
+    if (len > 0) inner.update(data, len);
+    const auto ih = inner.finish();
+
+    Sha256 outer;
+    outer.update(opad, 64);
+    outer.update(ih.data(), ih.size());
+    return outer.finish();
+}
+
+void xor_keystream(const uint8_t key[32], uint8_t dir, uint32_t seq, uint8_t* data, size_t len) {
+    uint8_t blk_hdr[32 + 9]{};
+    std::memcpy(blk_hdr, key, 32);
+    blk_hdr[32] = dir;
+    blk_hdr[33] = static_cast<uint8_t>(seq & 0xFFu);
+    blk_hdr[34] = static_cast<uint8_t>((seq >> 8) & 0xFFu);
+    blk_hdr[35] = static_cast<uint8_t>((seq >> 16) & 0xFFu);
+    blk_hdr[36] = static_cast<uint8_t>((seq >> 24) & 0xFFu);
+    uint32_t ctr = 0;
+    size_t off = 0;
+    while (off < len) {
+        blk_hdr[37] = static_cast<uint8_t>(ctr & 0xFFu);
+        blk_hdr[38] = static_cast<uint8_t>((ctr >> 8) & 0xFFu);
+        blk_hdr[39] = static_cast<uint8_t>((ctr >> 16) & 0xFFu);
+        blk_hdr[40] = static_cast<uint8_t>((ctr >> 24) & 0xFFu);
+        Sha256 ks;
+        ks.update("NCE3-CTR", 8);
+        ks.update(blk_hdr, sizeof(blk_hdr));
+        const auto pad = ks.finish();
+        const size_t take = std::min<size_t>(32, len - off);
+        for (size_t i = 0; i < take; ++i) {
+            data[off + i] ^= pad[i];
+        }
+        off += take;
+        ++ctr;
+    }
+}
+
+void fill_random_nonce(uint8_t out[16]) {
+    std::random_device rd;
+    const auto now_ns = static_cast<uint64_t>(
+        std::chrono::steady_clock::now().time_since_epoch().count());
+    Sha256 h;
+    for (int i = 0; i < 8; ++i) {
+        const uint32_t v = rd();
+        h.update(&v, sizeof(v));
+    }
+    h.update(&now_ns, sizeof(now_ns));
+    const auto digest = h.finish();
+    std::memcpy(out, digest.data(), 16);
+}
+
+void derive_session_key(
+    const std::string& token,
+    const uint8_t client_nonce[16],
+    const uint8_t server_nonce[16],
+    uint8_t out_key[32]
+) {
+    Sha256 h;
+    h.update("NCE3-KEY:", 9);
+    h.update(token.data(), token.size());
+    h.update(client_nonce, 16);
+    h.update(server_nonce, 16);
+    const auto d = h.finish();
+    std::memcpy(out_key, d.data(), 32);
+}
+
+bool ct_eq_16(const uint8_t* a, const uint8_t* b) noexcept {
+    uint8_t diff = 0;
+    for (size_t i = 0; i < kTagBytes; ++i) {
+        diff = static_cast<uint8_t>(diff | static_cast<uint8_t>(a[i] ^ b[i]));
+    }
+    volatile uint8_t keep = diff;
+    return keep == 0;
+}
+
+bool write_frame(
+    NativeSock sock,
+    uint16_t cmd,
+    uint32_t seq,
+    const std::vector<uint8_t>& payload,
+    const uint8_t* key = nullptr,
+    uint8_t dir = 0
+) {
     if (payload.size() > kMaxPayloadBytes) return false;
+    uint16_t flags = 0;
+    const std::vector<uint8_t>* wire = &payload;
+    std::vector<uint8_t> enc;
+    if (key != nullptr) {
+        flags = kFlagEncrypted;
+        enc.resize(payload.size() + kTagBytes);
+        if (!payload.empty()) {
+            std::memcpy(enc.data(), payload.data(), payload.size());
+            xor_keystream(key, dir, seq, enc.data(), payload.size());
+        }
+        const auto mac = hmac_sha256(key, dir, cmd, seq, enc.data(), payload.size());
+        std::memcpy(enc.data() + payload.size(), mac.data(), kTagBytes);
+        wire = &enc;
+    }
+
     ByteWriter hdr;
     hdr.u32(kProtoMagic);
     hdr.u16(cmd);
-    hdr.u16(0);
+    hdr.u16(flags);
     hdr.u32(seq);
-    hdr.u32(static_cast<uint32_t>(payload.size()));
+    hdr.u32(static_cast<uint32_t>(wire->size()));
     if (!send_all(sock, hdr.buf.data(), hdr.buf.size())) return false;
-    return payload.empty() || send_all(sock, payload.data(), payload.size());
+    return wire->empty() || send_all(sock, wire->data(), wire->size());
 }
 
 bool read_frame(
@@ -210,19 +454,31 @@ bool read_frame(
     uint16_t& out_cmd,
     uint32_t& out_seq,
     std::vector<uint8_t>& out_payload,
-    size_t max_payload
+    size_t max_payload,
+    const uint8_t* key = nullptr,
+    uint8_t dir = 0
 ) {
     uint8_t hdr_bytes[16]{};
     if (!recv_all(sock, hdr_bytes, sizeof(hdr_bytes))) return false;
     ByteReader r{hdr_bytes, sizeof(hdr_bytes)};
     if (r.u32() != kProtoMagic) return false;
     out_cmd = r.u16();
-    (void)r.u16();
+    const uint16_t flags = r.u16();
     out_seq = r.u32();
     const uint32_t plen = r.u32();
     if (!r.ok || plen > max_payload) return false;
     out_payload.resize(plen);
-    return plen == 0 || recv_all(sock, out_payload.data(), plen);
+    if (plen > 0 && !recv_all(sock, out_payload.data(), plen)) return false;
+
+    if (key != nullptr) {
+        if ((flags & kFlagEncrypted) == 0 || plen < kTagBytes) return false;
+        const size_t ct_len = plen - kTagBytes;
+        const auto mac = hmac_sha256(key, dir, out_cmd, out_seq, out_payload.data(), ct_len);
+        if (!ct_eq_16(out_payload.data() + ct_len, mac.data())) return false;
+        if (ct_len > 0) xor_keystream(key, dir, out_seq, out_payload.data(), ct_len);
+        out_payload.resize(ct_len);
+    }
+    return true;
 }
 
 bool constant_time_equals(const std::string& a, const std::string& b) noexcept {
@@ -280,6 +536,8 @@ void RemoteProcess::close_socket_locked() const noexcept {
         close_native_sock(s);
         m_sock = from_native(kInvalidSock);
     }
+    m_encrypted = false;
+    std::memset(m_session_key, 0, sizeof(m_session_key));
 }
 
 bool RemoteProcess::connect(const std::string& host, uint16_t port, const std::string& auth_token) {
@@ -330,8 +588,13 @@ bool RemoteProcess::connect(const std::string& host, uint16_t port, const std::s
         m_last_error.clear();
     }
 
+    uint8_t client_nonce[16]{};
     ByteWriter w;
     w.str(auth_token);
+    if (!auth_token.empty()) {
+        fill_random_nonce(client_nonce);
+        w.raw(client_nonce, sizeof(client_nonce));
+    }
     std::vector<uint8_t> resp;
     if (!rpc(CMD_HELLO, w.buf, resp)) {
         disconnect();
@@ -349,6 +612,15 @@ bool RemoteProcess::connect(const std::string& host, uint16_t port, const std::s
     }
     m_pointer_size = ptr_sz ? static_cast<size_t>(ptr_sz) : sizeof(uintptr_t);
     m_remote_os = os;
+    if (!auth_token.empty() && r.need(16)) {
+        uint8_t server_nonce[16]{};
+        if (r.read_bytes(server_nonce, sizeof(server_nonce))) {
+            std::lock_guard<std::mutex> lock(m_io_mutex);
+            derive_session_key(auth_token, client_nonce, server_nonce, m_session_key);
+            m_encrypted = true;
+        }
+    }
+    m_proto_version = 3;
     return true;
 }
 
@@ -359,11 +631,17 @@ void RemoteProcess::disconnect() {
     m_host.clear();
     m_port = 0;
     m_remote_os.clear();
+    m_proto_version = 2;
 }
 
 bool RemoteProcess::is_connected() const noexcept {
     std::lock_guard<std::mutex> lock(m_io_mutex);
     return to_native(m_sock) != kInvalidSock;
+}
+
+bool RemoteProcess::is_encrypted() const noexcept {
+    std::lock_guard<std::mutex> lock(m_io_mutex);
+    return m_encrypted;
 }
 
 std::string RemoteProcess::last_error() const {
@@ -379,14 +657,15 @@ bool RemoteProcess::rpc(uint16_t cmd, const std::vector<uint8_t>& req, std::vect
         return false;
     }
     const uint32_t seq = m_seq++;
-    if (!write_frame(s, cmd, seq, req)) {
+    const uint8_t* key = m_encrypted ? m_session_key : nullptr;
+    if (!write_frame(s, cmd, seq, req, key, 0x01u)) {
         m_last_error = "Network send failed";
         close_socket_locked();
         return false;
     }
     uint16_t r_cmd = 0;
     uint32_t r_seq = 0;
-    if (!read_frame(s, r_cmd, r_seq, resp, kMaxPayloadBytes) || r_cmd != cmd || r_seq != seq) {
+    if (!read_frame(s, r_cmd, r_seq, resp, kMaxPayloadBytes, key, 0x02u) || r_cmd != cmd || r_seq != seq) {
         m_last_error = "Network receive/protocol error";
         close_socket_locked();
         return false;
@@ -577,6 +856,197 @@ bool RemoteProcess::resume() {
     return r.u8() != 0 && r.ok;
 }
 
+namespace {
+
+void write_regs_array(ByteWriter& w, const debugger::Registers& regs) {
+    w.u64(regs.rax); w.u64(regs.rbx); w.u64(regs.rcx); w.u64(regs.rdx);
+    w.u64(regs.rsi); w.u64(regs.rdi); w.u64(regs.rbp); w.u64(regs.rsp);
+    w.u64(regs.rip);
+    w.u64(regs.r8);  w.u64(regs.r9);  w.u64(regs.r10); w.u64(regs.r11);
+    w.u64(regs.r12); w.u64(regs.r13); w.u64(regs.r14); w.u64(regs.r15);
+    w.u64(regs.eflags);
+}
+
+void read_regs_array(ByteReader& r, uint64_t (&regs)[18]) {
+    for (size_t i = 0; i < 18; ++i) {
+        regs[i] = r.u64();
+    }
+}
+
+} // namespace
+
+bool RemoteProcess::remote_watch_start(uintptr_t address, size_t size, uint8_t kind) {
+    if (!m_attached) return false;
+    ByteWriter w;
+    w.u64(static_cast<uint64_t>(address));
+    w.u32(static_cast<uint32_t>(size));
+    w.u8(kind);
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_WATCH_START, w.buf, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_watch_stop() {
+    if (!is_connected()) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_WATCH_STOP, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_watch_clear() {
+    if (!is_connected()) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_WATCH_CLEAR, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_watch_poll(bool& out_active, std::vector<RemoteWatchHit>& out_hits) const {
+    out_active = false;
+    out_hits.clear();
+    if (!m_attached) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_WATCH_POLL, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    out_active = (r.u8() != 0);
+    const uint32_t count = r.u32();
+    if (!r.ok || count > 10000) return false;
+    out_hits.reserve(count);
+    for (uint32_t i = 0; i < count && r.ok; ++i) {
+        RemoteWatchHit h;
+        h.instruction = static_cast<uintptr_t>(r.u64());
+        h.location = r.str();
+        h.disassembly = r.str();
+        h.base_register = r.str();
+        h.base_offset = static_cast<int64_t>(r.u64());
+        h.count = static_cast<size_t>(r.u64());
+        read_regs_array(r, h.regs);
+        const uint32_t blen = r.u32();
+        if (!r.ok || blen > 64 || !r.need(blen)) return false;
+        h.bytes.resize(blen);
+        if (blen > 0 && !r.read_bytes(h.bytes.data(), blen)) return false;
+        if (r.ok) out_hits.push_back(std::move(h));
+    }
+    return r.ok;
+}
+
+bool RemoteProcess::remote_speed_set(double factor, std::string& out_msg) {
+    out_msg.clear();
+    if (!m_attached) {
+        out_msg = "Not attached";
+        return false;
+    }
+    uint64_t bits = 0;
+    std::memcpy(&bits, &factor, sizeof(bits));
+    ByteWriter w;
+    w.u64(bits);
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_SPEED_SET, w.buf, resp)) {
+        out_msg = last_error();
+        return false;
+    }
+    ByteReader r{resp.data(), resp.size()};
+    const bool ok = (r.u8() != 0);
+    out_msg = r.str();
+    return ok && r.ok;
+}
+
+bool RemoteProcess::remote_speed_reset() {
+    if (!is_connected()) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_SPEED_RESET, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_attach(uint8_t backend, std::string& out_error) {
+    out_error.clear();
+    if (!m_attached) {
+        out_error = "Not attached";
+        return false;
+    }
+    ByteWriter w;
+    w.u8(backend);
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_ATTACH, w.buf, resp)) {
+        out_error = last_error();
+        return false;
+    }
+    ByteReader r{resp.data(), resp.size()};
+    const bool ok = (r.u8() != 0);
+    out_error = r.str();
+    return ok && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_detach() {
+    if (!is_connected()) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_DETACH, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_set_bp(uintptr_t address, const std::string& note, bool temporary,
+                                      const std::string& condition, bool is_tracepoint) {
+    if (!m_attached) return false;
+    ByteWriter w;
+    w.u64(static_cast<uint64_t>(address));
+    w.str(note);
+    w.u8(temporary ? 1 : 0);
+    w.str(condition);
+    w.u8(is_tracepoint ? 1 : 0);
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_SET_BP, w.buf, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_remove_bp(uintptr_t address) {
+    if (!is_connected()) return false;
+    ByteWriter w;
+    w.u64(static_cast<uint64_t>(address));
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_REMOVE_BP, w.buf, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_action(uint8_t action) {
+    if (!m_attached) return false;
+    ByteWriter w;
+    w.u8(action);
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_CONTINUE, w.buf, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    return r.u8() != 0 && r.ok;
+}
+
+bool RemoteProcess::remote_dbg_state(RemoteDebugState& out_state) const {
+    out_state = {};
+    if (!is_connected()) return false;
+    std::vector<uint8_t> resp;
+    if (!rpc(CMD_DBG_STATE, {}, resp)) return false;
+    ByteReader r{resp.data(), resp.size()};
+    out_state.attached = (r.u8() != 0);
+    out_state.state = r.u8();
+    out_state.active_tid = r.u32();
+    read_regs_array(r, out_state.regs);
+    const uint32_t bp_count = r.u32();
+    if (!r.ok || bp_count > 4096) return false;
+    out_state.breakpoints.reserve(bp_count);
+    for (uint32_t i = 0; i < bp_count && r.ok; ++i) {
+        RemoteDebugState::Bp bp;
+        bp.address = static_cast<uintptr_t>(r.u64());
+        bp.enabled = (r.u8() != 0);
+        bp.hits = r.u64();
+        bp.note = r.str();
+        if (r.ok) out_state.breakpoints.push_back(std::move(bp));
+    }
+    return r.ok;
+}
+
 // ---- RemoteServer ---------------------------------------------------------------------------------
 
 RemoteServer::RemoteServer(ProcessFactory factory, ProcessListFn list_fn)
@@ -739,14 +1209,32 @@ void RemoteServer::accept_loop() {
 
 void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::atomic<bool>> done) {
     const NativeSock sock = to_native(client_sock);
-    std::unique_ptr<IProcess> proc = m_factory ? m_factory() : IProcess::create();
+    std::shared_ptr<IProcess> proc(m_factory ? m_factory() : IProcess::create());
+    auto dbg = std::make_shared<debugger::DebugCoordinator>(proc);
+    debugger::AccessWatcher watcher;
+    watcher.set_coordinator(dbg);
+    std::unique_ptr<speedhack::Speedhack> speed;
+
+    auto cleanup_target_tools = [&] {
+        watcher.stop();
+        if (speed) {
+            speed->detach();
+            speed.reset();
+        }
+        dbg->detach();
+    };
+
     bool authed = m_auth_token.empty();
+    bool crypto_active = false;
+    uint8_t session_key[32]{};
     if (!authed) set_recv_timeout(sock, 5000);
 
     uint16_t cmd = 0;
     uint32_t seq = 0;
     std::vector<uint8_t> req;
-    while (m_running.load() && read_frame(sock, cmd, seq, req, authed ? kMaxPayloadBytes : kPreAuthMaxPayload)) {
+    while (m_running.load() &&
+           read_frame(sock, cmd, seq, req, authed ? kMaxPayloadBytes : kPreAuthMaxPayload,
+                      crypto_active ? session_key : nullptr, 0x01u)) {
         ByteWriter resp;
         if (cmd == CMD_HELLO) {
             ByteReader r{req.data(), req.size()};
@@ -757,7 +1245,20 @@ void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::ato
             resp.u32(token_ok ? 0u : 1u);
             resp.u32(static_cast<uint32_t>(sizeof(uintptr_t)));
             resp.str(host_os_label());
-            if (!write_frame(sock, cmd, seq, resp.buf) || !token_ok) break;
+
+            bool enable_crypto_after = false;
+            if (token_ok && !m_auth_token.empty() && r.need(16)) {
+                uint8_t client_nonce[16]{};
+                if (r.read_bytes(client_nonce, sizeof(client_nonce))) {
+                    uint8_t server_nonce[16]{};
+                    fill_random_nonce(server_nonce);
+                    derive_session_key(m_auth_token, client_nonce, server_nonce, session_key);
+                    resp.raw(server_nonce, sizeof(server_nonce));
+                    enable_crypto_after = true;
+                }
+            }
+            if (!write_frame(sock, cmd, seq, resp.buf, nullptr, 0x02u) || !token_ok) break;
+            crypto_active = enable_crypto_after;
             continue;
         }
         if (!authed) break;
@@ -775,6 +1276,7 @@ void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::ato
             }
             case CMD_ATTACH: {
                 const uint32_t pid = r.u32();
+                cleanup_target_tools();
                 const bool ok = r.ok && proc && proc->attach(pid);
                 resp.u8(ok ? 1 : 0);
                 resp.u32(static_cast<uint32_t>(proc ? proc->pointer_size() : sizeof(uintptr_t)));
@@ -783,6 +1285,7 @@ void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::ato
                 break;
             }
             case CMD_DETACH: {
+                cleanup_target_tools();
                 if (proc) proc->detach();
                 resp.u8(1);
                 break;
@@ -877,13 +1380,136 @@ void RemoteServer::handle_client(uintptr_t client_sock, std::shared_ptr<std::ato
                 }
                 break;
             }
+            case CMD_WATCH_START: {
+                const uintptr_t addr = static_cast<uintptr_t>(r.u64());
+                const uint32_t sz = r.u32();
+                const uint8_t kind_raw = r.u8();
+                debugger::WatchKind wk = debugger::WatchKind::Write;
+                if (kind_raw == 1) wk = debugger::WatchKind::Access;
+                else if (kind_raw == 2) wk = debugger::WatchKind::Execute;
+                else if (kind_raw == 3) wk = debugger::WatchKind::GuardPage;
+                const bool ok = r.ok && proc && proc->is_attached() && watcher.start(proc, addr, sz, wk);
+                resp.u8(ok ? 1 : 0);
+                break;
+            }
+            case CMD_WATCH_POLL: {
+                const auto hits = watcher.hits();
+                resp.u8(watcher.watching() ? 1 : 0);
+                resp.u32(static_cast<uint32_t>(hits.size()));
+                for (const auto& h : hits) {
+                    resp.u64(static_cast<uint64_t>(h.instruction));
+                    resp.str(h.location);
+                    resp.str(h.disassembly);
+                    resp.str(h.base_register);
+                    resp.u64(static_cast<uint64_t>(h.base_offset));
+                    resp.u64(static_cast<uint64_t>(h.count));
+                    write_regs_array(resp, h.registers);
+                    resp.u32(static_cast<uint32_t>(h.bytes.size()));
+                    if (!h.bytes.empty()) resp.raw(h.bytes.data(), h.bytes.size());
+                }
+                break;
+            }
+            case CMD_WATCH_STOP: {
+                watcher.stop();
+                resp.u8(1);
+                break;
+            }
+            case CMD_WATCH_CLEAR: {
+                watcher.clear();
+                resp.u8(1);
+                break;
+            }
+            case CMD_SPEED_SET: {
+                const uint64_t bits = r.u64();
+                double factor = 1.0;
+                std::memcpy(&factor, &bits, sizeof(factor));
+                bool ok = false;
+                std::string msg;
+                if (r.ok && proc && proc->is_attached()) {
+                    if (!speed) speed = std::make_unique<speedhack::Speedhack>(proc);
+                    ok = (speed->is_installed() || speed->attach()) && speed->set_speed(factor) && speed->enable();
+                    msg = ok ? "Remote speedhack applied" : "Remote speedhack unsupported or failed";
+                } else {
+                    msg = "Target not attached";
+                }
+                resp.u8(ok ? 1 : 0);
+                resp.str(msg);
+                break;
+            }
+            case CMD_SPEED_RESET: {
+                if (speed) {
+                    speed->detach();
+                    speed.reset();
+                }
+                resp.u8(1);
+                break;
+            }
+            case CMD_DBG_ATTACH: {
+                const uint8_t be = r.u8();
+                const auto backend = (be == 1) ? debugger::DebugBackend::VEH : debugger::DebugBackend::Win32DebugAPI;
+                const bool ok = r.ok && proc && proc->is_attached() && dbg->attach(backend);
+                resp.u8(ok ? 1 : 0);
+                resp.str(ok ? std::string{} : dbg->last_error());
+                break;
+            }
+            case CMD_DBG_DETACH: {
+                dbg->detach();
+                resp.u8(1);
+                break;
+            }
+            case CMD_DBG_SET_BP: {
+                const uintptr_t addr = static_cast<uintptr_t>(r.u64());
+                const std::string note = r.str();
+                const bool temp = (r.u8() != 0);
+                const std::string cond = r.str();
+                const bool trace = (r.u8() != 0);
+                const bool ok = r.ok && dbg->set_breakpoint(addr, note, temp, cond, trace);
+                resp.u8(ok ? 1 : 0);
+                break;
+            }
+            case CMD_DBG_REMOVE_BP: {
+                const uintptr_t addr = static_cast<uintptr_t>(r.u64());
+                const bool ok = r.ok && dbg->remove_breakpoint(addr);
+                resp.u8(ok ? 1 : 0);
+                break;
+            }
+            case CMD_DBG_CONTINUE: {
+                const uint8_t act = r.u8();
+                bool ok = false;
+                if (r.ok) {
+                    if (act == 0) ok = dbg->resume();
+                    else if (act == 1) ok = dbg->pause();
+                    else if (act == 2) ok = dbg->step_into();
+                    else if (act == 3) ok = dbg->step_over();
+                    else if (act == 4) ok = dbg->step_out();
+                }
+                resp.u8(ok ? 1 : 0);
+                break;
+            }
+            case CMD_DBG_STATE: {
+                resp.u8(dbg->is_attached() ? 1 : 0);
+                resp.u8(static_cast<uint8_t>(dbg->state()));
+                resp.u32(dbg->active_thread_id());
+                write_regs_array(resp, dbg->registers());
+                const auto bps = dbg->get_breakpoints();
+                resp.u32(static_cast<uint32_t>(bps.size()));
+                for (const auto& bp : bps) {
+                    resp.u64(static_cast<uint64_t>(bp.address));
+                    resp.u8(bp.is_enabled ? 1 : 0);
+                    resp.u64(static_cast<uint64_t>(bp.hit_count));
+                    resp.str(bp.note);
+                }
+                break;
+            }
             default:
                 resp.u8(0);
                 break;
         }
-        if (!write_frame(sock, cmd, seq, resp.buf)) break;
+        if (!write_frame(sock, cmd, seq, resp.buf, crypto_active ? session_key : nullptr, 0x02u)) break;
     }
 
+    std::memset(session_key, 0, sizeof(session_key));
+    cleanup_target_tools();
     if (proc) proc->detach();
     {
         std::lock_guard<std::mutex> lock(m_clients_mutex);

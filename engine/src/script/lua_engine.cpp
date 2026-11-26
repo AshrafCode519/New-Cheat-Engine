@@ -7,9 +7,14 @@
 #include "debugger/pe_analyzer.hpp"
 #include "debugger/elf_analyzer.hpp"
 #include "debugger/disassembler.hpp"
+#include "debugger/micro_emulator.hpp"
+#include "debugger/protection_inspector.hpp"
+#include "debugger/pdb_reader.hpp"
 #include "view/engine_inspector.hpp"
 #include "assembler/auto_assembler.hpp"
+#include "script/plugin_manager.hpp"
 #include "utils/hex_utils.hpp"
+#include <fstream>
 
 #include <lua.h>
 #include <lualib.h>
@@ -1581,6 +1586,131 @@ int l_connectRemote(lua_State* L) {
     return 2;
 }
 
+int l_emulate(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_pushnil(L); return 1; }
+    const uintptr_t entry = parse_address(L, 1, &s->process());
+    const size_t max_steps = (lua_gettop(L) >= 2 && lua_isinteger(L, 2))
+        ? static_cast<size_t>(std::max<lua_Integer>(1, lua_tointeger(L, 2))) : 64;
+    debugger::Registers regs{};
+    if (lua_gettop(L) >= 3 && lua_istable(L, 3)) {
+        auto read_fld = [&](const char* k, uint64_t& dst) {
+            lua_getfield(L, 3, k);
+            if (lua_isinteger(L, -1)) dst = static_cast<uint64_t>(lua_tointeger(L, -1));
+            else if (lua_isnumber(L, -1)) dst = static_cast<uint64_t>(lua_tonumber(L, -1));
+            lua_pop(L, 1);
+        };
+        read_fld("rax", regs.rax); read_fld("rbx", regs.rbx);
+        read_fld("rcx", regs.rcx); read_fld("rdx", regs.rdx);
+        read_fld("rsi", regs.rsi); read_fld("rdi", regs.rdi);
+        read_fld("rbp", regs.rbp); read_fld("rsp", regs.rsp);
+        read_fld("r8",  regs.r8);  read_fld("r9",  regs.r9);
+    }
+    const auto res = s->emulate_code(entry, regs, max_steps);
+    lua_newtable(L);
+    lua_pushboolean(L, res.completed); lua_setfield(L, -2, "completed");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.steps_executed)); lua_setfield(L, -2, "steps");
+    lua_pushstring(L, res.fault_reason.c_str()); lua_setfield(L, -2, "fault");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rax)); lua_setfield(L, -2, "rax");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rbx)); lua_setfield(L, -2, "rbx");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rcx)); lua_setfield(L, -2, "rcx");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rdx)); lua_setfield(L, -2, "rdx");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rsp)); lua_setfield(L, -2, "rsp");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.final_regs.rip)); lua_setfield(L, -2, "rip");
+    lua_pushinteger(L, static_cast<lua_Integer>(res.accesses.size())); lua_setfield(L, -2, "accesses");
+    return 1;
+}
+
+int l_taintTrace(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_newtable(L); return 1; }
+    const uintptr_t sink = parse_address(L, 1, &s->process());
+    const std::string reg = luaL_checkstring(L, 2);
+    const uintptr_t entry = (lua_gettop(L) >= 3 && !lua_isnil(L, 3)) ? parse_address(L, 3, &s->process()) : sink;
+    const auto steps = s->trace_backward_taint(entry, sink, reg);
+    lua_newtable(L);
+    for (size_t i = 0; i < steps.size(); ++i) {
+        lua_newtable(L);
+        lua_pushinteger(L, static_cast<lua_Integer>(steps[i].address)); lua_setfield(L, -2, "address");
+        lua_pushstring(L, steps[i].instruction.c_str()); lua_setfield(L, -2, "instruction");
+        lua_pushstring(L, steps[i].origin_note.c_str()); lua_setfield(L, -2, "origin");
+        lua_newtable(L);
+        for (size_t j = 0; j < steps[i].tainted_regs.size(); ++j) {
+            lua_pushstring(L, steps[i].tainted_regs[j].c_str());
+            lua_rawseti(L, -2, static_cast<lua_Integer>(j + 1));
+        }
+        lua_setfield(L, -2, "tainted_regs");
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    return 1;
+}
+
+int l_inspectProtections(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_pushnil(L); return 1; }
+    const auto rep = s->inspect_protections();
+    lua_newtable(L);
+    lua_pushinteger(L, rep.risk_score); lua_setfield(L, -2, "risk_score");
+    lua_pushboolean(L, rep.has_anti_debug_apis); lua_setfield(L, -2, "has_anti_debug");
+    lua_pushboolean(L, rep.has_timing_checks); lua_setfield(L, -2, "has_timing");
+    lua_pushboolean(L, rep.has_iat_hooks); lua_setfield(L, -2, "has_iat_hooks");
+    lua_pushboolean(L, rep.has_rwx_caves); lua_setfield(L, -2, "has_rwx_caves");
+    lua_pushstring(L, rep.summary.c_str()); lua_setfield(L, -2, "summary");
+    lua_newtable(L);
+    for (size_t i = 0; i < rep.findings.size(); ++i) {
+        const auto& f = rep.findings[i];
+        lua_newtable(L);
+        lua_pushstring(L, f.category.c_str()); lua_setfield(L, -2, "category");
+        lua_pushstring(L, f.severity.c_str()); lua_setfield(L, -2, "severity");
+        lua_pushinteger(L, static_cast<lua_Integer>(f.address)); lua_setfield(L, -2, "address");
+        lua_pushstring(L, f.module_name.c_str()); lua_setfield(L, -2, "module");
+        lua_pushstring(L, f.description.c_str()); lua_setfield(L, -2, "description");
+        lua_rawseti(L, -2, static_cast<lua_Integer>(i + 1));
+    }
+    lua_setfield(L, -2, "findings");
+    return 1;
+}
+
+int l_loadPDB(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s) { lua_pushboolean(L, false); lua_pushstring(L, "No session"); return 2; }
+    const std::string mod = luaL_checkstring(L, 1);
+    const std::string pdb = (lua_gettop(L) >= 2 && lua_isstring(L, 2)) ? lua_tostring(L, 2) : "";
+    std::string msg;
+    const bool ok = s->load_pdb(mod, pdb, msg);
+    lua_pushboolean(L, ok);
+    lua_pushstring(L, msg.c_str());
+    return 2;
+}
+
+int l_dumpSDK(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s || !s->attached()) { lua_pushstring(L, ""); return 1; }
+    const std::string filter = (lua_gettop(L) >= 1 && lua_isstring(L, 1)) ? lua_tostring(L, 1) : "";
+    const size_t max_cls = (lua_gettop(L) >= 2 && lua_isinteger(L, 2))
+        ? static_cast<size_t>(std::max<lua_Integer>(1, lua_tointeger(L, 2))) : 256;
+    const std::string out_path = (lua_gettop(L) >= 3 && lua_isstring(L, 3)) ? lua_tostring(L, 3) : "";
+    const std::string hdr = s->dump_sdk_header(filter, max_cls);
+    if (!out_path.empty()) {
+        std::ofstream f(out_path, std::ios::binary | std::ios::trunc);
+        if (f) f << hdr;
+    }
+    lua_pushlstring(L, hdr.data(), hdr.size());
+    return 1;
+}
+
+int l_registerPluginCommand(lua_State* L) {
+    auto* s = get_session_from_lua(L);
+    if (!s) { lua_pushboolean(L, false); return 1; }
+    const std::string cmd = luaL_checkstring(L, 1);
+    const std::string help = (lua_gettop(L) >= 2 && lua_isstring(L, 2)) ? lua_tostring(L, 2) : "";
+    const std::string fn = luaL_checkstring(L, 3);
+    const std::string pid = (lua_gettop(L) >= 4 && lua_isstring(L, 4)) ? lua_tostring(L, 4) : "lua";
+    s->plugins().register_command(cmd, pid, help, fn);
+    lua_pushboolean(L, true);
+    return 1;
+}
+
 } // namespace
 
 LuaEngine::LuaEngine(session::Session* session)
@@ -2121,6 +2251,20 @@ void LuaEngine::register_nce_api() {
     lua_setglobal(m_L, "timelineReport");
     lua_pushcfunction(m_L, l_connectRemote);
     lua_setglobal(m_L, "connectRemote");
+
+    // NCE v3.0 APIs
+    lua_pushcfunction(m_L, l_emulate);
+    lua_setglobal(m_L, "emulate");
+    lua_pushcfunction(m_L, l_taintTrace);
+    lua_setglobal(m_L, "taintTrace");
+    lua_pushcfunction(m_L, l_inspectProtections);
+    lua_setglobal(m_L, "inspectProtections");
+    lua_pushcfunction(m_L, l_loadPDB);
+    lua_setglobal(m_L, "loadPDB");
+    lua_pushcfunction(m_L, l_dumpSDK);
+    lua_setglobal(m_L, "dumpSDK");
+    lua_pushcfunction(m_L, l_registerPluginCommand);
+    lua_setglobal(m_L, "registerPluginCommand");
 }
 
 } // namespace nce::script

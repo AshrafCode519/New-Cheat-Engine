@@ -36,9 +36,19 @@ else()
     target_compile_options(imgui PRIVATE -w)
 endif()
 
+set(NCE_GUI_SOURCES
+    src/main.cpp
+    src/app_common.cpp
+    src/tabs/scanner_table_tab.cpp
+    src/tabs/memory_tabs.cpp
+    src/tabs/re_debugger_tabs.cpp
+    src/tabs/tools_tabs.cpp
+)
+
 if (WIN32)
     target_link_libraries(imgui PUBLIC d3d11 d3dcompiler dxgi dwmapi gdi32)
-    add_executable(nce_gui WIN32 src/main.cpp)
+    add_executable(nce_gui WIN32 ${NCE_GUI_SOURCES})
+    target_include_directories(nce_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
     target_link_libraries(nce_gui PRIVATE engine imgui shell32)
 else()
     if (TARGET SDL2::SDL2)
@@ -51,6 +61,7 @@ else()
         target_link_libraries(imgui PUBLIC ${SDL2_LIBRARIES})
     endif()
     target_link_libraries(imgui PUBLIC OpenGL::GL ${CMAKE_DL_LIBS})
-    add_executable(nce_gui src/main.cpp)
+    add_executable(nce_gui ${NCE_GUI_SOURCES})
+    target_include_directories(nce_gui PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../third_party)
     target_link_libraries(nce_gui PRIVATE engine imgui)
 endif()

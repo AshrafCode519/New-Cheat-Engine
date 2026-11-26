@@ -125,9 +125,16 @@ bool AccessWatcher::start(std::shared_ptr<hal::IProcess> process, uintptr_t addr
         }
     }
 
-    int slot = coord->add_hw_watch(address, size, kind, [this](uint32_t tid, uintptr_t rip, const Registers& regs) {
-        on_hw_hit(tid, rip, regs);
-    });
+    int slot = -1;
+    if (kind == WatchKind::GuardPage) {
+        slot = coord->add_guard_watch(address, size, [this](uint32_t tid, uintptr_t rip, const Registers& regs) {
+            on_hw_hit(tid, rip, regs);
+        }) ? 99 : -1;
+    } else {
+        slot = coord->add_hw_watch(address, size, kind, [this](uint32_t tid, uintptr_t rip, const Registers& regs) {
+            on_hw_hit(tid, rip, regs);
+        });
+    }
     if (slot < 0) return false;
 
     {
@@ -147,6 +154,7 @@ void AccessWatcher::stop_address(uintptr_t address) {
     auto coord = m_shared_coordinator ? m_shared_coordinator : m_owned_coordinator;
     if (coord) {
         coord->remove_hw_watch(address);
+        coord->remove_guard_watch(address);
     }
     std::lock_guard<std::mutex> lock(m_mutex);
     m_watched_addresses.erase(
@@ -171,6 +179,7 @@ void AccessWatcher::stop() {
         }
         for (uintptr_t a : to_remove) {
             coord->remove_hw_watch(a);
+            coord->remove_guard_watch(a);
         }
     }
     if (m_owned_coordinator) {
@@ -194,7 +203,7 @@ void AccessWatcher::on_hw_hit(uint32_t, uintptr_t rip, const Registers& regs) {
     const bool is_64 = (m_process->pointer_size() != 4);
     uintptr_t writer_addr = rip;
     DecodedInstruction decoded;
-    if (m_kind == WatchKind::Execute) {
+    if (m_kind == WatchKind::Execute || m_kind == WatchKind::GuardPage) {
         uint8_t code[16] = {0};
         m_process->read_raw(rip, code, sizeof code);
         decoded = Disassembler::decode(code, sizeof code, rip, is_64);

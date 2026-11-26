@@ -14,8 +14,32 @@
 namespace nce::hal {
 
 // Networked IProcess backend communicating with `nce_server` (or in-process RemoteServer)
-// over a framed binary TCP protocol ("NCE2"). Enables remote memory scanning, disassembly,
-// and table management across machines, VMs, WSL, and Steam Deck targets.
+// over a framed binary TCP protocol ("NCE2" / "NCE3" encrypted + remote debug/watch/speed).
+struct RemoteWatchHit {
+    uintptr_t instruction{0};
+    std::string location;
+    std::string disassembly;
+    std::vector<uint8_t> bytes;
+    uint64_t regs[18]{}; // rax,rbx,rcx,rdx,rsi,rdi,rbp,rsp,rip,r8..r15,eflags
+    size_t count{0};
+    std::string base_register;
+    int64_t base_offset{0};
+};
+
+struct RemoteDebugState {
+    bool attached{false};
+    uint8_t state{0}; // matches debugger::DebuggerState
+    uint32_t active_tid{0};
+    uint64_t regs[18]{};
+    struct Bp {
+        uintptr_t address{0};
+        bool enabled{false};
+        uint64_t hits{0};
+        std::string note;
+    };
+    std::vector<Bp> breakpoints;
+};
+
 class RemoteProcess final : public IProcess {
 public:
     RemoteProcess() = default;
@@ -28,6 +52,8 @@ public:
     void disconnect();
 
     [[nodiscard]] bool is_connected() const noexcept;
+    [[nodiscard]] bool is_encrypted() const noexcept;
+    [[nodiscard]] uint32_t protocol_version() const noexcept { return m_proto_version; }
     [[nodiscard]] std::string host() const { return m_host; }
     [[nodiscard]] uint16_t port() const noexcept { return m_port; }
     [[nodiscard]] std::string remote_os() const { return m_remote_os; }
@@ -37,6 +63,23 @@ public:
     [[nodiscard]] std::vector<ProcessInfo> list_remote_processes() const;
     // Lists OS threads belonging to the currently attached remote process
     [[nodiscard]] std::vector<ThreadInfo> list_remote_threads() const;
+
+    // NCE3 Remote Watch / Debugger / Speedhack RPCs
+    bool remote_watch_start(uintptr_t address, size_t size, uint8_t kind);
+    bool remote_watch_stop();
+    bool remote_watch_clear();
+    bool remote_watch_poll(bool& out_active, std::vector<RemoteWatchHit>& out_hits) const;
+
+    bool remote_speed_set(double factor, std::string& out_msg);
+    bool remote_speed_reset();
+
+    bool remote_dbg_attach(uint8_t backend, std::string& out_error);
+    bool remote_dbg_detach();
+    bool remote_dbg_set_bp(uintptr_t address, const std::string& note = "", bool temporary = false,
+                           const std::string& condition = "", bool is_tracepoint = false);
+    bool remote_dbg_remove_bp(uintptr_t address);
+    bool remote_dbg_action(uint8_t action); // 0=resume,1=pause,2=step_into,3=step_over,4=step_out
+    bool remote_dbg_state(RemoteDebugState& out_state) const;
 
     // IProcess overrides
     bool attach(uint32_t pid) override;
@@ -73,6 +116,9 @@ private:
     mutable std::mutex m_io_mutex;
     mutable uintptr_t m_sock{static_cast<uintptr_t>(-1)};
     mutable uint32_t m_seq{1};
+    mutable uint8_t m_session_key[32]{};
+    mutable bool m_encrypted{false};
+    uint32_t m_proto_version{2};
 
     std::atomic<bool> m_attached{false};
     uint32_t m_pid{0};

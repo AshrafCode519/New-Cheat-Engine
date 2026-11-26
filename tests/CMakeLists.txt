@@ -40,6 +40,8 @@ add_executable(engine_tests
     test_v2_remote.cpp
     test_v2_self_healing_and_hybrid.cpp
     test_wow64_debugger.cpp
+    test_v3_emulator_and_stealth.cpp
+    test_v3_remote_and_sdk.cpp
 )
 
 target_include_directories(engine_tests PRIVATE
@@ -49,3 +51,15 @@ target_include_directories(engine_tests PRIVATE
 target_link_libraries(engine_tests PRIVATE engine)
 
 add_test(NAME engine_tests COMMAND engine_tests)
+
+add_executable(engine_live_tests
+    test_live_integration.cpp
+)
+
+target_include_directories(engine_live_tests PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/../third_party
+)
+
+target_link_libraries(engine_live_tests PRIVATE engine)
+
+add_test(NAME engine_live_tests COMMAND engine_live_tests)

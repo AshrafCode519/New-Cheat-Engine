@@ -14,8 +14,8 @@ namespace nce::debugger {
 
 class DebugCoordinator;
 
-// What to catch: a write to the address, any read/write access, or instruction execution
-enum class WatchKind { Write, Access, Execute };
+// What to catch: a write to the address, any read/write access, instruction execution, or stealth PAGE_GUARD trap
+enum class WatchKind { Write, Access, Execute, GuardPage };
 
 struct Registers {
     uint64_t rax{0}, rbx{0}, rcx{0}, rdx{0}, rsi{0}, rdi{0}, rbp{0}, rsp{0}, rip{0};

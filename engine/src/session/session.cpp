@@ -835,12 +835,15 @@ Session::Session(std::shared_ptr<hal::IProcess> process, std::unique_ptr<hal::IH
     : m_process(std::move(process))
     , m_table(std::make_unique<TableKeeper>(m_process, std::move(hotkeys)))
     , m_lua(std::make_unique<script::LuaEngine>(this))
+    , m_plugins(std::make_unique<script::PluginManager>(this))
 {
     m_table->set_lua_runner([this](const std::string& code, std::string& out_msg) -> bool {
         const auto res = run_lua(code);
         out_msg = res.success ? res.output : res.error;
         return res.success;
     });
+    m_plugins->use_default_dirs();
+    m_plugins->scan_plugins();
 }
 
 Session::AttachReport Session::attach(uint32_t pid) {
@@ -881,7 +884,13 @@ Session::AttachReport Session::attach(uint32_t pid) {
         std::lock_guard<std::mutex> slock(m_sym_mutex);
         m_pe_cache.clear();
         m_elf_cache.clear();
+        m_pdb_cache.clear();
+        m_pdb_probed.clear();
     }
+    m_remote_watching = false;
+    m_remote_watch_addr = 0;
+    m_remote_speed_on = false;
+    m_remote_speed = 1.0;
     m_ultimap.clear();
     m_speedhack = std::make_unique<speedhack::Speedhack>(m_process);
     m_debug_coordinator = std::make_shared<debugger::DebugCoordinator>(m_process);
@@ -892,12 +901,23 @@ Session::AttachReport Session::attach(uint32_t pid) {
     m_debugger = std::make_unique<debugger::StepDebugger>(m_process, m_debug_coordinator);
     m_hook_engine = std::make_unique<debugger::HookEngine>(m_process);
     if (m_lua) m_lua->set_session(this);
+    if (m_plugins) m_plugins->dispatch_hook("onAttach");
     report.read_only = !m_process->can_write();
     report.reconciled = attached.reconciled;
     return report;
 }
 
 void Session::detach() {
+    if (m_plugins && attached()) m_plugins->dispatch_hook("onDetach");
+    if (is_remote() && m_remote) {
+        m_remote->remote_watch_stop();
+        m_remote->remote_speed_reset();
+        m_remote->remote_dbg_detach();
+    }
+    m_remote_watching = false;
+    m_remote_watch_addr = 0;
+    m_remote_speed_on = false;
+    m_remote_speed = 1.0;
     m_watcher.stop();
     if (m_hook_engine) {
         m_hook_engine->remove_all_hooks();
@@ -925,6 +945,8 @@ void Session::detach() {
         std::lock_guard<std::mutex> slock(m_sym_mutex);
         m_pe_cache.clear();
         m_elf_cache.clear();
+        m_pdb_cache.clear();
+        m_pdb_probed.clear();
     }
     m_ultimap.clear();
     m_timeline.clear();
@@ -933,8 +955,89 @@ void Session::detach() {
 }
 
 bool Session::watch(uintptr_t address, size_t size, debugger::WatchKind kind) {
-    if (!attached() || is_remote()) return false;
+    if (!attached()) return false;
+    if (is_remote() && m_remote) {
+        uint8_t k = 0;
+        if (kind == debugger::WatchKind::Access) k = 1;
+        else if (kind == debugger::WatchKind::Execute) k = 2;
+        else if (kind == debugger::WatchKind::GuardPage) k = 3;
+        const bool ok = m_remote->remote_watch_start(address, size, k);
+        if (ok) {
+            m_remote_watching = true;
+            m_remote_watch_addr = address;
+        }
+        return ok;
+    }
     return m_watcher.start(m_process, address, size, kind);
+}
+
+void Session::stop_watch() {
+    if (is_remote() && m_remote) {
+        m_remote->remote_watch_stop();
+        m_remote_watching = false;
+        m_remote_watch_addr = 0;
+        return;
+    }
+    m_watcher.stop();
+}
+
+void Session::stop_watch_address(uintptr_t address) {
+    if (is_remote() && m_remote) {
+        if (m_remote_watch_addr == address) stop_watch();
+        return;
+    }
+    m_watcher.stop_address(address);
+}
+
+bool Session::watching() const {
+    if (is_remote()) return m_remote_watching;
+    return m_watcher.watching();
+}
+
+uintptr_t Session::watched_address() const {
+    if (is_remote()) return m_remote_watch_addr;
+    return m_watcher.address();
+}
+
+std::vector<uintptr_t> Session::watched_addresses() const {
+    if (is_remote()) {
+        if (m_remote_watching && m_remote_watch_addr != 0) return {m_remote_watch_addr};
+        return {};
+    }
+    return m_watcher.watched_addresses();
+}
+
+std::vector<debugger::AccessHit> Session::watch_hits() const {
+    if (is_remote() && m_remote) {
+        bool active = false;
+        std::vector<hal::RemoteWatchHit> rhits;
+        if (!m_remote->remote_watch_poll(active, rhits)) return {};
+        std::vector<debugger::AccessHit> out;
+        out.reserve(rhits.size());
+        for (const auto& rh : rhits) {
+            debugger::AccessHit h;
+            h.instruction = rh.instruction;
+            h.location = rh.location;
+            h.disassembly = rh.disassembly;
+            h.bytes = rh.bytes;
+            h.count = rh.count;
+            h.base_register = rh.base_register;
+            h.base_offset = rh.base_offset;
+            h.registers.rax = rh.regs[0]; h.registers.rbx = rh.regs[1];
+            h.registers.rcx = rh.regs[2]; h.registers.rdx = rh.regs[3];
+            h.registers.rsi = rh.regs[4]; h.registers.rdi = rh.regs[5];
+            h.registers.rbp = rh.regs[6]; h.registers.rsp = rh.regs[7];
+            h.registers.rip = rh.regs[8];
+            h.registers.r8  = rh.regs[9];  h.registers.r9  = rh.regs[10];
+            h.registers.r10 = rh.regs[11]; h.registers.r11 = rh.regs[12];
+            h.registers.r12 = rh.regs[13]; h.registers.r13 = rh.regs[14];
+            h.registers.r14 = rh.regs[15]; h.registers.r15 = rh.regs[16];
+            h.registers.eflags = rh.regs[17];
+            out.push_back(std::move(h));
+        }
+        return out;
+    }
+    return m_watcher.hits();
 }
 
 std::optional<hal::ProcessInfo> Session::find_restart() const {
@@ -980,7 +1083,16 @@ std::vector<scanner::PointerPath> Session::find_permanent_paths(const table::Tab
 }
 
 bool Session::set_speed(double multiplier) {
-    if (!m_speedhack || is_remote()) return false;
+    if (is_remote() && m_remote && attached()) {
+        std::string msg;
+        const bool ok = m_remote->remote_speed_set(multiplier, msg);
+        if (ok) {
+            m_remote_speed_on = true;
+            m_remote_speed = multiplier;
+        }
+        return ok;
+    }
+    if (!m_speedhack) return false;
     if (!m_speedhack->is_installed()) {
         if (!m_speedhack->attach()) return false;
     }
@@ -988,7 +1100,13 @@ bool Session::set_speed(double multiplier) {
 }
 
 bool Session::enable_speedhack() {
-    if (!m_speedhack || is_remote()) return false;
+    if (is_remote() && m_remote && attached()) {
+        std::string msg;
+        const bool ok = m_remote->remote_speed_set(m_remote_speed, msg);
+        if (ok) m_remote_speed_on = true;
+        return ok;
+    }
+    if (!m_speedhack) return false;
     if (!m_speedhack->is_installed()) {
         if (!m_speedhack->attach()) return false;
     }
@@ -996,19 +1114,30 @@ bool Session::enable_speedhack() {
 }
 
 bool Session::disable_speedhack() {
-    if (!m_speedhack || is_remote()) return false;
+    if (is_remote() && m_remote) {
+        const bool ok = m_remote->remote_speed_reset();
+        if (ok) {
+            m_remote_speed_on = false;
+            m_remote_speed = 1.0;
+        }
+        return ok;
+    }
+    if (!m_speedhack) return false;
     return m_speedhack->disable();
 }
 
 bool Session::speedhack_installed() const {
+    if (is_remote()) return m_remote_speed_on;
     return m_speedhack && m_speedhack->is_installed();
 }
 
 bool Session::speedhack_enabled() const {
+    if (is_remote()) return m_remote_speed_on;
     return m_speedhack && m_speedhack->is_enabled();
 }
 
 double Session::speedhack_speed() const {
+    if (is_remote()) return m_remote_speed;
     return m_speedhack ? m_speedhack->get_speed() : 1.0;
 }
 
@@ -1162,15 +1291,26 @@ scanner::PointerScanResult Session::scan_saved_pointer_map(
 }
 
 bool Session::dbg_attach(debugger::DebugBackend backend) {
-    if (!m_debugger || is_remote()) return false;
+    if (is_remote() && m_remote && attached()) {
+        std::string err;
+        return m_remote->remote_dbg_attach(backend == debugger::DebugBackend::VEH ? 1 : 0, err);
+    }
+    if (!m_debugger) return false;
     return m_debugger->attach(backend);
 }
 
 void Session::dbg_detach() {
+    if (is_remote() && m_remote) {
+        m_remote->remote_dbg_detach();
+        return;
+    }
     if (m_debugger) m_debugger->detach();
 }
 
 bool Session::dbg_set_bp(uintptr_t addr, const std::string& note, const std::string& condition, bool is_tracepoint) {
+    if (is_remote() && m_remote) {
+        return m_remote->remote_dbg_set_bp(addr, note, false, condition, is_tracepoint);
+    }
     if (!m_debugger) return false;
     return m_debugger->set_breakpoint(addr, note, false, condition, is_tracepoint);
 }
@@ -1196,31 +1336,37 @@ bool Session::inject_dll(const std::string& dll_path, std::string& error_out) {
 }
 
 bool Session::dbg_remove_bp(uintptr_t addr) {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_remove_bp(addr);
     if (!m_debugger) return false;
     return m_debugger->remove_breakpoint(addr);
 }
 
 bool Session::dbg_resume() {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_action(0);
     if (!m_debugger) return false;
     return m_debugger->resume();
 }
 
 bool Session::dbg_pause() {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_action(1);
     if (!m_debugger) return false;
     return m_debugger->pause();
 }
 
 bool Session::dbg_step_into() {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_action(2);
     if (!m_debugger) return false;
     return m_debugger->step_into();
 }
 
 bool Session::dbg_step_over() {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_action(3);
     if (!m_debugger) return false;
     return m_debugger->step_over();
 }
 
 bool Session::dbg_step_out() {
+    if (is_remote() && m_remote) return m_remote->remote_dbg_action(4);
     if (!m_debugger) return false;
     return m_debugger->step_out();
 }
@@ -1317,6 +1463,26 @@ std::string Session::resolve_symbol(uintptr_t address) const {
                     }
                 }
             }
+            if (m_pdb_probed.find(mod.base_address) == m_pdb_probed.end()) {
+                m_pdb_probed.insert(mod.base_address);
+                const std::string comp = debugger::PDBReader::locate_companion_pdb(mod.path);
+                if (!comp.empty()) {
+                    debugger::PDBReader rdr;
+                    if (rdr.load_file(comp)) {
+                        m_pdb_cache.emplace(mod.base_address, std::move(rdr));
+                    }
+                }
+            }
+            auto pdb_it = m_pdb_cache.find(mod.base_address);
+            if (pdb_it != m_pdb_cache.end() && pdb_it->second.is_loaded()) {
+                const uint32_t rva = static_cast<uint32_t>(address - mod.base_address);
+                if (auto sym = pdb_it->second.find_by_rva(rva)) {
+                    if (sym->second == 0) return mod.name + "!" + sym->first.name;
+                    std::ostringstream ss;
+                    ss << mod.name << "!" << sym->first.name << "+0x" << std::hex << std::uppercase << sym->second;
+                    return ss.str();
+                }
+            }
             std::ostringstream ss;
             ss << mod.name << "+0x" << std::hex << std::uppercase << (address - mod.base_address);
             return ss.str();
@@ -1362,9 +1528,12 @@ Outcome Session::connect_remote(const std::string& host, uint16_t port, const st
     m_remote = remote;
     m_process = remote;
     if (m_table) m_table->set_process(remote);
-    std::string msg = "Connected to NCE2 remote " + host + ":" + std::to_string(port);
+    std::string msg = "Connected to NCE3 remote " + host + ":" + std::to_string(port);
     if (!remote->remote_os().empty()) {
         msg += " (" + remote->remote_os() + ", " + std::to_string(remote->pointer_size() * 8) + "-bit)";
+    }
+    if (remote->is_encrypted()) {
+        msg += " [Encrypted SHA256-CTR+HMAC]";
     }
     return Outcome::success(std::move(msg));
 }
@@ -1513,6 +1682,160 @@ table::SignatureMigrationReport Session::migrate_table_signatures() {
     return m_table->with([&](table::CheatTable& t, const std::vector<hal::ModuleInfo>& mods) {
         return table::migrate_table_by_signatures(t, *m_process, mods);
     });
+}
+
+debugger::EmulationResult Session::emulate_code(
+    uintptr_t entry_rip,
+    const debugger::Registers& regs,
+    size_t max_steps,
+    const std::vector<debugger::MemWritePatch>& patches) const
+{
+    if (!attached()) {
+        debugger::EmulationResult r;
+        r.fault_reason = "Not attached to any process.";
+        return r;
+    }
+    const bool is_64 = (m_process->pointer_size() != 4);
+    return debugger::MicroEmulator::emulate(m_process.get(), entry_rip, regs, max_steps, is_64, patches);
+}
+
+debugger::EmulationResult Session::dry_run_hook(
+    uintptr_t target_address,
+    const std::vector<uint8_t>& cave_code,
+    uintptr_t cave_address,
+    const debugger::Registers& regs,
+    size_t max_steps) const
+{
+    if (!attached()) {
+        debugger::EmulationResult r;
+        r.fault_reason = "Not attached to any process.";
+        return r;
+    }
+    return debugger::MicroEmulator::dry_run_hook(*m_process, target_address, cave_code, cave_address, regs, max_steps);
+}
+
+std::vector<debugger::TaintStep> Session::trace_backward_taint(
+    uintptr_t entry_address,
+    uintptr_t sink_address,
+    const std::string& reg_name) const
+{
+    if (!attached()) return {};
+    const auto cfg = build_cfg(entry_address, 256, 48);
+    return debugger::MicroEmulator::backward_taint(cfg, sink_address, reg_name);
+}
+
+debugger::ProtectionReport Session::inspect_protections() const {
+    if (!attached()) return {};
+    return debugger::ProtectionInspector::inspect(*m_process);
+}
+
+bool Session::load_pdb(const std::string& module_name_or_base, const std::string& pdb_path, std::string& out_msg) {
+    out_msg.clear();
+    if (!attached()) {
+        out_msg = "Not attached to any process.";
+        return false;
+    }
+    const auto mods = m_process->get_modules();
+    const hal::ModuleInfo* target_mod = nullptr;
+    const bool looks_hex = module_name_or_base.rfind("0x", 0) == 0 || module_name_or_base.rfind("0X", 0) == 0;
+    const uintptr_t parsed_base = looks_hex ? utils::parse_address(module_name_or_base) : 0;
+    const bool has_addr = (parsed_base != 0);
+    for (const auto& m : mods) {
+        if ((has_addr && m.base_address == parsed_base) ||
+            equals_ignore_case(m.name, module_name_or_base) ||
+            equals_ignore_case(m.path, module_name_or_base)) {
+            target_mod = &m;
+            break;
+        }
+    }
+    if (!target_mod) {
+        out_msg = "Module not found: " + module_name_or_base;
+        return false;
+    }
+    std::string chosen_pdb = pdb_path;
+    if (chosen_pdb.empty()) {
+        chosen_pdb = debugger::PDBReader::locate_companion_pdb(target_mod->path);
+    }
+    if (chosen_pdb.empty()) {
+        out_msg = "No .pdb specified or located next to " + target_mod->path;
+        return false;
+    }
+    debugger::PDBReader rdr;
+    if (!rdr.load_file(chosen_pdb)) {
+        out_msg = rdr.last_error().empty() ? "Failed to parse PDB file." : rdr.last_error();
+        return false;
+    }
+    const size_t sym_count = rdr.symbols().size();
+    {
+        std::lock_guard<std::mutex> lock(m_sym_mutex);
+        m_pdb_probed.insert(target_mod->base_address);
+        m_pdb_cache[target_mod->base_address] = std::move(rdr);
+    }
+    out_msg = "Loaded " + std::to_string(sym_count) + " PDB symbols for " + target_mod->name;
+    return true;
+}
+
+std::vector<std::pair<std::string, debugger::PDBSymbol>> Session::search_pdb_symbols(
+    const std::string& query, size_t max_results) const
+{
+    std::vector<std::pair<std::string, debugger::PDBSymbol>> out;
+    if (!attached()) return out;
+    const auto mods = m_process->get_modules();
+    std::lock_guard<std::mutex> lock(m_sym_mutex);
+    for (const auto& [base, rdr] : m_pdb_cache) {
+        if (!rdr.is_loaded()) continue;
+        std::string mname;
+        for (const auto& m : mods) {
+            if (m.base_address == base) { mname = m.name; break; }
+        }
+        for (const auto& s : rdr.find_by_name(query, max_results)) {
+            out.emplace_back(mname, s);
+            if (out.size() >= max_results) return out;
+        }
+    }
+    return out;
+}
+
+std::string Session::dump_sdk_header(const std::string& filter, size_t max_classes) const {
+    if (!attached()) return "// Not attached to target process.\n";
+    const auto det = detect_game_engine();
+    if (det.kind == view::GameEngineKind::UnityIL2CPP || det.kind == view::GameEngineKind::UnityMono) {
+        const auto meta = inspect_unity_metadata_memory(0, filter, max_classes);
+        if (!meta.types.empty()) {
+            return view::EngineInspector::generate_sdk_header_from_unity(meta, max_classes);
+        }
+    } else if (det.kind == view::GameEngineKind::UnrealEngine) {
+        const auto ug = find_unreal_globals(0);
+        if (ug.found_objects && ug.found_names) {
+            const auto objs = dump_unreal_objects(ug.guobject_array_va, ug.fname_pool_va, {}, filter, max_classes);
+            std::vector<view::SdkClassDef> defs;
+            for (const auto& obj : objs) {
+                auto lay = dissect_unreal_object(obj.address, ug.fname_pool_va);
+                if (lay.fields.empty()) continue;
+                view::SdkClassDef d;
+                d.name = lay.class_name.empty() ? obj.name : lay.class_name;
+                d.size = lay.size;
+                d.fields = std::move(lay.fields);
+                defs.push_back(std::move(d));
+                if (defs.size() >= 64) break;
+            }
+            if (!defs.empty()) {
+                return view::EngineInspector::generate_sdk_header(defs, "Unreal Engine Live SDK Dump");
+            }
+        }
+    }
+    return "// Engine: " + det.engine_name + "\n// " + det.details + "\n// No extractable runtime metadata/objects matched filter.\n";
+}
+
+bool Session::remote_encrypted() const noexcept {
+    return m_remote && m_remote->is_encrypted();
+}
+
+std::optional<hal::RemoteDebugState> Session::remote_debug_state() const {
+    if (!is_remote() || !m_remote) return std::nullopt;
+    hal::RemoteDebugState st;
+    if (!m_remote->remote_dbg_state(st)) return std::nullopt;
+    return st;
 }
 
 } // namespace nce::session

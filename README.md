@@ -3,7 +3,8 @@
 [![Build & Test](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-194%20passed%20(17.8k%2B%20assertions)-brightgreen.svg)](tests/)
+[![Release](https://img.shields.io/badge/Version-v3.0-purple.svg)](https://github.com/AshrafCode519/New-Cheat-Engine)
+[![Tests](https://img.shields.io/badge/Unit%20+%20Live%20Tests-Windows%20%2B%20Linux-brightgreen.svg)](tests/)
 
 > **⚠️ تنويه وإخلاء مسؤولية (Disclaimer):** هذا المشروع مخصّص لأغراض **التعليم، الهندسة العكسية، البحث الأمني، وتعديل الألعاب الفردية (Offline/Single-Player)** فقط.
 > Intended strictly for **educational reverse engineering, security research, and single-player/offline game analysis**.
@@ -11,6 +12,7 @@
 محرك حديث عابر للمنصات (**Windows + Linux**) مكتوب بلغة **C++20** بدون اعتماديات خارجية مسبقة التثبيت لفحص وتعديل الذاكرة والهندسة العكسية، ويضم واجهة رسومية متكاملة (**Dear ImGui + DirectX 11** على ويندوز و**SDL2 + OpenGL 3** على لينكس) وأداة سطر أوامر تفاعلية (`memscan_cli`) ومحرك سكربتات **Lua 5.4** و**Auto-Assembler** مدمج.
 
 ### Quick Start (English Summary)
+- **NCE v3.0 Highlights:** Copy-On-Write x86/x64 `MicroEmulator` + Backward Taint Slicer, Stealth `PAGE_GUARD` Watch + `ProtectionInspector` (Anti-Debug / IAT-Hook / RWX), NCE3 encrypted remote protocol (SHA-256 CTR + HMAC, Remote Debug/Watch/Speedhack), Pure C++ MSF 7.00 `.pdb` reader, Godot + One-Click C++20 `SDK.hpp`/`.CT` Dumper, Lua `PluginManager` (`plugins/*.lua`), Modular GUI + Workspace JSON Persistence, and Live OS `engine_live_tests`.
 - **Prebuilt Releases:** Ready-to-run Windows (`nce_gui.exe`, `memscan_cli.exe`, `nce_server.exe`, `nce_veh.dll`, `target_dummy.exe`) and Linux (`nce_gui`, `memscan_cli`, `nce_server`, `target_dummy`) packages can be downloaded from [GitHub Releases](https://github.com/AshrafCode519/New-Cheat-Engine/releases) when tagged.
 - **Windows (MinGW / CMake):** `cmake -B build -G "MinGW Makefiles" && cmake --build build -j 4` -> outputs `build/bin/nce_gui.exe`, `build/bin/memscan_cli.exe`, `build/bin/nce_server.exe`, `build/bin/nce_veh.dll`, `build/bin/target_dummy.exe`, and `build/bin/engine_tests.exe`.
 - **Linux (GCC / CMake):** `sudo apt install libsdl2-dev libgl-dev && cmake -B build && cmake --build build -j 4` -> outputs `nce_gui`, `memscan_cli`, `nce_server`, `target_dummy`, and `engine_tests` (`LinuxProcess`, `ptrace` debugger, `ELFAnalyzer` + DWARF, `clock_gettime` speedhack).

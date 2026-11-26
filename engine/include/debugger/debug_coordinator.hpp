@@ -107,6 +107,12 @@ public:
     void remove_all_hw_watches();
     [[nodiscard]] std::vector<uintptr_t> active_hw_watch_addresses() const;
 
+    // Stealth Page-Guard watches (Win32 PAGE_GUARD — leaves DR0..DR3 completely untouched)
+    bool add_guard_watch(uintptr_t address, size_t size, HardwareWatchSlot::HitCallback cb);
+    bool remove_guard_watch(uintptr_t address);
+    void remove_all_guard_watches();
+    [[nodiscard]] std::vector<uintptr_t> active_guard_watch_addresses() const;
+
     // Execution control
     bool resume();
     bool pause();
@@ -134,8 +140,19 @@ public:
     void set_breakpoint_callback(BreakpointCallback cb);
 
 private:
+    struct GuardWatchSlot {
+        uintptr_t address{0};
+        size_t size{4};
+        uintptr_t page_base{0};
+        uint32_t orig_prot{0};
+        bool armed{false};
+        HardwareWatchSlot::HitCallback on_hit;
+    };
+
     bool apply_breakpoint(Breakpoint& bp);
     bool restore_breakpoint_byte(Breakpoint& bp);
+    bool apply_guard_page(uintptr_t page_base, uint32_t& out_orig_prot);
+    void restore_guard_page(uintptr_t page_base, uint32_t orig_prot);
     void sync_hw_registers_all_threads();
 
     // Unified event handlers called by Win32, VEH, and Linux ptrace loops.
@@ -181,10 +198,12 @@ private:
     bool m_wow64_initial_bp_seen{false};
     bool m_is_wow64{false};
     uintptr_t m_rearm_bp_addr{0};
+    uintptr_t m_rearm_guard_page{0};
     BreakpointCallback m_bp_callback;
 
     std::map<uintptr_t, Breakpoint> m_breakpoints;
     HardwareWatchSlot m_hw_slots[4]{};
+    std::vector<GuardWatchSlot> m_guard_watches;
     std::vector<hal::ModuleInfo> m_modules;
 
     std::vector<TraceEntry> m_trace_log;

@@ -29,7 +29,7 @@ jobs:
       - name: Verify GUI and Server binaries
         run: test -x ./build/bin/nce_gui.exe && ./build/bin/nce_server.exe --help
       - name: Test
-        run: ./build/bin/engine_tests.exe
+        run: ./build/bin/engine_tests.exe && ./build/bin/engine_live_tests.exe
 
   linux-gcc:
     runs-on: ubuntu-latest
@@ -44,4 +44,4 @@ jobs:
       - name: Verify GUI and Server binaries
         run: test -x ./build/bin/nce_gui && test -x ./build/bin/nce_server && ./build/bin/nce_server --help
       - name: Test
-        run: ./build/bin/engine_tests
+        run: ./build/bin/engine_tests && ./build/bin/engine_live_tests

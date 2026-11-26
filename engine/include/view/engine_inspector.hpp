@@ -13,7 +13,8 @@ enum class GameEngineKind {
     Unknown,
     UnityMono,
     UnityIL2CPP,
-    UnrealEngine
+    UnrealEngine,
+    Godot
 };
 
 struct EngineDetection {
@@ -141,6 +142,13 @@ struct UnrealObjectInfo {
     std::string class_name;
 };
 
+struct SdkClassDef {
+    std::string name;
+    std::string namespaze;
+    size_t size{0};
+    std::vector<StructField> fields;
+};
+
 struct UnrealCalibrationResult {
     bool ok{false};
     UnrealOffsets offsets;
@@ -149,7 +157,7 @@ struct UnrealCalibrationResult {
 
 class EngineInspector {
 public:
-    /// Detects Unity (Mono / IL2CPP) or Unreal Engine in the target process and collects key exports/symbols.
+    /// Detects Unity (Mono / IL2CPP), Unreal Engine, or Godot in the target process and collects key exports/symbols.
     static EngineDetection detect(hal::IProcess& proc);
 
     /// Parses a Unity IL2CPP global-metadata.dat byte buffer and extracts classes and fields.
@@ -227,6 +235,28 @@ public:
         uintptr_t world_or_actor_addr,
         uintptr_t fname_pool_addr,
         const UnrealOffsets& seed = {});
+
+    /// Reflects a live Il2CppClass* pointer directly (supporting probing field offsets from live memory).
+    static StructLayout dissect_il2cpp_class(
+        hal::IProcess& proc,
+        uintptr_t il2cpp_class_addr,
+        uintptr_t instance_addr = 0,
+        const Il2CppClassOffsets& offsets = {});
+
+    /// Generates clean C++20 `SDK.hpp` header structs with static padding and offset checks.
+    static std::string generate_sdk_header(
+        const std::vector<SdkClassDef>& classes,
+        const std::string& header_title = "NCE v3.0 Generated SDK");
+
+    /// Converts parsed Unity IL2CPP metadata types into a C++ `SDK.hpp` header.
+    static std::string generate_sdk_header_from_unity(
+        const UnityMetadataReport& meta,
+        size_t max_classes = 256);
+
+    /// Generates an importable Cheat Engine `.CT` XML table from reflected SDK classes.
+    static std::string generate_sdk_cheat_table_xml(
+        const std::vector<SdkClassDef>& classes,
+        uintptr_t base_instance = 0);
 };
 
 } // namespace nce::view

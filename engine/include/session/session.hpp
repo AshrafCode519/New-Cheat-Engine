@@ -22,8 +22,12 @@
 #include "../debugger/step_debugger.hpp"
 #include "../debugger/decompiler.hpp"
 #include "../debugger/causality_timeline.hpp"
+#include "../debugger/micro_emulator.hpp"
+#include "../debugger/protection_inspector.hpp"
+#include "../debugger/pdb_reader.hpp"
 #include "../hal/injector.hpp"
 #include "../script/lua_engine.hpp"
+#include "../script/plugin_manager.hpp"
 #include <atomic>
 #include <filesystem>
 #include <functional>
@@ -31,6 +35,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <set>
 #include <string>
 #include <thread>
 #include <vector>
@@ -221,15 +226,15 @@ public:
     [[nodiscard]] std::unique_ptr<scanner::ValueTracker> new_tracker(std::vector<scanner::DataType> types) const;
     [[nodiscard]] std::vector<scanner::PointerPath> find_permanent_paths(const table::TableEntry& entry);
 
-    // "Find what writes/accesses this address": hardware breakpoints (up to 4 concurrent DR0-DR3 slots)
-    // sharing the unified DebugCoordinator with StepDebugger so both can run simultaneously.
+    // "Find what writes/accesses this address": hardware breakpoints (DR0-DR3) or stealth GuardPage watches,
+    // supporting both local DebugCoordinator and remote NCE3 sessions.
     bool watch(uintptr_t address, size_t size, debugger::WatchKind kind);
-    void stop_watch() { m_watcher.stop(); }
-    void stop_watch_address(uintptr_t address) { m_watcher.stop_address(address); }
-    [[nodiscard]] bool watching() const { return m_watcher.watching(); }
-    [[nodiscard]] uintptr_t watched_address() const { return m_watcher.address(); }
-    [[nodiscard]] std::vector<uintptr_t> watched_addresses() const { return m_watcher.watched_addresses(); }
-    [[nodiscard]] std::vector<debugger::AccessHit> watch_hits() const { return m_watcher.hits(); }
+    void stop_watch();
+    void stop_watch_address(uintptr_t address);
+    [[nodiscard]] bool watching() const;
+    [[nodiscard]] uintptr_t watched_address() const;
+    [[nodiscard]] std::vector<uintptr_t> watched_addresses() const;
+    [[nodiscard]] std::vector<debugger::AccessHit> watch_hits() const;
 
     // Speedhack: dilates time inside the attached process (QPC and GetTickCount64)
     bool set_speed(double multiplier);
@@ -366,6 +371,35 @@ public:
     [[nodiscard]] std::vector<HybridModuleInfo> inspect_hybrid_modules() const;
     [[nodiscard]] bool is_proton_or_wine() const;
 
+    // NCE v3.0: Micro-Emulator, Taint Slicer, Stealth/Protection Inspector, Local PDB, SDK Dumper, Plugins
+    [[nodiscard]] debugger::EmulationResult emulate_code(
+        uintptr_t entry_rip,
+        const debugger::Registers& regs = {},
+        size_t max_steps = 64,
+        const std::vector<debugger::MemWritePatch>& patches = {}) const;
+    [[nodiscard]] debugger::EmulationResult dry_run_hook(
+        uintptr_t target_address,
+        const std::vector<uint8_t>& cave_code,
+        uintptr_t cave_address,
+        const debugger::Registers& regs = {},
+        size_t max_steps = 64) const;
+    [[nodiscard]] std::vector<debugger::TaintStep> trace_backward_taint(
+        uintptr_t entry_address,
+        uintptr_t sink_address,
+        const std::string& reg_name) const;
+    [[nodiscard]] debugger::ProtectionReport inspect_protections() const;
+
+    bool load_pdb(const std::string& module_name_or_base, const std::string& pdb_path, std::string& out_msg);
+    [[nodiscard]] std::vector<std::pair<std::string, debugger::PDBSymbol>> search_pdb_symbols(
+        const std::string& query, size_t max_results = 64) const;
+
+    [[nodiscard]] std::string dump_sdk_header(const std::string& filter = "", size_t max_classes = 256) const;
+    [[nodiscard]] bool remote_encrypted() const noexcept;
+    [[nodiscard]] std::optional<hal::RemoteDebugState> remote_debug_state() const;
+
+    [[nodiscard]] script::PluginManager& plugins() { return *m_plugins; }
+    [[nodiscard]] const script::PluginManager& plugins() const { return *m_plugins; }
+
     // AOB Self-Healing Table anchors & migration
     Outcome anchor_entry_signature(size_t index, uintptr_t code_address, int64_t struct_offset = 0);
     table::SignatureMigrationReport migrate_table_signatures();
@@ -390,11 +424,18 @@ private:
     std::unique_ptr<debugger::StepDebugger> m_debugger;
     std::unique_ptr<debugger::HookEngine> m_hook_engine;
     std::unique_ptr<script::LuaEngine> m_lua;
+    std::unique_ptr<script::PluginManager> m_plugins;
     mutable std::map<uintptr_t, debugger::PEInfo> m_pe_cache;
     mutable std::map<uintptr_t, debugger::ELFInfo> m_elf_cache;
+    mutable std::map<uintptr_t, debugger::PDBReader> m_pdb_cache;
+    mutable std::set<uintptr_t> m_pdb_probed;
     debugger::UltimapProfiler m_ultimap;
     debugger::CausalityTimeline m_timeline;
     std::shared_ptr<hal::RemoteProcess> m_remote;
+    bool m_remote_watching{false};
+    uintptr_t m_remote_watch_addr{0};
+    bool m_remote_speed_on{false};
+    double m_remote_speed{1.0};
     mutable std::mutex m_sym_mutex;
 };
 

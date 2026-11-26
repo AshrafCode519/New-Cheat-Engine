@@ -323,6 +323,147 @@ std::vector<uintptr_t> DebugCoordinator::active_hw_watch_addresses() const {
     return out;
 }
 
+bool DebugCoordinator::apply_guard_page(uintptr_t page_base, uint32_t& out_orig_prot) {
+#ifdef _WIN32
+    if (m_pid == 0 || page_base == 0) return false;
+    HANDLE hp = OpenProcess(PROCESS_VM_OPERATION | PROCESS_QUERY_INFORMATION, FALSE, m_pid);
+    if (!hp) return false;
+    DWORD prot = static_cast<DWORD>(out_orig_prot);
+    if (prot == 0) {
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hp, reinterpret_cast<LPCVOID>(page_base), &mbi, sizeof(mbi)) == 0 ||
+            mbi.State != MEM_COMMIT) {
+            CloseHandle(hp);
+            return false;
+        }
+        prot = mbi.Protect & ~static_cast<DWORD>(PAGE_GUARD | PAGE_NOCACHE | PAGE_WRITECOMBINE);
+        if (prot == 0 || prot == PAGE_NOACCESS) {
+            CloseHandle(hp);
+            return false;
+        }
+        out_orig_prot = static_cast<uint32_t>(prot);
+    }
+    DWORD dummy = 0;
+    const BOOL ok = VirtualProtectEx(hp, reinterpret_cast<LPVOID>(page_base), 4096, prot | PAGE_GUARD, &dummy);
+    CloseHandle(hp);
+    return ok == TRUE;
+#else
+    (void)page_base;
+    (void)out_orig_prot;
+    return false;
+#endif
+}
+
+void DebugCoordinator::restore_guard_page(uintptr_t page_base, uint32_t orig_prot) {
+#ifdef _WIN32
+    if (m_pid == 0 || page_base == 0 || orig_prot == 0) return;
+    HANDLE hp = OpenProcess(PROCESS_VM_OPERATION, FALSE, m_pid);
+    if (!hp) return;
+    DWORD dummy = 0;
+    VirtualProtectEx(hp, reinterpret_cast<LPVOID>(page_base), 4096, static_cast<DWORD>(orig_prot), &dummy);
+    CloseHandle(hp);
+#else
+    (void)page_base;
+    (void)orig_prot;
+#endif
+}
+
+bool DebugCoordinator::add_guard_watch(uintptr_t address, size_t size, HardwareWatchSlot::HitCallback cb) {
+#ifdef _WIN32
+    if (address == 0) return false;
+    if (size == 0) size = 4;
+    const uintptr_t page_base = address & ~uintptr_t{0xFFF};
+
+    std::lock_guard<std::mutex> lock(m_mutex);
+    for (auto& g : m_guard_watches) {
+        if (g.address == address) {
+            g.size = size;
+            g.on_hit = std::move(cb);
+            if (m_is_attached && !g.armed) {
+                uint32_t prot = g.orig_prot;
+                if (!apply_guard_page(page_base, prot)) return false;
+                g.orig_prot = prot;
+                g.armed = true;
+            }
+            return true;
+        }
+    }
+
+    uint32_t shared_prot = 0;
+    bool already_armed = false;
+    for (const auto& g : m_guard_watches) {
+        if (g.page_base == page_base && g.armed) {
+            shared_prot = g.orig_prot;
+            already_armed = true;
+            break;
+        }
+    }
+
+    GuardWatchSlot slot;
+    slot.address = address;
+    slot.size = size;
+    slot.page_base = page_base;
+    slot.orig_prot = shared_prot;
+    slot.armed = already_armed;
+    slot.on_hit = std::move(cb);
+
+    if (m_is_attached && !slot.armed) {
+        if (!apply_guard_page(page_base, slot.orig_prot)) return false;
+        slot.armed = true;
+    }
+    m_guard_watches.push_back(std::move(slot));
+    return true;
+#else
+    (void)address;
+    (void)size;
+    (void)cb;
+    return false;
+#endif
+}
+
+bool DebugCoordinator::remove_guard_watch(uintptr_t address) {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    auto it = std::find_if(m_guard_watches.begin(), m_guard_watches.end(),
+                           [address](const GuardWatchSlot& g) { return g.address == address; });
+    if (it == m_guard_watches.end()) return false;
+    const uintptr_t page_base = it->page_base;
+    const uint32_t orig_prot = it->orig_prot;
+    const bool was_armed = it->armed;
+    m_guard_watches.erase(it);
+
+    const bool still_used = std::any_of(m_guard_watches.begin(), m_guard_watches.end(),
+                                        [page_base](const GuardWatchSlot& g) { return g.page_base == page_base; });
+    if (!still_used) {
+        if (m_rearm_guard_page == page_base) m_rearm_guard_page = 0;
+        if (was_armed) restore_guard_page(page_base, orig_prot);
+    }
+    return true;
+}
+
+void DebugCoordinator::remove_all_guard_watches() {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<std::pair<uintptr_t, uint32_t>> pages;
+    for (const auto& g : m_guard_watches) {
+        if (g.armed && std::none_of(pages.begin(), pages.end(),
+                                    [&](const auto& p) { return p.first == g.page_base; })) {
+            pages.emplace_back(g.page_base, g.orig_prot);
+        }
+    }
+    m_guard_watches.clear();
+    m_rearm_guard_page = 0;
+    for (const auto& [pg, prot] : pages) {
+        restore_guard_page(pg, prot);
+    }
+}
+
+std::vector<uintptr_t> DebugCoordinator::active_guard_watch_addresses() const {
+    std::lock_guard<std::mutex> lock(m_mutex);
+    std::vector<uintptr_t> out;
+    out.reserve(m_guard_watches.size());
+    for (const auto& g : m_guard_watches) out.push_back(g.address);
+    return out;
+}
+
 bool DebugCoordinator::attach(DebugBackend backend) {
     if (m_is_attached) {
         if (m_backend == backend) return true;
@@ -341,6 +482,7 @@ bool DebugCoordinator::attach(DebugBackend backend) {
     m_wow64_initial_bp_seen = false;
     m_is_wow64 = (m_process->pointer_size() == 4);
     m_rearm_bp_addr = 0;
+    m_rearm_guard_page = 0;
     m_silent_step = false;
     m_resume_pending = false;
     m_step_pending = false;
@@ -401,6 +543,11 @@ bool DebugCoordinator::attach(DebugBackend backend) {
         for (auto& [addr, bp] : m_breakpoints) {
             if (bp.is_enabled) apply_breakpoint(bp);
         }
+        for (auto& g : m_guard_watches) {
+            if (!g.armed && apply_guard_page(g.page_base, g.orig_prot)) {
+                g.armed = true;
+            }
+        }
     }
     sync_hw_registers_all_threads();
     return true;
@@ -436,6 +583,13 @@ void DebugCoordinator::detach() {
             for (auto& [addr, bp] : m_breakpoints) {
                 if (bp.is_enabled) restore_breakpoint_byte(bp);
             }
+            for (auto& g : m_guard_watches) {
+                if (g.armed) {
+                    restore_guard_page(g.page_base, g.orig_prot);
+                    g.armed = false;
+                }
+            }
+            m_rearm_guard_page = 0;
         }
 #ifdef _WIN32
         if (m_veh_state) {
@@ -1058,6 +1212,19 @@ bool DebugCoordinator::process_single_step(uint32_t thread_id, uintptr_t rip, ui
             handled_rearm = true;
         }
 
+        // 2b. Re-arm stealth PAGE_GUARD after the faulting instruction completed
+        if (m_rearm_guard_page != 0) {
+            for (const auto& g : m_guard_watches) {
+                if (g.page_base == m_rearm_guard_page && g.armed) {
+                    uint32_t prot = g.orig_prot;
+                    apply_guard_page(m_rearm_guard_page, prot);
+                    break;
+                }
+            }
+            m_rearm_guard_page = 0;
+            handled_rearm = true;
+        }
+
         // 3. Determine whether this single-step should pause for the user
         if (m_silent_step) {
             m_silent_step = false;
@@ -1210,6 +1377,46 @@ void DebugCoordinator::win32_debug_loop(std::promise<bool> start_promise) {
                             SetThreadContext(th, &ctx);
                         }
                         continue_status = DBG_CONTINUE;
+                    } else if (ex.ExceptionCode == EXCEPTION_GUARD_PAGE) {
+                        const uintptr_t fault_addr = (ex.NumberParameters >= 2)
+                            ? static_cast<uintptr_t>(ex.ExceptionInformation[1])
+                            : 0;
+                        const uintptr_t fault_page = fault_addr & ~uintptr_t{0xFFF};
+                        std::vector<HardwareWatchSlot::HitCallback> guard_cbs;
+                        bool ours = false;
+                        {
+                            std::lock_guard<std::mutex> lock(m_mutex);
+                            for (const auto& g : m_guard_watches) {
+                                if (!g.armed) continue;
+                                if (fault_addr == 0 || g.page_base == fault_page) {
+                                    ours = true;
+                                    const uintptr_t lo = g.address;
+                                    const uintptr_t hi = g.address + g.size;
+                                    if (fault_addr == 0 || (fault_addr + 8 > lo && fault_addr < hi)) {
+                                        if (g.on_hit) guard_cbs.push_back(g.on_hit);
+                                    }
+                                }
+                            }
+                            if (ours) {
+                                m_rearm_guard_page = (fault_page != 0) ? fault_page : m_guard_watches.front().page_base;
+                                m_silent_step = true;
+                            }
+                        }
+                        if (ours) {
+                            for (const auto& cb : guard_cbs) {
+                                cb(ev.dwThreadId, static_cast<uintptr_t>(regs.rip), regs);
+                            }
+                            if (m_is_wow64) {
+                                wctx.EFlags |= 0x100UL;
+                                Wow64SetThreadContext(th, &wctx);
+                            } else {
+                                ctx.EFlags |= 0x100UL;
+                                SetThreadContext(th, &ctx);
+                            }
+                            continue_status = DBG_CONTINUE;
+                        } else {
+                            continue_status = DBG_EXCEPTION_NOT_HANDLED;
+                        }
                     } else {
                         continue_status = DBG_EXCEPTION_NOT_HANDLED;
                     }
@@ -1502,6 +1709,11 @@ void DebugCoordinator::linux_ptrace_loop(std::promise<bool> start_promise) {
         std::lock_guard<std::mutex> lock(m_mutex);
         for (auto& [addr, bp] : m_breakpoints) {
             if (bp.is_enabled) apply_breakpoint(bp);
+        }
+        for (auto& g : m_guard_watches) {
+            if (!g.armed && apply_guard_page(g.page_base, g.orig_prot)) {
+                g.armed = true;
+            }
         }
         for (pid_t tid : attached_tids) {
             apply_dr_to_linux_tid(tid, m_hw_slots);

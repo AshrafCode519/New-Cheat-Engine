@@ -208,11 +208,42 @@ EngineDetection EngineInspector::detect(hal::IProcess& proc) {
         }
     }
 
+    // Check modules for Godot Engine (GDExtension / GDNative / static binary signature)
+    for (const auto& mod : modules) {
+        const std::string ln = to_lower_copy(mod.name);
+        std::map<std::string, uintptr_t> gfound;
+        collect_module_exports(proc, mod.base_address, {
+            "gdextension_interface_get_proc_address",
+            "godot_gdnative_init",
+            "godot_string_new",
+            "godot_object_method_bind_call"
+        }, gfound);
+        bool looks_godot = !gfound.empty() || ln.find("godot") != std::string::npos || ln.find("libgodot") != std::string::npos;
+        if (!looks_godot && main_mod && mod.base_address == main_mod->base_address && mod.size > 0) {
+            const size_t cap = std::min<size_t>(mod.size, 2u * 1024u * 1024u);
+            std::vector<uint8_t> head(cap);
+            if (proc.read_raw(mod.base_address, head.data(), cap)) {
+                static constexpr const char kSig[] = "Godot Engine v";
+                auto it = std::search(head.begin(), head.end(), kSig, kSig + sizeof(kSig) - 1);
+                if (it != head.end()) looks_godot = true;
+            }
+        }
+        if (looks_godot) {
+            det.kind = GameEngineKind::Godot;
+            det.engine_name = "Godot Engine";
+            det.runtime_module = mod.name;
+            det.runtime_base = mod.base_address;
+            det.api_exports = std::move(gfound);
+            det.details = "Detected Godot Engine runtime module " + mod.name;
+            return det;
+        }
+    }
+
     if (main_mod) {
         det.runtime_module = main_mod->name;
         det.runtime_base = main_mod->base_address;
     }
-    det.details = "No Unity or Unreal runtime module detected cleanly.";
+    det.details = "No Unity, Unreal, or Godot runtime module detected cleanly.";
     return det;
 }
 
@@ -1152,6 +1183,237 @@ UnrealCalibrationResult EngineInspector::calibrate_unreal_offsets(
 
     res.ok = !res.notes.empty();
     return res;
+}
+
+namespace {
+
+std::string sanitize_c_ident(const std::string& raw, const std::string& fallback) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (std::isalnum(static_cast<unsigned char>(c)) || c == '_') {
+            out.push_back(c);
+        } else if (c == '.' || c == ':' || c == '-' || c == ' ') {
+            out.push_back('_');
+        }
+    }
+    if (out.empty()) out = fallback;
+    if (std::isdigit(static_cast<unsigned char>(out[0]))) {
+        out.insert(out.begin(), '_');
+    }
+    return out;
+}
+
+std::string sanitize_xml_attr(const std::string& raw) {
+    std::string out;
+    out.reserve(raw.size());
+    for (char c : raw) {
+        if (c == '&') out += "&amp;";
+        else if (c == '<') out += "&lt;";
+        else if (c == '>') out += "&gt;";
+        else if (c == '"') out += "&quot;";
+        else out.push_back(c);
+    }
+    return out;
+}
+
+std::string c_type_from_field(const StructField& f) {
+    if (f.type == "float") return "float";
+    if (f.type == "double") return "double";
+    if (f.type == "bool") return "bool";
+    if (f.type == "UObject*" || f.type.find('*') != std::string::npos) return "uintptr_t";
+    if (f.size == 1) return "uint8_t";
+    if (f.size == 2) return "uint16_t";
+    if (f.size == 8) return "uint64_t";
+    return "int32_t";
+}
+
+} // namespace
+
+StructLayout EngineInspector::dissect_il2cpp_class(
+    hal::IProcess& proc,
+    uintptr_t il2cpp_class_addr,
+    uintptr_t instance_addr,
+    const Il2CppClassOffsets& offsets)
+{
+    StructLayout layout;
+    layout.address = instance_addr ? instance_addr : il2cpp_class_addr;
+    if (!proc.is_attached() || il2cpp_class_addr == 0) return layout;
+
+    auto read_remote_cstr = [&](uintptr_t ptr) -> std::string {
+        if (ptr == 0) return {};
+        char buf[128]{};
+        if (!proc.read_raw(ptr, buf, sizeof(buf) - 1)) return {};
+        buf[sizeof(buf) - 1] = '\0';
+        return std::string(buf);
+    };
+
+    uintptr_t name_ptr = 0;
+    uintptr_t ns_ptr = 0;
+    read_ptr(proc, il2cpp_class_addr + offsets.class_name_ptr_offset, name_ptr);
+    read_ptr(proc, il2cpp_class_addr + offsets.class_ns_ptr_offset, ns_ptr);
+    const std::string cname = read_remote_cstr(name_ptr);
+    const std::string cns = read_remote_cstr(ns_ptr);
+    layout.class_name = cns.empty() ? cname : (cns + "." + cname);
+
+    uintptr_t fields_ptr = 0;
+    uint16_t field_count = 0;
+    if (!read_ptr(proc, il2cpp_class_addr + offsets.class_fields_ptr_offset, fields_ptr) ||
+        !proc.read_raw(il2cpp_class_addr + offsets.class_field_count_offset, &field_count, sizeof(field_count)) ||
+        fields_ptr == 0) {
+        return layout;
+    }
+
+    const uint16_t cap = std::min<uint16_t>(field_count, 512);
+    size_t max_end = 16;
+    for (uint16_t i = 0; i < cap; ++i) {
+        const uintptr_t finfo = fields_ptr + static_cast<size_t>(i) * offsets.field_info_stride;
+        uintptr_t fn_ptr = 0;
+        int32_t f_off = -1;
+        uint32_t f_tok = 0;
+        if (!read_ptr(proc, finfo + offsets.field_name_ptr_offset, fn_ptr)) break;
+        proc.read_raw(finfo + offsets.field_offset_offset, &f_off, sizeof(f_off));
+        proc.read_raw(finfo + offsets.field_token_offset, &f_tok, sizeof(f_tok));
+
+        std::string fname = read_remote_cstr(fn_ptr);
+        if (fname.empty() || f_off < 0 || f_off > 0x20000) continue;
+
+        StructField sf;
+        sf.offset = static_cast<size_t>(f_off);
+        sf.size = 4;
+        sf.name = std::move(fname);
+        sf.type = "int32_t";
+        if (instance_addr != 0) {
+            uint32_t iv = 0;
+            if (proc.read_raw(instance_addr + sf.offset, &iv, sizeof(iv))) {
+                sf.value = std::to_string(static_cast<int32_t>(iv));
+            }
+        }
+        std::ostringstream note;
+        note << "IL2CPP field +0x" << std::hex << std::uppercase << sf.offset << " token 0x" << f_tok;
+        sf.note = note.str();
+        max_end = std::max(max_end, sf.offset + sf.size);
+        layout.fields.push_back(std::move(sf));
+    }
+    std::sort(layout.fields.begin(), layout.fields.end(),
+              [](const StructField& a, const StructField& b) { return a.offset < b.offset; });
+    layout.size = max_end;
+    return layout;
+}
+
+std::string EngineInspector::generate_sdk_header(
+    const std::vector<SdkClassDef>& classes,
+    const std::string& header_title)
+{
+    std::ostringstream out;
+    out << "// " << header_title << "\n"
+        << "// Auto-generated by New Cheat Engine (NCE v3.0)\n"
+        << "#pragma once\n"
+        << "#include <cstdint>\n\n"
+        << "namespace sdk {\n\n";
+
+    for (size_t ci = 0; ci < classes.size(); ++ci) {
+        const auto& cls = classes[ci];
+        const std::string full_raw = cls.namespaze.empty() ? cls.name : (cls.namespaze + "_" + cls.name);
+        const std::string sname = sanitize_c_ident(full_raw, "Class_" + std::to_string(ci));
+        out << "// Original: " << (cls.namespaze.empty() ? cls.name : (cls.namespaze + "." + cls.name)) << "\n";
+        out << "struct " << sname << " {\n";
+
+        auto fields = cls.fields;
+        std::sort(fields.begin(), fields.end(),
+                  [](const StructField& a, const StructField& b) { return a.offset < b.offset; });
+
+        size_t cursor = 0;
+        size_t pad_idx = 0;
+        for (size_t fi = 0; fi < fields.size(); ++fi) {
+            const auto& f = fields[fi];
+            if (f.offset < cursor) continue;
+            if (f.offset > cursor) {
+                const size_t gap = f.offset - cursor;
+                out << "    uint8_t _pad_" << std::hex << cursor << "_" << std::dec << (pad_idx++)
+                    << "[0x" << std::hex << gap << std::dec << "];\n";
+                cursor = f.offset;
+            }
+            const std::string ctype = c_type_from_field(f);
+            const std::string fname = sanitize_c_ident(f.name, "field_" + std::to_string(fi));
+            const size_t sz = (ctype == "double" || ctype == "uint64_t" || ctype == "uintptr_t")
+                ? sizeof(uint64_t)
+                : ((ctype == "uint8_t" || ctype == "bool") ? 1u : (ctype == "uint16_t" ? 2u : 4u));
+            out << "    " << ctype << " " << fname << "; // +0x" << std::hex << std::uppercase << f.offset << std::dec << "\n";
+            cursor += sz;
+        }
+        if (cls.size > cursor) {
+            out << "    uint8_t _pad_tail[0x" << std::hex << (cls.size - cursor) << std::dec << "];\n";
+        }
+        out << "};\n\n";
+    }
+
+    out << "} // namespace sdk\n";
+    return out.str();
+}
+
+std::string EngineInspector::generate_sdk_header_from_unity(
+    const UnityMetadataReport& meta,
+    size_t max_classes)
+{
+    std::vector<SdkClassDef> defs;
+    const size_t cap = std::min(meta.types.size(), max_classes);
+    defs.reserve(cap);
+    for (size_t i = 0; i < cap; ++i) {
+        const auto& t = meta.types[i];
+        SdkClassDef d;
+        d.name = t.name;
+        d.namespaze = t.namespaze;
+        size_t est_off = 0x10; // past Il2CppObject header on 64-bit
+        for (const auto& uf : t.fields) {
+            StructField sf;
+            sf.offset = est_off;
+            sf.size = 4;
+            sf.type = "int32_t";
+            sf.name = uf.name;
+            sf.note = "Estimated from metadata index";
+            d.fields.push_back(std::move(sf));
+            est_off += 4;
+        }
+        d.size = est_off;
+        defs.push_back(std::move(d));
+    }
+    return generate_sdk_header(defs, "Unity IL2CPP SDK Dump");
+}
+
+std::string EngineInspector::generate_sdk_cheat_table_xml(
+    const std::vector<SdkClassDef>& classes,
+    uintptr_t base_instance)
+{
+    std::ostringstream xml;
+    xml << "<?xml version=\"1.0\" encoding=\"utf-8\"?>\n"
+        << "<CheatTable CheatEngineTableVersion=\"42\">\n"
+        << "  <CheatEntries>\n";
+
+    size_t id = 1;
+    for (const auto& cls : classes) {
+        for (const auto& f : cls.fields) {
+            const uintptr_t addr = base_instance + f.offset;
+            std::string ce_type = "4 Bytes";
+            if (f.type == "float") ce_type = "Float";
+            else if (f.type == "double") ce_type = "Double";
+            else if (f.type == "bool" || f.size == 1) ce_type = "Byte";
+            else if (f.size == 2) ce_type = "2 Bytes";
+            else if (f.size == 8 || f.type == "UObject*") ce_type = "8 Bytes";
+
+            std::string label = (cls.name.empty() ? std::string("Object") : cls.name) + "::" + f.name;
+            xml << "    <CheatEntry>\n"
+                << "      <ID>" << (id++) << "</ID>\n"
+                << "      <Description>\"" << sanitize_xml_attr(label) << "\"</Description>\n"
+                << "      <VariableType>" << ce_type << "</VariableType>\n"
+                << "      <Address>" << std::hex << std::uppercase << addr << std::dec << "</Address>\n"
+                << "    </CheatEntry>\n";
+        }
+    }
+
+    xml << "  </CheatEntries>\n"
+        << "</CheatTable>\n";
+    return xml.str();
 }
 
 } // namespace nce::view
