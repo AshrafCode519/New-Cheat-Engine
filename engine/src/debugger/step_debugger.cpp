@@ -66,10 +66,21 @@ std::vector<StackFrame> StepDebugger::walk_stack(const hal::IProcess& proc,
                                                  const std::vector<hal::ModuleInfo>& modules,
                                                  size_t max_frames) {
     std::vector<StackFrame> frames;
+    const size_t ptr_sz = (proc.pointer_size() == 4) ? 4 : sizeof(uintptr_t);
+    auto read_ptr = [&](uintptr_t addr, uintptr_t& out) -> bool {
+        if (ptr_sz == 4) {
+            uint32_t v32 = 0;
+            if (!proc.read_raw(addr, &v32, 4)) return false;
+            out = v32;
+            return true;
+        }
+        return proc.read_raw(addr, &out, sizeof(out));
+    };
+
     uintptr_t cur_rbp = rbp;
 
     uintptr_t top_ret = 0;
-    if (rsp != 0 && proc.read_raw(rsp, &top_ret, sizeof(top_ret)) && top_ret > 0x10000) {
+    if (rsp != 0 && read_ptr(rsp, top_ret) && top_ret > 0x1000) {
         StackFrame frame;
         frame.rbp = rbp;
         frame.return_address = top_ret;
@@ -88,9 +99,9 @@ std::vector<StackFrame> StepDebugger::walk_stack(const hal::IProcess& proc,
         uintptr_t next_rbp = 0;
         uintptr_t ret_addr = 0;
 
-        if (!proc.read_raw(cur_rbp, &next_rbp, sizeof(next_rbp))) break;
-        if (!proc.read_raw(cur_rbp + sizeof(uintptr_t), &ret_addr, sizeof(ret_addr))) break;
-        if (ret_addr <= 0x10000) break;
+        if (!read_ptr(cur_rbp, next_rbp)) break;
+        if (!read_ptr(cur_rbp + ptr_sz, ret_addr)) break;
+        if (ret_addr <= 0x1000) break;
 
         StackFrame frame;
         frame.rbp = cur_rbp;

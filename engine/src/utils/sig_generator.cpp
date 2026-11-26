@@ -129,7 +129,7 @@ std::optional<SignatureGenerator::GeneratedSig> SignatureGenerator::generate(
     }
 
     auto instructions = debugger::Disassembler::disassemble_range(
-        code_buffer.data(), code_buffer.size(), address, 16
+        code_buffer.data(), code_buffer.size(), address, 16, process.pointer_size() != 4
     );
 
     if (instructions.empty()) return std::nullopt;

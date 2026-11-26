@@ -805,10 +805,11 @@ std::string AutoAssembler::generate_aob_hook_script(
     uint8_t buf[64]{};
     if (!proc.read_raw(address, buf, sizeof(buf))) return {};
 
+    const bool is_64 = (proc.pointer_size() != 4);
     std::vector<debugger::DecodedInstruction> stolen;
     size_t stolen_len = 0;
     while (stolen_len < min_bytes && stolen_len < sizeof(buf)) {
-        auto insn = debugger::Disassembler::decode(buf + stolen_len, sizeof(buf) - stolen_len, address + stolen_len);
+        auto insn = debugger::Disassembler::decode(buf + stolen_len, sizeof(buf) - stolen_len, address + stolen_len, is_64);
         if (insn.length == 0) break;
         stolen.push_back(insn);
         stolen_len += insn.length;
