@@ -3,7 +3,7 @@
 [![Build & Test](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml/badge.svg)](https://github.com/AshrafCode519/New-Cheat-Engine/actions/workflows/ci.yml)
 [![C++20](https://img.shields.io/badge/C%2B%2B-20-blue.svg)](https://isocpp.org/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-emerald.svg)](LICENSE)
-[![Tests](https://img.shields.io/badge/Unit%20Tests-192%20passed%20(17.8k%2B%20assertions)-brightgreen.svg)](tests/)
+[![Tests](https://img.shields.io/badge/Unit%20Tests-194%20passed%20(17.8k%2B%20assertions)-brightgreen.svg)](tests/)
 
 > **⚠️ تنويه وإخلاء مسؤولية (Disclaimer):** هذا المشروع مخصّص لأغراض **التعليم، الهندسة العكسية، البحث الأمني، وتعديل الألعاب الفردية (Offline/Single-Player)** فقط.
 > Intended strictly for **educational reverse engineering, security research, and single-player/offline game analysis**.
@@ -171,7 +171,7 @@ cmake --build build
 # أو عبر CTest:
 ctest --test-dir build --output-on-failure
 ```
-تغطي الاختبارات (`192 test cases / 17,833 assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process` و`LinuxProcess` (`ptrace` + `ELFAnalyzer` DWARF)، و`HookEngine`، و`Speedhack`، و`Lua 5.4`، و`Disassembler`/`X86Assembler` (`x64/x86/AVX/x87/X-Refs/Atomics/SSE2`)، و`ScanResults` (تفريغ القرص)، و`CETableFormat` (مع `SignatureAnchor` و`<LuaScript>`)، و`PointerMap`، و`EngineInspector` (`Unity / Unreal`)، بالإضافة لـ **`PseudoCDecompiler`** و**`CausalityTimeline`** و**`RemoteServer`/`RemoteProcess`** و**Hybrid PE+ELF**. لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
+تغطي الاختبارات (`194 test cases / 17,897 assertions`) محرك الفحص عبر `FakeProcess` بالإضافة لاختبارات حيّة على `Win32Process` و`LinuxProcess` (`ptrace` + `ELFAnalyzer` DWARF)، و`HookEngine` (64-bit + 32-bit)، و`Speedhack`، و`Lua 5.4`، و`Disassembler`/`X86Assembler` (`x64/x86/AVX/x87/X-Refs/Atomics/SSE2`)، و`ScanResults` (تفريغ القرص)، و`CETableFormat` (مع `SignatureAnchor` و`<LuaScript>`)، و`PointerMap`، و`EngineInspector` (`Unity / Unreal`)، و**WOW64 (32-bit debugging)**، بالإضافة لـ **`PseudoCDecompiler`** و**`CausalityTimeline`** و**`RemoteServer`/`RemoteProcess`** (المحصّن بحدود الاتصال والمصادقة) و**Hybrid PE+ELF**. لإيقاف بناء الاختبارات: `-DNCE_BUILD_TESTS=OFF`.
 
 ### التشغيل والاختبار:
 1. قم بتشغيل الهدف التجريبي:
